@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "thundering-birds"
+version = "0.1.0"
+description = "BirdCLEF 2025 Competition"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.12"
+python-dotenv = ">=0.19.0"
+kaggle = ">=1.5.12"
+tqdm = ">=4.65.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
