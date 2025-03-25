@@ -37,7 +37,7 @@ log_filepath = run_dir / log_filename
 
 # Get the root logger
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # Remove all existing handlers
 for handler in logger.handlers[:]:
@@ -59,8 +59,9 @@ console_handler.setFormatter(console_formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# Silence numba.core logs
+# Silence some logs
 logging.getLogger("numba.core").setLevel(logging.WARNING)
+logging.getLogger("PIL").setLevel(logging.WARNING)
 
 logger.info(f"Logging to {log_filepath}")
 
@@ -366,23 +367,43 @@ class WandbLogger:
 def save_melspectrogram(
     spec: np.ndarray,
     label: str,
+    class_id: int,
     filename: str,
     chunk_id: int,
+    batch_id: int,
+    sample_id: int,
     save_dir: Path,
     epoch: int,
     step: int,
     wandb_logger: WandbLogger,
 ) -> None:
-    """Save mel spectrogram as an image and optionally log to wandb."""
+    """Save mel spectrogram as an image and optionally log to wandb.
+
+    Args:
+        spec: Mel spectrogram array
+        label: Class label (species name)
+        class_id: Numeric class ID
+        filename: Original audio filename
+        chunk_id: ID of the chunk in the audio file
+        batch_id: ID of the batch
+        sample_id: ID of the sample in the batch
+        save_dir: Directory to save the image
+        epoch: Current epoch number
+        step: Current step number
+        wandb_logger: WandbLogger instance
+    """
     # Create figure
     plt.figure(figsize=(10, 4))
     plt.imshow(spec, aspect="auto", origin="lower", cmap="viridis")
     plt.colorbar()
-    plt.title(f"Label: {label}\nFile: {filename}\nChunk: {chunk_id}")
+    plt.title(f"Label: {label} (ID: {class_id})\nFile: {filename}\nChunk: {chunk_id}")
     plt.tight_layout()
 
-    # Create filename from components
-    img_filename = f"{label}_{filename.split('/')[-1]}_chunk{chunk_id}.png"
+    # Create filename with all components
+    img_filename = (
+        f"epoch{epoch:02d}_batch{batch_id:03d}_sample{sample_id:03d}_"
+        f"class{class_id:03d}_{label}_chunk{chunk_id:03d}.png"
+    )
 
     # Save to local filesystem
     plt.savefig(save_dir / img_filename)
@@ -392,12 +413,15 @@ def save_melspectrogram(
     # Log to wandb if available
     wandb_logger.log_image(
         spec,
-        f"Label: {label}, File: {filename}, Chunk: {chunk_id}",
+        f"Label: {label} (ID: {class_id}), File: {filename}, Chunk: {chunk_id}",
         epoch=epoch,
         step=step,
         label=label,
+        class_id=class_id,
         filename=filename,
         chunk_id=chunk_id,
+        batch_id=batch_id,
+        sample_id=sample_id,
     )
 
 
@@ -411,6 +435,7 @@ def train_epoch(
     epoch: int,
     run_dir: Path,
     wandb_logger: WandbLogger,
+    metadata_df: pd.DataFrame,  # Add metadata_df parameter
 ) -> float:
     """Train for one epoch."""
     model.train()
@@ -447,19 +472,27 @@ def train_epoch(
             # Save spectrograms
             for idx, random_idx in enumerate(random_indices):
                 spec = inputs[random_idx]
-                label = labels[random_idx]
+                label_id = labels[random_idx].item()
+
+                # Get the original label from metadata
+                label = metadata_df[metadata_df["target"] == label_id][
+                    "primary_label"
+                ].iloc[0]
 
                 # Convert to numpy and save
                 spec_np = spec[0].numpy()  # Take first channel since they're identical
                 save_melspectrogram(
                     spec_np,
-                    f"class_{label.item()}",  # Use class number as label
-                    f"batch_{step}_sample_{random_idx.item()}",  # Use batch and sample info as filename
-                    idx,  # Use loop index as chunk ID
-                    spectrograms_dir,
-                    epoch,
-                    step,
-                    wandb_logger,
+                    label=label,
+                    class_id=label_id,
+                    filename=f"batch_{step}_sample_{random_idx.item()}",
+                    chunk_id=idx,
+                    batch_id=step,
+                    sample_id=random_idx.item(),
+                    save_dir=spectrograms_dir,
+                    epoch=epoch,
+                    step=step,
+                    wandb_logger=wandb_logger,
                 )
 
         inputs = inputs.to(config.DEVICE)
@@ -633,6 +666,7 @@ def main():
             epoch,
             run_dir,
             wandb_logger,
+            metadata_df,  # Pass metadata_df to train_epoch
         )
 
         # Log epoch metrics
