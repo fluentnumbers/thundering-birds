@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import os
@@ -8,6 +9,7 @@ from typing import Dict, Tuple
 import albumentations as albu
 import cv2
 import librosa
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -19,15 +21,27 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-import wandb
-
 # Create logs directory if it doesn't exist
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
 
+# Create timestamped run directory
+run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_name = f"basic_pipeline_{run_timestamp}"
+run_dir = log_dir / run_name
+run_dir.mkdir(exist_ok=True)
+
 # Setup logging with both file and console handlers
-log_filename = f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-log_filepath = log_dir / log_filename
+log_filename = "training.log"
+log_filepath = run_dir / log_filename
+
+# Get the root logger
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
+# Remove all existing handlers
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
 
 # Create formatters and handlers
 file_handler = logging.FileHandler(log_filepath)
@@ -41,11 +55,12 @@ console_formatter = logging.Formatter(log_format)
 file_handler.setFormatter(file_formatter)
 console_handler.setFormatter(console_formatter)
 
-# Setup root logger
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+# Add new handlers
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+
+# Silence numba.core logs
+logging.getLogger("numba.core").setLevel(logging.WARNING)
 
 logger.info(f"Logging to {log_filepath}")
 
@@ -54,33 +69,33 @@ class Config:
     """Configuration class for the pipeline."""
 
     def __init__(self):
-        self.SEED = 2024
+        self.SEED = 42
         self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-        self.MIXED_PRECISION = False
+        self.DEV_MODE = False  # Take only fraction of the dataset, for dev
+        self.DEV_MODE_N_SAMPLES = 300  # Number of samples to use in development mode
 
         # Data config
         self.DATA_ROOT = Path("data/birdclef-2025")
         self.FS = 32000  # Sample rate
-        self.N_FFT = 1095  # FFT size
-        self.WIN_SIZE = 412  # Window size
-        self.WIN_LAP = 100  # Window overlap
-        self.MIN_FREQ = 40
-        self.MAX_FREQ = 15000
-        self.USE_XYMASKING = True
+        self.N_FFT = 1024  # FFT size
+        self.WIN_LAP = 512  # Window overlap
+        self.MIN_FREQ = 50
+        self.MAX_FREQ = 14000
+        self.N_MELS = 128
+
+        self.segment_duration = 5  # seconds
+        self.nsamples = self.segment_duration * self.FS
+        self.padmode = "constant"
+        self.ufoldoverlap = self.nsamples // 2  # 2.5 seconds overlap
 
         # Training config
         self.BATCH_SIZE = 32
         self.NUM_WORKERS = 1
         self.LR_MAX = 3e-4
-        self.EPOCHS = 2
+        self.EPOCHS = 20
 
         # Model config
         self.N_CLASSES = None  # Will be set after data loading
-
-        # Audio config
-        self.nsamples = 160000  # 5 seconds * 32000 Hz
-        self.padmode = "constant"
-        self.ufoldoverlap = 80000  # 2.5 seconds overlap
 
 
 def load_metadata(config: Config) -> pd.DataFrame:
@@ -101,6 +116,15 @@ def load_metadata(config: Config) -> pd.DataFrame:
     config.N_CLASSES = len(labels)
     logger.info(f"Found {config.N_CLASSES} unique classes")
 
+    # For development: limit to a fractions of  samples while maintaining class distribution
+    if config.DEV_MODE:
+        metadata_df = metadata_df.groupby("primary_label", group_keys=False).apply(
+            lambda x: x.sample(
+                n=min(config.DEV_MODE_N_SAMPLES // config.N_CLASSES, len(x))
+            )
+        )
+        logger.info(f"Development mode: Limited dataset to {len(metadata_df)} samples")
+
     return metadata_df
 
 
@@ -114,7 +138,7 @@ class MelSpectrogramTransform:
             hop_length=config.WIN_LAP,
             f_max=config.MAX_FREQ,
             f_min=config.MIN_FREQ,
-            n_mels=128,
+            n_mels=config.N_MELS,
         )
         self.to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
         self.etol = 1e-8
@@ -131,104 +155,133 @@ class MelSpectrogramTransform:
         return torch.tensor(output)
 
 
+def preprocess_dataset(
+    metadata_df: pd.DataFrame, config: Config
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Precompute all segments and mel spectrograms for the dataset.
+
+    Args:
+        metadata_df: DataFrame containing metadata
+        config: Configuration object
+
+    Returns:
+        Tuple of (precomputed_spectrograms, labels) where spectrograms has shape [n_total_segments, 3, 224, 224]
+        and labels has shape [n_total_segments]
+    """
+    logger.info("Starting dataset preprocessing...")
+    mel_transform = MelSpectrogramTransform(config)
+
+    # Initialize lists to store results
+    all_spectrograms = []
+    all_labels = []
+    total_size_mb = 0
+
+    # Process each audio file
+    for idx, row in tqdm(
+        metadata_df.iterrows(), total=len(metadata_df), desc="Processing audio files"
+    ):
+        # Load audio
+        audio_data, _ = librosa.load(row.filepath, sr=config.FS)
+        audio_tensor = torch.tensor(audio_data)
+
+        # Pad if necessary
+        nsamples = audio_tensor.shape[-1]
+        rsamples = nsamples % config.nsamples
+        audio_tensor = torch.nn.functional.pad(
+            audio_tensor, (0, config.nsamples - rsamples), mode=config.padmode
+        )
+
+        # Calculate number of segments
+        n_segments = (len(audio_tensor) - config.nsamples) // config.ufoldoverlap + 1
+        logger.debug(f"File {row.filename}: {n_segments} segments")
+
+        # Process each segment
+        for segment_idx in range(n_segments):
+            start_idx = segment_idx * config.ufoldoverlap
+            audio_segment = audio_tensor[start_idx : start_idx + config.nsamples]
+
+            # Convert to mel spectrogram
+            mel_spec = mel_transform(audio_segment)
+
+            # Resize to 224x224
+            mel_spec = torch.tensor(cv2.resize(mel_spec.numpy(), (224, 224)))
+
+            # Add channel dimension and repeat to 3 channels
+            mel_spec = mel_spec.unsqueeze(0).repeat(3, 1, 1)
+
+            # Append to lists
+            all_spectrograms.append(mel_spec)
+            all_labels.append(row.target)
+
+            # Log memory usage every 1000 segments
+            if len(all_spectrograms) % 1000 == 0:
+                current_size = sum(
+                    spec.element_size() * spec.nelement() for spec in all_spectrograms
+                )
+                current_size_mb = current_size / (1024 * 1024)
+                total_size_mb = current_size_mb
+                logger.info(
+                    f"Processed {len(all_spectrograms)} segments. Current memory usage: {current_size_mb:.2f} MB"
+                )
+
+    # Convert lists to tensors
+    logger.info("Converting lists to tensors...")
+    spectrograms = torch.stack(all_spectrograms)
+    labels = torch.tensor(all_labels)
+
+    # Log final memory usage
+    final_size = spectrograms.element_size() * spectrograms.nelement()
+    final_size_mb = final_size / (1024 * 1024)
+    logger.info(f"Preprocessing complete. Final dataset size: {final_size_mb:.2f} MB")
+    logger.info(
+        f"Dataset shape: Spectrograms {spectrograms.shape}, Labels {labels.shape}"
+    )
+
+    return spectrograms, labels
+
+
 class BirdSoundDataset(Dataset):
-    """Dataset class for bird sound spectrograms."""
+    """Dataset class for bird sound spectrograms using precomputed data."""
 
     def __init__(
-        self, metadata: pd.DataFrame, config: Config, augmentation=None, mode="train"
+        self,
+        spectrograms: torch.Tensor,
+        labels: torch.Tensor,
+        augmentation=None,
+        mode="train",
     ):
-        self.metadata = metadata
-        self.config = config
+        self.spectrograms = spectrograms
+        self.labels = labels
         self.augmentation = augmentation
         self.mode = mode
-        self.total_samples = len(metadata)
-        self.sample_count = 0  # Track actual processing order
-        self.mel_transform = MelSpectrogramTransform(config)
-        logger.info(f"Created {mode} dataset with {self.total_samples} audio files")
+        self.total_samples = len(spectrograms)
+        logger.info(f"Created {mode} dataset with {self.total_samples} samples")
 
     def __len__(self) -> int:
         return self.total_samples
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        row = self.metadata.iloc[index]
-        self.sample_count += 1
-
-        # Load audio
-        audio_data, _ = librosa.load(row.filepath, sr=self.config.FS)
-        logger.debug(
-            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Raw audio shape: {audio_data.shape}, "
-            f"duration: {len(audio_data)/self.config.FS:.2f}s"
-        )
-
-        # Convert to tensor and pad if necessary
-        audio_tensor = torch.tensor(audio_data)
-        nsamples = audio_tensor.shape[-1]
-        rsamples = nsamples % self.config.nsamples
-
-        # Pad the audio
-        audio_tensor = torch.nn.functional.pad(
-            audio_tensor, (0, self.config.nsamples - rsamples), mode=self.config.padmode
-        )
-        logger.debug(
-            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Audio after padding: {audio_tensor.shape}, "
-            f"duration: {len(audio_tensor)/self.config.FS:.2f}s"
-        )
-
-        # Unfold into 5-second segments with overlap
-        audio_segments = audio_tensor.unfold(
-            dimension=-1, size=self.config.nsamples, step=self.config.ufoldoverlap
-        )
-        num_segments = audio_segments.shape[0]
-        logger.debug(
-            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Audio segments shape: {audio_segments.shape}, "
-            f"number of segments: {num_segments}"
-        )
-
-        # Randomly select one segment for training
-        segment_idx = torch.randint(0, num_segments, (1,)).item()
-        audio_segment = audio_segments[segment_idx]
-        logger.debug(
-            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Selected segment {segment_idx}/{num_segments} shape: {audio_segment.shape}"
-        )
-
-        # Convert segment to mel spectrogram
-        mel_spec = self.mel_transform(audio_segment)
-        logger.debug(
-            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Mel spectrogram shape: {mel_spec.shape}"
-        )
-
-        # Resize spectrogram to 224x224 for EfficientNet
-        mel_spec = torch.tensor(cv2.resize(mel_spec.numpy(), (224, 224)))
-        logger.debug(
-            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Resized spectrogram shape: {mel_spec.shape}"
-        )
+        spec = self.spectrograms[index]
+        label = self.labels[index]
 
         # Apply augmentations if any
-        if self.augmentation:
-            mel_spec = torch.tensor(self.augmentation(image=mel_spec.numpy())["image"])
-            logger.debug(
-                f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-                f"Augmented spectrogram shape: {mel_spec.shape}"
-            )
+        if self.augmentation and self.mode == "train":
+            spec = torch.tensor(self.augmentation(image=spec.numpy())["image"])
 
-        # Add channel dimension and repeat to 3 channels
-        mel_spec = mel_spec.unsqueeze(0).repeat(3, 1, 1)
-        logger.debug(
-            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Final tensor shape: {mel_spec.shape}"
-        )
-
-        return mel_spec, torch.tensor(row.target, dtype=torch.long)
+        return spec, label
 
 
 def collate_fn(batch):
-    """Custom collate function to handle batching of spectrograms."""
+    """Custom collate function to handle batching of spectrograms.
+
+    Args:
+        batch: List of tuples (mel_spec, label) where mel_spec has shape [3, H, W]
+              and label is a scalar
+
+    Returns:
+        Tuple of (inputs, labels) where inputs has shape [batch_size, 3, H, W]
+        and labels has shape [batch_size]
+    """
     # Separate inputs and labels
     inputs, labels = zip(*batch)
 
@@ -242,24 +295,6 @@ def collate_fn(batch):
 def get_transforms(mode: str) -> albu.Compose:
     """Get augmentation transforms based on mode."""
     return None
-    if mode == "train":
-        return albu.Compose(
-            [
-                albu.HorizontalFlip(p=0.5),
-                (
-                    albu.XYMasking(
-                        p=0.3,
-                        num_masks_x=(1, 3),
-                        num_masks_y=(1, 3),
-                        mask_x_length=(1, 10),
-                        mask_y_length=(1, 20),
-                    )
-                    if Config().USE_XYMASKING
-                    else albu.NoOp()
-                ),
-            ]
-        )
-    return albu.Compose([])
 
 
 class EfficientNetModel(nn.Module):
@@ -280,6 +315,92 @@ class EfficientNetModel(nn.Module):
         return self.efficientnet(x)
 
 
+class WandbLogger:
+    """Wrapper for wandb logging functionality."""
+
+    def __init__(self, run_name: str, run_dir: Path):
+        self.enabled = False
+        try:
+            import wandb
+
+            self.wandb = wandb
+            self.wandb.init(
+                project="bird-sound-classification",
+                name=run_name,
+                dir=str(run_dir),
+            )
+            self.enabled = True
+            logger.info("Initialized wandb logging")
+        except ImportError:
+            logger.info("wandb not available, continuing without wandb logging")
+        except Exception as e:
+            logger.warning(f"Failed to initialize wandb: {e}")
+
+    def log(self, data: dict) -> None:
+        """Log data to wandb if available."""
+        if self.enabled:
+            try:
+                self.wandb.log(data)
+            except Exception as e:
+                logger.warning(f"Failed to log to wandb: {e}")
+
+    def log_image(self, image: np.ndarray, caption: str, **kwargs) -> None:
+        """Log image to wandb if available."""
+        if self.enabled:
+            try:
+                self.wandb.log(
+                    {"images": self.wandb.Image(image, caption=caption), **kwargs}
+                )
+            except Exception as e:
+                logger.warning(f"Failed to log image to wandb: {e}")
+
+    def finish(self) -> None:
+        """Finish wandb run if available."""
+        if self.enabled:
+            try:
+                self.wandb.finish()
+            except Exception as e:
+                logger.warning(f"Failed to finish wandb: {e}")
+
+
+def save_melspectrogram(
+    spec: np.ndarray,
+    label: str,
+    filename: str,
+    chunk_id: int,
+    save_dir: Path,
+    epoch: int,
+    step: int,
+    wandb_logger: WandbLogger,
+) -> None:
+    """Save mel spectrogram as an image and optionally log to wandb."""
+    # Create figure
+    plt.figure(figsize=(10, 4))
+    plt.imshow(spec, aspect="auto", origin="lower", cmap="viridis")
+    plt.colorbar()
+    plt.title(f"Label: {label}\nFile: {filename}\nChunk: {chunk_id}")
+    plt.tight_layout()
+
+    # Create filename from components
+    img_filename = f"{label}_{filename.split('/')[-1]}_chunk{chunk_id}.png"
+
+    # Save to local filesystem
+    plt.savefig(save_dir / img_filename)
+    plt.close()
+    logger.debug(f"Saved spectrogram to {img_filename}")
+
+    # Log to wandb if available
+    wandb_logger.log_image(
+        spec,
+        f"Label: {label}, File: {filename}, Chunk: {chunk_id}",
+        epoch=epoch,
+        step=step,
+        label=label,
+        filename=filename,
+        chunk_id=chunk_id,
+    )
+
+
 def train_epoch(
     model: nn.Module,
     train_loader: DataLoader,
@@ -288,26 +409,58 @@ def train_epoch(
     scheduler: optim.lr_scheduler._LRScheduler,
     config: Config,
     epoch: int,
+    run_dir: Path,
+    wandb_logger: WandbLogger,
 ) -> float:
     """Train for one epoch."""
     model.train()
     total_loss = 0
     total_batches = len(train_loader)
 
-    # Log dataloader info at the start of epoch
+    # Create directory for spectrograms if it doesn't exist
+    spectrograms_dir = run_dir / "spectrograms"
+    spectrograms_dir.mkdir(exist_ok=True)
+
+    # Log epoch separator and info
+    logger.info("-" * 80)
     logger.info(
         f"Starting epoch {epoch+1}/{config.EPOCHS} with {total_batches} batches "
         f"of size {config.BATCH_SIZE}"
     )
+    logger.info("-" * 80)
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.EPOCHS}")
     for step, (inputs, labels) in enumerate(pbar):
-        # Log batch dimensions
+        # Log batch separator and dimensions
+        logger.debug("=" * 40)
         logger.debug(
             f"Batch (step {step + 1}/{total_batches}) - "
             f"Inputs: {inputs.shape} ({inputs.dtype}), "
             f"Labels: {labels.shape} ({labels.dtype})"
         )
+
+        # Save random spectrograms from the first batch of each epoch
+        if step == 0:
+            # Get 3 random indices from the current batch
+            random_indices = torch.randperm(len(inputs))[:3]
+
+            # Save spectrograms
+            for idx, random_idx in enumerate(random_indices):
+                spec = inputs[random_idx]
+                label = labels[random_idx]
+
+                # Convert to numpy and save
+                spec_np = spec[0].numpy()  # Take first channel since they're identical
+                save_melspectrogram(
+                    spec_np,
+                    f"class_{label.item()}",  # Use class number as label
+                    f"batch_{step}_sample_{random_idx.item()}",  # Use batch and sample info as filename
+                    idx,  # Use loop index as chunk ID
+                    spectrograms_dir,
+                    epoch,
+                    step,
+                    wandb_logger,
+                )
 
         inputs = inputs.to(config.DEVICE)
         labels = labels.to(config.DEVICE)
@@ -317,7 +470,8 @@ def train_epoch(
         # Forward pass
         outputs = model(inputs)
         logger.info(
-            f"Batch 1/{total_batches} - " f"Model output dimensions: {outputs.shape}"
+            f"Batch {step + 1}/{total_batches} - "
+            f"Model output dimensions: {outputs.shape}"
         )
 
         loss = criterion(outputs, labels)
@@ -338,7 +492,7 @@ def train_epoch(
                 f"Loss: {loss.item():.4f}, "
                 f"LR: {scheduler.get_last_lr()[0]:.6f}"
             )
-            wandb.log(
+            wandb_logger.log(
                 {
                     "batch": step + 1,
                     "batch_loss": loss.item(),
@@ -347,18 +501,34 @@ def train_epoch(
             )
 
         pbar.set_postfix(loss=total_loss / (step + 1))
+        logger.debug("=" * 40)
+
+    # Log end of epoch separator
+    logger.info("-" * 80)
+    logger.info(f"Completed epoch {epoch+1}/{config.EPOCHS}")
+    logger.info("-" * 80)
 
     return total_loss / len(train_loader)
 
 
 def main():
     """Main training pipeline."""
-    # Initialize wandb
-    wandb.init(project="bird-sound-classification")
+    # Initialize wandb logger
+    wandb_logger = WandbLogger(run_name, run_dir)
 
     # Initialize config
     config = Config()
     logger.info(f"Using device: {config.DEVICE}")
+
+    # Save config to run directory
+    config_dict = {k: v for k, v in config.__dict__.items() if not k.startswith("_")}
+    # Convert Path objects to strings
+    config_dict = {
+        k: str(v) if isinstance(v, Path) else v for k, v in config_dict.items()
+    }
+    with open(run_dir / "config.json", "w") as f:
+        json.dump(config_dict, f, indent=4)
+    logger.info(f"Saved config to {run_dir / 'config.json'}")
 
     # Set random seeds
     torch.manual_seed(config.SEED)
@@ -369,22 +539,40 @@ def main():
     logger.info(f"Loaded metadata with {len(metadata_df)} samples")
 
     # Split data
-    train_df, valid_df = train_test_split(
-        metadata_df,
-        test_size=0.2,
-        random_state=config.SEED,
-        stratify=metadata_df["primary_label"],
-    )
+    if config.DEV_MODE:
+        train_df, valid_df = train_test_split(
+            metadata_df, test_size=0.2, random_state=config.SEED
+        )
+    else:
+        train_df, valid_df = train_test_split(
+            metadata_df,
+            test_size=0.2,
+            random_state=config.SEED,
+            stratify=metadata_df["primary_label"],
+        )
     logger.info(
         f"Split data into {len(train_df)} train and {len(valid_df)} validation samples"
     )
 
-    # Create datasets
+    # Precompute datasets
+    logger.info("Precomputing training dataset...")
+    train_spectrograms, train_labels = preprocess_dataset(train_df, config)
+
+    logger.info("Precomputing validation dataset...")
+    valid_spectrograms, valid_labels = preprocess_dataset(valid_df, config)
+
+    # Create datasets with precomputed data
     train_dataset = BirdSoundDataset(
-        train_df, config, augmentation=get_transforms("train"), mode="train"
+        train_spectrograms,
+        train_labels,
+        augmentation=get_transforms("train"),
+        mode="train",
     )
     valid_dataset = BirdSoundDataset(
-        valid_df, config, augmentation=get_transforms("valid"), mode="valid"
+        valid_spectrograms,
+        valid_labels,
+        augmentation=get_transforms("valid"),
+        mode="valid",
     )
 
     # Create dataloaders with custom collate function
@@ -436,15 +624,24 @@ def main():
     logger.info("Starting training...")
     for epoch in range(config.EPOCHS):
         train_loss = train_epoch(
-            model, train_loader, criterion, optimizer, scheduler, config, epoch
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            scheduler,
+            config,
+            epoch,
+            run_dir,
+            wandb_logger,
         )
 
         # Log epoch metrics
         logger.info(f"Epoch {epoch+1}/{config.EPOCHS} - Loss: {train_loss:.4f}")
-        wandb.log({"epoch": epoch, "train_loss": train_loss})
+        wandb_logger.log({"epoch": epoch, "train_loss": train_loss})
 
         # Save checkpoint
         if (epoch + 1) % 5 == 0:
+            checkpoint_path = run_dir / f"model_epoch_{epoch+1}.pt"
             torch.save(
                 {
                     "epoch": epoch,
@@ -453,11 +650,12 @@ def main():
                     "scheduler_state_dict": scheduler.state_dict(),
                     "loss": train_loss,
                 },
-                f"checkpoints/model_epoch_{epoch+1}.pt",
+                checkpoint_path,
             )
+            logger.info(f"Saved checkpoint to {checkpoint_path}")
 
     logger.info("Training completed!")
-    wandb.finish()
+    wandb_logger.finish()
 
 
 if __name__ == "__main__":

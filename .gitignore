@@ -176,6 +176,7 @@ cython_debug/
 data/*
 data/**/*.ogg
 wandb/*
+logs/*
 
 
 
