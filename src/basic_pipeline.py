@@ -49,18 +49,6 @@ logger.addHandler(console_handler)
 
 logger.info(f"Logging to {log_filepath}")
 
-# Check if CUDA is available and cupy can be imported
-USE_GPU_ACCELERATION = False
-try:
-    import cupy as cp
-    from cupyx.scipy import signal as cupy_signal
-
-    if torch.cuda.is_available():
-        USE_GPU_ACCELERATION = True
-        logger.info("GPU acceleration enabled with CuPy")
-except ImportError:
-    logger.info("CuPy not available, using CPU for spectrogram generation")
-
 
 class Config:
     """Configuration class for the pipeline."""
@@ -71,7 +59,7 @@ class Config:
         self.MIXED_PRECISION = False
 
         # Data config
-        self.DATA_ROOT = Path("data/birdclef-2024")
+        self.DATA_ROOT = Path("data/birdclef-2025")
         self.FS = 32000  # Sample rate
         self.N_FFT = 1095  # FFT size
         self.WIN_SIZE = 412  # Window size
@@ -82,9 +70,9 @@ class Config:
 
         # Training config
         self.BATCH_SIZE = 32
-        self.NUM_WORKERS = 4
+        self.NUM_WORKERS = 1
         self.LR_MAX = 3e-4
-        self.EPOCHS = 20
+        self.EPOCHS = 2
 
         # Model config
         self.N_CLASSES = None  # Will be set after data loading
@@ -98,7 +86,7 @@ class Config:
 def load_metadata(config: Config) -> pd.DataFrame:
     """Load and prepare metadata."""
     logger.info("Loading metadata...")
-    metadata_df = pd.read_csv(f"{config.DATA_ROOT}/train_metadata.csv")
+    metadata_df = pd.read_csv(f"{config.DATA_ROOT}/train.csv")
 
     # Add full filepath
     metadata_df["filepath"] = metadata_df["filename"].apply(
@@ -116,77 +104,31 @@ def load_metadata(config: Config) -> pd.DataFrame:
     return metadata_df
 
 
-def audio_to_spectrogram_cpu(audio_data: np.ndarray, config: Config) -> np.ndarray:
-    """Convert audio data to spectrogram using CPU (scipy)."""
-    # Handle NaNs
-    mean_signal = np.nanmean(audio_data)
-    audio_data = (
-        np.nan_to_num(audio_data, nan=mean_signal)
-        if np.isnan(audio_data).mean() < 1
-        else np.zeros_like(audio_data)
-    )
+class MelSpectrogramTransform:
+    """Computes the Mel Spectogram of an audio sample."""
 
-    # Generate spectrogram
-    frequencies, times, spec_data = signal.spectrogram(
-        audio_data,
-        fs=config.FS,
-        nfft=config.N_FFT,
-        nperseg=config.WIN_SIZE,
-        noverlap=config.WIN_LAP,
-        window="hann",
-    )
+    def __init__(self, config: Config):
+        self.to_melspectogram = torchaudio.transforms.MelSpectrogram(
+            sample_rate=config.FS,
+            n_fft=config.N_FFT,
+            hop_length=config.WIN_LAP,
+            f_max=config.MAX_FREQ,
+            f_min=config.MIN_FREQ,
+            n_mels=128,
+        )
+        self.to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
+        self.etol = 1e-8
 
-    # Filter frequency range
-    valid_freq = (frequencies >= config.MIN_FREQ) & (frequencies <= config.MAX_FREQ)
-    spec_data = spec_data[valid_freq, :]
+    def __call__(self, audio_sample: torch.Tensor) -> torch.Tensor:
+        if torch.isnan(audio_sample).any():
+            mean_value = torch.nanmean(audio_sample)
+            audio_sample = torch.nan_to_num(audio_sample, nan=mean_value)
 
-    # Log scale and normalize
-    spec_data = np.log10(spec_data + 1e-20)
-    spec_data = spec_data - spec_data.min()
-    spec_data = spec_data / spec_data.max()
+        output = self.to_melspectogram(audio_sample)
+        output = librosa.power_to_db(output, ref=np.max)
+        output = (output - output.min()) / (output.max() - output.min() + self.etol)
 
-    return spec_data
-
-
-def audio_to_spectrogram_gpu(audio_data: np.ndarray, config: Config) -> np.ndarray:
-    """Convert audio data to spectrogram using GPU (cupy)."""
-    audio_data = cp.array(audio_data)
-
-    # Handle NaNs
-    mean_signal = cp.nanmean(audio_data)
-    audio_data = (
-        cp.nan_to_num(audio_data, nan=mean_signal)
-        if cp.isnan(audio_data).mean() < 1
-        else cp.zeros_like(audio_data)
-    )
-
-    # Generate spectrogram
-    frequencies, times, spec_data = cupy_signal.spectrogram(
-        audio_data,
-        fs=config.FS,
-        nfft=config.N_FFT,
-        nperseg=config.WIN_SIZE,
-        noverlap=config.WIN_LAP,
-        window="hann",
-    )
-
-    # Filter frequency range
-    valid_freq = (frequencies >= config.MIN_FREQ) & (frequencies <= config.MAX_FREQ)
-    spec_data = spec_data[valid_freq, :]
-
-    # Log scale and normalize
-    spec_data = cp.log10(spec_data + 1e-20)
-    spec_data = spec_data - spec_data.min()
-    spec_data = spec_data / spec_data.max()
-
-    return spec_data.get()
-
-
-def audio_to_spectrogram(audio_data: np.ndarray, config: Config) -> np.ndarray:
-    """Convert audio data to spectrogram using available hardware."""
-    if USE_GPU_ACCELERATION:
-        return audio_to_spectrogram_gpu(audio_data, config)
-    return audio_to_spectrogram_cpu(audio_data, config)
+        return torch.tensor(output)
 
 
 class BirdSoundDataset(Dataset):
@@ -201,14 +143,15 @@ class BirdSoundDataset(Dataset):
         self.mode = mode
         self.total_samples = len(metadata)
         self.sample_count = 0  # Track actual processing order
-        logger.info(f"Created {mode} dataset with {self.total_samples} samples")
+        self.mel_transform = MelSpectrogramTransform(config)
+        logger.info(f"Created {mode} dataset with {self.total_samples} audio files")
 
     def __len__(self) -> int:
         return self.total_samples
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         row = self.metadata.iloc[index]
-        self.sample_count += 1  # Increment processing order counter
+        self.sample_count += 1
 
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=self.config.FS)
@@ -218,61 +161,87 @@ class BirdSoundDataset(Dataset):
             f"duration: {len(audio_data)/self.config.FS:.2f}s"
         )
 
-        # Handle audio length
-        n_copy = math.ceil(5 * self.config.FS / len(audio_data))
-        if n_copy > 1:
-            audio_data = np.concatenate([audio_data] * n_copy)
-            logger.debug(
-                f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-                f"Audio after padding: {audio_data.shape}, "
-                f"duration: {len(audio_data)/self.config.FS:.2f}s"
-            )
+        # Convert to tensor and pad if necessary
+        audio_tensor = torch.tensor(audio_data)
+        nsamples = audio_tensor.shape[-1]
+        rsamples = nsamples % self.config.nsamples
 
-        # Take center 5 seconds
-        start_idx = int(len(audio_data) / 2 - 2.5 * self.config.FS)
-        end_idx = int(start_idx + 5.0 * self.config.FS)
-        audio_data = audio_data[start_idx:end_idx]
+        # Pad the audio
+        audio_tensor = torch.nn.functional.pad(
+            audio_tensor, (0, self.config.nsamples - rsamples), mode=self.config.padmode
+        )
         logger.debug(
             f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Audio after center crop: {audio_data.shape}, "
-            f"duration: {len(audio_data)/self.config.FS:.2f}s"
+            f"Audio after padding: {audio_tensor.shape}, "
+            f"duration: {len(audio_tensor)/self.config.FS:.2f}s"
         )
 
-        # Convert to spectrogram
-        spec_data = audio_to_spectrogram(audio_data, self.config)
+        # Unfold into 5-second segments with overlap
+        audio_segments = audio_tensor.unfold(
+            dimension=-1, size=self.config.nsamples, step=self.config.ufoldoverlap
+        )
+        num_segments = audio_segments.shape[0]
         logger.debug(
             f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Spectrogram shape: {spec_data.shape}"
+            f"Audio segments shape: {audio_segments.shape}, "
+            f"number of segments: {num_segments}"
         )
 
-        # Resize to 224x224 for EfficientNet
-        spec_data = cv2.resize(spec_data, (224, 224))
+        # Randomly select one segment for training
+        segment_idx = torch.randint(0, num_segments, (1,)).item()
+        audio_segment = audio_segments[segment_idx]
         logger.debug(
             f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Resized spectrogram shape: {spec_data.shape}"
+            f"Selected segment {segment_idx}/{num_segments} shape: {audio_segment.shape}"
+        )
+
+        # Convert segment to mel spectrogram
+        mel_spec = self.mel_transform(audio_segment)
+        logger.debug(
+            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
+            f"Mel spectrogram shape: {mel_spec.shape}"
+        )
+
+        # Resize spectrogram to 224x224 for EfficientNet
+        mel_spec = torch.tensor(cv2.resize(mel_spec.numpy(), (224, 224)))
+        logger.debug(
+            f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
+            f"Resized spectrogram shape: {mel_spec.shape}"
         )
 
         # Apply augmentations if any
         if self.augmentation:
-            spec_data = self.augmentation(image=spec_data)["image"]
+            mel_spec = torch.tensor(self.augmentation(image=mel_spec.numpy())["image"])
             logger.debug(
                 f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-                f"Augmented spectrogram shape: {spec_data.shape}"
+                f"Augmented spectrogram shape: {mel_spec.shape}"
             )
 
-        # Convert to tensor and add channel dimension
-        spec_data = torch.tensor(spec_data, dtype=torch.float32).unsqueeze(0)
-        spec_data = spec_data.repeat(3, 1, 1)  # Convert to 3 channels
+        # Add channel dimension and repeat to 3 channels
+        mel_spec = mel_spec.unsqueeze(0).repeat(3, 1, 1)
         logger.debug(
             f"[{self.mode}] Sample ({self.sample_count}/{self.total_samples}, idx={index}) - "
-            f"Final tensor shape: {spec_data.shape}"
+            f"Final tensor shape: {mel_spec.shape}"
         )
 
-        return spec_data, torch.tensor(row.target, dtype=torch.long)
+        return mel_spec, torch.tensor(row.target, dtype=torch.long)
+
+
+def collate_fn(batch):
+    """Custom collate function to handle batching of spectrograms."""
+    # Separate inputs and labels
+    inputs, labels = zip(*batch)
+
+    # Stack inputs and labels
+    inputs = torch.stack(inputs)
+    labels = torch.stack(labels)
+
+    return inputs, labels
 
 
 def get_transforms(mode: str) -> albu.Compose:
     """Get augmentation transforms based on mode."""
+    return None
     if mode == "train":
         return albu.Compose(
             [
@@ -347,11 +316,9 @@ def train_epoch(
 
         # Forward pass
         outputs = model(inputs)
-        if step == 0:  # Only log first batch output dimensions
-            logger.info(
-                f"Batch 1/{total_batches} - "
-                f"Model output dimensions: {outputs.shape}"
-            )
+        logger.info(
+            f"Batch 1/{total_batches} - " f"Model output dimensions: {outputs.shape}"
+        )
 
         loss = criterion(outputs, labels)
 
@@ -420,18 +387,20 @@ def main():
         valid_df, config, augmentation=get_transforms("valid"), mode="valid"
     )
 
-    # Create dataloaders
+    # Create dataloaders with custom collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=config.NUM_WORKERS,
+        collate_fn=collate_fn,
     )
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         num_workers=config.NUM_WORKERS,
+        collate_fn=collate_fn,
     )
     logger.info(
         f"Created dataloaders - Train: {len(train_loader)} batches, "
