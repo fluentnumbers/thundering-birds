@@ -37,3 +37,7 @@ help:
 	@echo "  make clean_logs        - Remove all log files"
 	@echo "  make all              - Run setup, install, and download dataset"
 	@echo "  make help             - Show this help message"
+
+
+freeze:
+	poetry export --without-hashes --format=requirements.txt > requirements.txt
