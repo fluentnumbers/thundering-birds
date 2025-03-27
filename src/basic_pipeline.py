@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchaudio
+from efficientnet_pytorch import EfficientNet
 from scipy import signal
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
@@ -72,7 +73,7 @@ class Config:
     def __init__(self):
         self.SEED = 42
         self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-        self.DEV_MODE = False  # Take only fraction of the dataset, for dev
+        self.DEV_MODE = True  # Take only fraction of the dataset, for dev
         self.DEV_MODE_N_SAMPLES = 300  # Number of samples to use in development mode
 
         # Data config
@@ -93,7 +94,7 @@ class Config:
         self.BATCH_SIZE = 32
         self.NUM_WORKERS = 1
         self.LR_MAX = 3e-4
-        self.EPOCHS = 20
+        self.EPOCHS = 5
 
         # Model config
         self.N_CLASSES = None  # Will be set after data loading
@@ -303,13 +304,8 @@ class EfficientNetModel(nn.Module):
 
     def __init__(self, num_classes: int):
         super().__init__()
-        self.efficientnet = torch.hub.load(
-            "NVIDIA/DeepLearningExamples:torchhub",
-            "nvidia_efficientnet_b0",
-            pretrained=True,
-        )
-        self.efficientnet.classifier.fc = nn.Linear(
-            self.efficientnet.classifier.fc.in_features, num_classes
+        self.efficientnet = EfficientNet.from_pretrained(
+            "efficientnet-b0", num_classes=num_classes, pretrained=True
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -689,6 +685,62 @@ def main():
             logger.info(f"Saved checkpoint to {checkpoint_path}")
 
     logger.info("Training completed!")
+    # Save final model for Kaggle submission
+    final_model_path = run_dir / "final_model.pt"
+
+    # Get the label mapping from metadata_df
+    unique_labels = sorted(metadata_df["primary_label"].unique())
+    label2id = {label: idx for idx, label in enumerate(unique_labels)}
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": config,
+            "class_mapping": {
+                idx: label for label, idx in label2id.items()
+            },  # Reverse mapping for inference
+        },
+        final_model_path,
+    )
+    logger.info(f"Saved final model for Kaggle submission to {final_model_path}")
+
+    # Export to ONNX format for faster inference (optional)
+    try:
+        dummy_input = torch.randn(1, 3, 224, 224, device=config.DEVICE)
+        onnx_path = run_dir / "model.onnx"
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            export_params=True,
+            opset_version=12,
+            do_constant_folding=True,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+        )
+        logger.info(f"Exported ONNX model to {onnx_path}")
+    except Exception as e:
+        logger.warning(f"Failed to export ONNX model: {e}")
+    # Save model to wandb
+    if wandb_logger.enabled:
+        try:
+            artifact = wandb_logger.wandb.Artifact(
+                name=f"model-{run_name}",
+                type="model",
+                description="Trained bird sound classification model",
+            )
+            # Add the PyTorch model file
+            artifact.add_file(str(final_model_path))
+            # Add the ONNX model if it was successfully exported
+            if os.path.exists(onnx_path):
+                artifact.add_file(str(onnx_path))
+            # Log the artifact to wandb
+            wandb_logger.wandb.log_artifact(artifact)
+            logger.info("Saved model to wandb artifacts")
+        except Exception as e:
+            logger.warning(f"Failed to save model to wandb: {e}")
+
     wandb_logger.finish()
 
 

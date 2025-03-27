@@ -29,6 +29,8 @@ torch-optim = "^0.0.4"
 torchmetrics = "^1.7.0"
 wandb = "^0.19.8"
 cupy-cuda12x = "^13.4.1"
+torch-onnx = "^0.1.25"
+efficientnet-pytorch = "^0.7.1"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
