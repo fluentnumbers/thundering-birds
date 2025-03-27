@@ -1,0 +1,3 @@
+"""
+Bird sound classification package.
+"""
