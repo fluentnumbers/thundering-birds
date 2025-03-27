@@ -49,7 +49,7 @@ class Config:
         MODEL_CONFIG = {
             "efficientnet_version": "efficientnet-b0",
             "kernel_size": (5, 5),
-            "cfar_scaling_factors": (5, 20),
+            "cfar_scaling_factors": (1, 20),
         }
         MAKE_RGB: bool = False
 
@@ -72,7 +72,7 @@ class Config:
 
     # Logging and visualization
     LOG_DIR: Path = Path("logs")
-    SAVE_SPECTROGRAMS: bool = False
+    SAVE_SPECTROGRAMS: bool = True
     WANDB_PROJECT: str = "bird-sound-classification"
 
     def __post_init__(self):

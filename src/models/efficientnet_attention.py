@@ -4,6 +4,10 @@ import torch
 import torch.nn as nn
 from efficientnet_pytorch import EfficientNet
 
+from src.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
 
 class CFARLayer(nn.Module):
     """
@@ -14,7 +18,7 @@ class CFARLayer(nn.Module):
     def __init__(
         self,
         kernel_size: Tuple[int, int] = (5, 5),
-        scaling_factor: float = 0.5,
+        scaling_factor: float = 1,
     ):
         super().__init__()
         self.kernel_size = kernel_size
@@ -30,13 +34,17 @@ class CFARLayer(nn.Module):
         self.scaling_factor = scaling_factor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Fixed kernel noise estimation
         local_noise = nn.functional.conv2d(x, self.kernel, padding=self.padding)
+        threshold = local_noise * self.scaling_factor
 
-        # Apply adaptive thresholding
-        return torch.where(
-            x > (local_noise * self.scaling_factor), x, torch.zeros_like(x)
-        )
+        # Add logging to monitor values (during development)
+        if torch.rand(1).item() < 0.01:  # Log 1% of forward passes
+            logger.info(
+                f"CFAR stats - Input: mean={x.mean():.4f}, std={x.std():.4f}, "
+                f"Threshold: mean={threshold.mean():.4f}, std={threshold.std():.4f}"
+            )
+
+        return torch.where(x > threshold, x, torch.zeros_like(x))
 
 
 class AttentionChannels(nn.Module):
@@ -47,9 +55,11 @@ class AttentionChannels(nn.Module):
     def __init__(
         self,
         kernel_size: Tuple[int, int] = (3, 3),
-        scaling_factors: Tuple[float, float] = (0.5, 0.7),
+        scaling_factors: Tuple[float, float] = (5, 20),
     ):
         super().__init__()
+        self.norm = nn.BatchNorm2d(1)  # Add normalization
+
         self.cfar1 = CFARLayer(
             kernel_size=kernel_size,
             scaling_factor=scaling_factors[0],
