@@ -67,6 +67,71 @@ def save_melspectrogram(
     )
 
 
+def save_attention_outputs(
+    attention_outputs: torch.Tensor,
+    label: str,
+    class_id: int,
+    filename: str,
+    chunk_id: int,
+    batch_id: int,
+    sample_id: int,
+    save_dir: Path,
+    epoch: int,
+    step: int,
+    wandb_logger: WandbLogger,
+) -> None:
+    """Save attention outputs as images and optionally log to wandb."""
+    # Convert to numpy and normalize for visualization
+    attention_np = attention_outputs.cpu().numpy()
+
+    # Create figure with 3 subplots for each channel
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # Plot original spectrogram
+    axes[0].imshow(attention_np[0], aspect="auto", origin="lower", cmap="viridis")
+    axes[0].set_title("Original Spectrogram")
+    axes[0].axis("off")
+
+    # Plot first attention channel
+    axes[1].imshow(attention_np[1], aspect="auto", origin="lower", cmap="viridis")
+    axes[1].set_title("Attention Channel 1")
+    axes[1].axis("off")
+
+    # Plot second attention channel
+    axes[2].imshow(attention_np[2], aspect="auto", origin="lower", cmap="viridis")
+    axes[2].set_title("Attention Channel 2")
+    axes[2].axis("off")
+
+    plt.suptitle(
+        f"Label: {label} (ID: {class_id})\nFile: {filename}\nChunk: {chunk_id}"
+    )
+    plt.tight_layout()
+
+    # Create filename with all components
+    img_filename = (
+        f"attention_epoch{epoch:02d}_batch{batch_id:03d}_sample{sample_id:03d}_"
+        f"class{class_id:03d}_{label}_chunk{chunk_id:03d}.png"
+    )
+
+    # Save to local filesystem
+    plt.savefig(save_dir / img_filename)
+    plt.close()
+
+    # Log to wandb if available
+    wandb_logger.log_image(
+        attention_np,
+        f"Attention Outputs - Label: {label} (ID: {class_id}), File: {filename}, Chunk: {chunk_id}",
+        epoch=epoch,
+        step=step,
+        label=label,
+        class_id=class_id,
+        filename=filename,
+        chunk_id=chunk_id,
+        batch_id=batch_id,
+        sample_id=sample_id,
+    )
+
+
 def train_epoch(
     model: nn.Module,
     train_loader: torch.utils.data.DataLoader,
@@ -84,18 +149,20 @@ def train_epoch(
     total_loss = 0
     total_batches = len(train_loader)
 
-    # Create directory for spectrograms if it doesn't exist
+    # Create directory for spectrograms and attention outputs if they don't exist
     spectrograms_dir = run_dir / "spectrograms"
+    attention_dir = run_dir / "attention_outputs"
     spectrograms_dir.mkdir(exist_ok=True)
+    attention_dir.mkdir(exist_ok=True)
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.EPOCHS}")
     for step, (inputs, labels) in enumerate(pbar):
-        # Save random spectrograms from the first batch of each epoch
-        if step == 0:
+        # Save random spectrograms and attention outputs from the first batch of each epoch
+        if step == 0 and False and config.SAVE_SPECTROGRAMS:
             # Get 3 random indices from the current batch
             random_indices = torch.randperm(len(inputs))[:3]
 
-            # Save spectrograms
+            # Save spectrograms and attention outputs
             for idx, random_idx in enumerate(random_indices):
                 spec = inputs[random_idx]
                 label_id = labels[random_idx].item()
@@ -105,7 +172,7 @@ def train_epoch(
                     "primary_label"
                 ].iloc[0]
 
-                # Convert to numpy and save
+                # Convert to numpy and save original spectrogram
                 spec_np = spec[0].numpy()  # Take first channel since they're identical
                 save_melspectrogram(
                     spec_np,
@@ -128,6 +195,32 @@ def train_epoch(
 
         # Forward pass
         outputs = model(inputs)
+
+        # Save attention outputs if this is the first batch
+        if step == 0 and config.SAVE_SPECTROGRAMS:
+            # Get 3 random indices from the current batch
+            random_indices = torch.randperm(len(inputs))[:3]
+            for idx, random_idx in enumerate(random_indices):
+                attention_outputs = model.get_attention_outputs()[random_idx]
+                label_id = labels[random_idx].item()
+                label = metadata_df[metadata_df["target"] == label_id][
+                    "primary_label"
+                ].iloc[0]
+
+                save_attention_outputs(
+                    attention_outputs,
+                    label=label,
+                    class_id=label_id,
+                    filename=f"batch_{step}_sample_{random_idx.item()}",
+                    chunk_id=idx,
+                    batch_id=step,
+                    sample_id=random_idx.item(),
+                    save_dir=attention_dir,
+                    epoch=epoch,
+                    step=step,
+                    wandb_logger=wandb_logger,
+                )
+
         loss = criterion(outputs, labels)
 
         # Backward pass

@@ -29,14 +29,14 @@ class Config:
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
     BATCH_SIZE: int = 32
     NUM_WORKERS: int = 4
-    EPOCHS: int = 2
+    EPOCHS: int = 5
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True
     DEV_MODE_N_SAMPLES: int = 300
 
     # Model configuration
     MODEL_NAME: str = (
-        "efficientnet"  # Options: "efficientnet", "efficientnet_attention"
+        "efficientnet_attention"  # Options: "efficientnet", "efficientnet_attention"
     )
 
     # Different configurations based on model type
@@ -49,8 +49,7 @@ class Config:
         MODEL_CONFIG = {
             "efficientnet_version": "efficientnet-b0",
             "kernel_size": (5, 5),
-            "learnable_cfar": True,
-            "cfar_thresholds": (0.5, 0.7),
+            "cfar_scaling_factors": (5, 20),
         }
         MAKE_RGB: bool = False
 

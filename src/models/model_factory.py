@@ -26,9 +26,8 @@ class ModelFactory:
             "default_config": {
                 "num_classes": None,  # Will be set during creation
                 "efficientnet_version": "efficientnet-b0",
-                "kernel_size": (3, 3),
-                "learnable_cfar": True,
-                "cfar_thresholds": (0.5, 0.7),
+                "kernel_size": (5, 5),
+                "cfar_scaling_factors": (5, 20),
             },
         },
     }
