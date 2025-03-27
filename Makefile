@@ -1,4 +1,4 @@
-.PHONY: download_kaggle_dataset clean_data setup install
+.PHONY: download_kaggle_dataset clean_data setup install clean_logs
 
 # Default target
 all: setup install download_kaggle_dataset
@@ -21,6 +21,12 @@ clean_data:
 	rm -rf data/*
 	rm -f birdclef-2025.zip
 
+# Clean logs directory
+clean_logs:
+	if exist logs\* del /Q /F /S logs\*
+	if exist logs rmdir /S /Q logs
+	mkdir logs
+
 # Show help
 help:
 	@echo "Available commands:"
@@ -28,5 +34,6 @@ help:
 	@echo "  make install           - Install project dependencies"
 	@echo "  make download_kaggle_dataset - Download the BirdCLEF 2025 dataset"
 	@echo "  make clean_data        - Remove all downloaded and extracted data"
+	@echo "  make clean_logs        - Remove all log files"
 	@echo "  make all              - Run setup, install, and download dataset"
 	@echo "  make help             - Show this help message"
