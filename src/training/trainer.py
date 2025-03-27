@@ -274,10 +274,11 @@ def train(config, run_dir: Path):
     unique_labels = sorted(metadata_df["primary_label"].unique())
     label2id = {label: idx for idx, label in enumerate(unique_labels)}
 
+    # Save only the essential data in a format that can be loaded without source code
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "config": config,
+            "num_classes": config.N_CLASSES,  # Save number of classes directly
             "class_mapping": {
                 idx: label for label, idx in label2id.items()
             },  # Reverse mapping for inference
