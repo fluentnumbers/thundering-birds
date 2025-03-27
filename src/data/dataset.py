@@ -16,11 +16,11 @@ class MelSpectrogramTransform:
 
     def __init__(self, config):
         self.to_melspectogram = torchaudio.transforms.MelSpectrogram(
-            sample_rate=config.FS,
+            sample_rate=config.SAMPLE_RATE,
             n_fft=config.N_FFT,
-            hop_length=config.WIN_LAP,
-            f_max=config.MAX_FREQ,
-            f_min=config.MIN_FREQ,
+            hop_length=config.HOP_LENGTH,
+            f_max=config.FMAX,
+            f_min=config.FMIN,
             n_mels=config.N_MELS,
         )
         self.to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)

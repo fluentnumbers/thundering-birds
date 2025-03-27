@@ -65,23 +65,23 @@ def preprocess_dataset(
         metadata_df.iterrows(), total=len(metadata_df), desc="Processing audio files"
     ):
         # Load audio
-        audio_data, _ = librosa.load(row.filepath, sr=config.FS)
+        audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)
         audio_tensor = torch.tensor(audio_data)
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
-        rsamples = nsamples % config.nsamples
+        rsamples = nsamples % config.NSAMPLES
         audio_tensor = torch.nn.functional.pad(
-            audio_tensor, (0, config.nsamples - rsamples), mode=config.padmode
+            audio_tensor, (0, config.NSAMPLES - rsamples), mode=config.PADMODE
         )
 
         # Calculate number of segments
-        n_segments = (len(audio_tensor) - config.nsamples) // config.ufoldoverlap + 1
+        n_segments = (len(audio_tensor) - config.NSAMPLES) // config.UFOLD_OVERLAP + 1
 
         # Process each segment
         for segment_idx in range(n_segments):
-            start_idx = segment_idx * config.ufoldoverlap
-            audio_segment = audio_tensor[start_idx : start_idx + config.nsamples]
+            start_idx = segment_idx * config.UFOLD_OVERLAP
+            audio_segment = audio_tensor[start_idx : start_idx + config.NSAMPLES]
 
             # Convert to mel spectrogram
             mel_spec = mel_transform(audio_segment)
@@ -89,8 +89,10 @@ def preprocess_dataset(
             # Resize to 224x224
             mel_spec = torch.tensor(cv2.resize(mel_spec.numpy(), (224, 224)))
 
-            # Add channel dimension and repeat to 3 channels
-            mel_spec = mel_spec.unsqueeze(0).repeat(3, 1, 1)
+            # Add channel dimension and optionally repeat to 3 channels for RGB
+            mel_spec = mel_spec.unsqueeze(0)
+            if config.MAKE_RGB:
+                mel_spec = mel_spec.repeat(3, 1, 1)
 
             # Append to lists
             all_spectrograms.append(mel_spec)

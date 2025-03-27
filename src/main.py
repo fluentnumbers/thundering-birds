@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from src.config.config import Config
+from config import Config
 from src.training.trainer import train
 from src.utils.logger import setup_logger
 

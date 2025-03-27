@@ -16,7 +16,8 @@ from tqdm import tqdm
 
 from src.data.dataset import BirdSoundDataset, collate_fn, get_transforms
 from src.data.preprocessing import load_metadata, preprocess_dataset
-from src.models.efficientnet import EfficientNetModel
+from src.models.efficientnet import create_model
+from src.models.model_factory import ModelFactory
 from src.utils.logger import WandbLogger, setup_logger
 
 
@@ -211,8 +212,11 @@ def train(config, run_dir: Path):
         collate_fn=collate_fn,
     )
 
-    # Initialize model
-    model = EfficientNetModel(config.N_CLASSES)
+    # Initialize model using the factory
+    model = ModelFactory.create_model(
+        model_config=config.model_config,
+        num_classes=config.N_CLASSES,
+    )
     model = model.to(config.DEVICE)
 
     if torch.cuda.device_count() > 1:
