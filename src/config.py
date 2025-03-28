@@ -23,7 +23,7 @@ class Config:
     TRAIN_METADATA_PATH: Path = DATA_ROOT / "train_metadata.csv"
     TEST_AUDIO_DIR: Path = DATA_ROOT / "test_audio"
     TEST_METADATA_PATH: Path = DATA_ROOT / "test_metadata.csv"
-
+    LOGS_DIR: Path = Path("logs")
     # Training parameters
     SEED: int = 42
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"

@@ -14,6 +14,7 @@ import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
+from src.config import LOGS_DIR
 from src.data.dataset import BirdSoundDataset, collate_fn, get_transforms
 from src.data.preprocessing import load_metadata, preprocess_dataset
 from src.models.efficientnet import create_model
@@ -114,6 +115,14 @@ def train_epoch(
 
 def train(config, run_dir: Path):
     """Main training pipeline."""
+    # Change run_dir initialization to use LOGS_DIR
+    run_dir = LOGS_DIR / run_dir.name
+    # or
+    run_dir = LOGS_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Create logs directory if it doesn't exist
+    run_dir.mkdir(parents=True, exist_ok=True)
+
     # Initialize wandb logger
     wandb_logger = WandbLogger(run_dir.name, run_dir)
 

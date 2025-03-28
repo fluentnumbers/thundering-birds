@@ -4,7 +4,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-from utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 # Set up logger
 logger = setup_logger(__name__)

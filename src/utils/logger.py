@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
+from src.config import LOGS_DIR
+
 
 def setup_logger(run_dir: Path) -> logging.Logger:
     """Setup logging with both file and console handlers."""
@@ -63,10 +65,11 @@ class WandbLogger:
             import wandb
 
             self.wandb = wandb
+            self.run_dir = LOGS_DIR / run_dir
             self.wandb.init(
                 project="bird-sound-classification",
                 name=run_name,
-                dir=str(run_dir),
+                dir=str(self.run_dir),
             )
             self.enabled = True
             logging.info("Initialized wandb logging")
