@@ -7,51 +7,40 @@ import numpy as np
 from src.config import LOGS_DIR
 
 
-def setup_logger(run_dir: Path) -> logging.Logger:
+def setup_logger(name: str, run_dir: Path = None) -> logging.Logger:
     """Setup logging with both file and console handlers."""
-    # Create logs directory if it doesn't exist
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-
-    # Create timestamped run directory
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"basic_pipeline_{run_timestamp}"
-    run_dir = log_dir / run_name
-    run_dir.mkdir(exist_ok=True)
-
-    # Setup logging with both file and console handlers
-    log_filename = "training.log"
-    log_filepath = run_dir / log_filename
-
-    # Get the root logger
-    logger = logging.getLogger()
+    logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
 
-    # Remove all existing handlers
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
+    # Only add handlers if they haven't been added already
+    if not logger.handlers:
+        # Create console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
 
-    # Create formatters and handlers
-    file_handler = logging.FileHandler(log_filepath)
-    console_handler = logging.StreamHandler()
+        # Create file handler if run_dir is provided
+        if run_dir is not None:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            log_filepath = run_dir / "training.log"
+            file_handler = logging.FileHandler(log_filepath)
+            file_handler.setLevel(logging.INFO)
+            logger.info(f"Logging to {log_filepath}")
 
-    # Define format
-    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    file_formatter = logging.Formatter(log_format)
-    console_formatter = logging.Formatter(log_format)
+        # Define format
+        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        formatter = logging.Formatter(log_format)
+        console_handler.setFormatter(formatter)
+        if run_dir is not None:
+            file_handler.setFormatter(formatter)
 
-    file_handler.setFormatter(file_formatter)
-    console_handler.setFormatter(console_formatter)
+        # Add handlers
+        logger.addHandler(console_handler)
+        if run_dir is not None:
+            logger.addHandler(file_handler)
 
-    # Add new handlers
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-
-    # Silence some logs
-    logging.getLogger("numba.core").setLevel(logging.WARNING)
-    logging.getLogger("PIL").setLevel(logging.WARNING)
-
-    logger.info(f"Logging to {log_filepath}")
+        # Silence some logs
+        logging.getLogger("numba.core").setLevel(logging.WARNING)
+        logging.getLogger("PIL").setLevel(logging.WARNING)
 
     return logger
 
@@ -65,7 +54,7 @@ class WandbLogger:
             import wandb
 
             self.wandb = wandb
-            self.run_dir = LOGS_DIR / run_dir
+            self.run_dir = run_dir  # Use the provided run_dir directly
             self.wandb.init(
                 project="bird-sound-classification",
                 name=run_name,

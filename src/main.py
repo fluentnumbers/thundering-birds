@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from config import Config
+from src.config import LOGS_DIR, Config
 from src.training.trainer import train
 from src.utils.logger import setup_logger
 
@@ -12,11 +12,12 @@ def main():
     # Initialize config
     config = Config()
 
+    # Create run directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = LOGS_DIR / f"basic_pipeline_{timestamp}"
+
     # Setup logging
-    run_dir = (
-        Path("logs") / f"basic_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    )
-    logger = setup_logger(run_dir)
+    logger = setup_logger(__name__, run_dir)
     logger.info(f"Using device: {config.DEVICE}")
 
     # Save config to run directory

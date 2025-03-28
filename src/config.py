@@ -4,6 +4,9 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
+# Global configuration variables
+LOGS_DIR = Path("logs")
+
 
 @dataclass
 class ModelConfig:
@@ -23,7 +26,6 @@ class Config:
     TRAIN_METADATA_PATH: Path = DATA_ROOT / "train_metadata.csv"
     TEST_AUDIO_DIR: Path = DATA_ROOT / "test_audio"
     TEST_METADATA_PATH: Path = DATA_ROOT / "test_metadata.csv"
-    LOGS_DIR: Path = Path("logs")
     # Training parameters
     SEED: int = 42
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -71,20 +73,8 @@ class Config:
     TRAIN_VALID_SPLIT: float = 0.2
 
     # Logging and visualization
-    LOG_DIR: Path = Path("logs")
     SAVE_SPECTROGRAMS: bool = True
     WANDB_PROJECT: str = "bird-sound-classification"
-
-    def __post_init__(self):
-        """Initialize paths and create necessary directories."""
-        # Create necessary directories
-        self.DATA_ROOT.mkdir(exist_ok=True)
-        self.LOG_DIR.mkdir(exist_ok=True)
-
-        # Set number of classes if not provided
-        if self.N_CLASSES is None:
-            # This will be set during data loading
-            self.N_CLASSES = 0
 
     @property
     def model_config(self) -> ModelConfig:

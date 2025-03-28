@@ -67,9 +67,10 @@ def train_epoch(
                 ].iloc[0]
 
                 # Get the original filename from metadata_df
-                # Use the label_id to find the corresponding row in metadata_df
                 row = metadata_df[metadata_df["target"] == label_id].iloc[0]
-                original_filename = row.get("filename", "unknown")
+                original_filename = Path(
+                    row.get("filename", "unknown")
+                ).stem  # Get filename without extension and path
 
                 # Include filename, class label and start sec in the filename
                 filename = f"{original_filename}_{label}_batch_{step}_sample_{idx}"
@@ -115,15 +116,7 @@ def train_epoch(
 
 def train(config, run_dir: Path):
     """Main training pipeline."""
-    # Change run_dir initialization to use LOGS_DIR
-    run_dir = LOGS_DIR / run_dir.name
-    # or
-    run_dir = LOGS_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Create logs directory if it doesn't exist
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialize wandb logger
+    # Initialize wandb logger with the existing run_dir
     wandb_logger = WandbLogger(run_dir.name, run_dir)
 
     # Set random seeds
