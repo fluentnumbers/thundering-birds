@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import albumentations as albu
 import cv2
@@ -9,6 +9,10 @@ import pandas as pd
 import torch
 import torchaudio
 from torch.utils.data import Dataset
+
+from src.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class MelSpectrogramTransform:
@@ -25,11 +29,15 @@ class MelSpectrogramTransform:
         )
         self.to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
         self.etol = 1e-8
+        logger.debug("Initialized MelSpectrogramTransform")
 
     def __call__(self, audio_sample: torch.Tensor) -> torch.Tensor:
         if torch.isnan(audio_sample).any():
             mean_value = torch.nanmean(audio_sample)
             audio_sample = torch.nan_to_num(audio_sample, nan=mean_value)
+            logger.warning(
+                f"Found NaN values in audio sample, replaced with mean: {mean_value}"
+            )
 
         output = self.to_melspectogram(audio_sample)
         output = librosa.power_to_db(output, ref=np.max)
@@ -43,14 +51,20 @@ class BirdSoundDataset(Dataset):
 
     def __init__(
         self,
-        processed_metadata_df: pd.DataFrame,
-        augmentation=None,
-        mode="train",
+        metadata_df: pd.DataFrame,
+        augmentation: Optional[albu.Compose] = None,
+        mode: str = "train",
     ):
-        self.processed_metadata_df = processed_metadata_df
+        self.metadata_df = metadata_df
         self.augmentation = augmentation
         self.mode = mode
-        self.total_samples = len(processed_metadata_df)
+        logger.info(
+            f"Initialized BirdSoundDataset with {len(metadata_df)} samples in {mode} mode"
+        )
+        if augmentation:
+            logger.debug("Using data augmentation")
+
+        self.total_samples = len(metadata_df)
 
         # Cache for loaded batch data
         self.current_batch_idx = None
@@ -59,7 +73,7 @@ class BirdSoundDataset(Dataset):
     def _load_batch(self, batch_idx: int):
         """Load a batch of spectrograms from disk."""
         if self.current_batch_idx != batch_idx:
-            batch_file = self.processed_metadata_df.iloc[0]["batch_file"]
+            batch_file = self.metadata_df.iloc[0]["batch_file"]
             self.current_batch_data = torch.load(batch_file)
             self.current_batch_idx = batch_idx
 
@@ -68,7 +82,7 @@ class BirdSoundDataset(Dataset):
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get batch information for this index
-        row = self.processed_metadata_df.iloc[index]
+        row = self.metadata_df.iloc[index]
         batch_idx = row["batch_idx"]
         sample_idx = row["sample_idx"]
 

@@ -6,6 +6,10 @@ import torch
 import torchaudio
 from requests import HTTPError
 
+from src.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
 # List of authors whose recordings contain human voice
 AUTHORS_WITH_VOICE = []
 COLLECTIONS_WITH_VOICE = ["CSA"]
@@ -16,10 +20,14 @@ def load_silero_vad():
         model, utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad", model="silero_vad"
         )
+        logger.info("Successfully loaded Silero VAD model")
         return model, utils
     except HTTPError as e:
-        print(f"Failed to download model: {e}")
-        print("Please check your internet connection and try again")
+        logger.error(f"Failed to download model: {e}")
+        logger.error("Please check your internet connection and try again")
+        return None, None
+    except Exception as e:
+        logger.error(f"Unexpected error loading Silero VAD model: {e}")
         return None, None
 
 

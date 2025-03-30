@@ -41,6 +41,9 @@ def setup_logger(name: str, run_dir: Path = None) -> logging.Logger:
         # Silence some logs
         logging.getLogger("numba.core").setLevel(logging.WARNING)
         logging.getLogger("PIL").setLevel(logging.WARNING)
+        logging.getLogger("torch.hub").setLevel(
+            logging.WARNING
+        )  # Silence torch.hub messages
 
     return logger
 
