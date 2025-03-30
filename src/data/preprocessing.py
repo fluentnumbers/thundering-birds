@@ -11,6 +11,9 @@ import torch
 from tqdm import tqdm
 
 from src.data.dataset import MelSpectrogramTransform
+from src.data.voice_removal import SileroVADRemover
+
+logger = logging.getLogger(__name__)
 
 
 def load_metadata(config) -> pd.DataFrame:
@@ -55,10 +58,18 @@ def preprocess_dataset(
     """
     mel_transform = MelSpectrogramTransform(config)
 
+    # Initialize voice remover if needed
+    voice_remover = None
+    if config.REMOVE_VOICE:
+        voice_remover = SileroVADRemover(config)
+        logger.info(
+            "Voice removal enabled - will detect and remove voice from recordings"
+        )
+
     # Initialize lists to store results
     all_spectrograms = []
     all_labels = []
-    total_size_mb = 0
+    processed_with_voice = 0
 
     # Process each audio file
     for idx, row in tqdm(
@@ -67,6 +78,12 @@ def preprocess_dataset(
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)
         audio_tensor = torch.tensor(audio_data)
+
+        # Check for voice and remove if needed
+        if voice_remover:
+            audio_tensor, has_voice = voice_remover(audio_tensor)
+            if has_voice:
+                processed_with_voice += 1
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
@@ -106,6 +123,12 @@ def preprocess_dataset(
                 current_size_mb = current_size / (1024 * 1024)
                 total_size_mb = current_size_mb
 
+    # Log final statistics
+    if config.REMOVE_VOICE:
+        logger.info(
+            f"Found and removed voice from {processed_with_voice} recordings ({processed_with_voice/len(metadata_df)*100:.1f}%)"
+        )
+
     # Convert lists to tensors
     spectrograms = torch.stack(all_spectrograms)
     labels = torch.tensor(all_labels)
@@ -131,6 +154,15 @@ def preprocess_and_save_dataset(
         Tuple of (output_dir, processed_metadata_df) containing paths to saved spectrograms
     """
     mel_transform = MelSpectrogramTransform(config)
+
+    # Initialize voice remover if needed
+    voice_remover = None
+    if config.REMOVE_VOICE:
+        voice_remover = SileroVADRemover(config)
+        logger.info(
+            "Voice removal enabled - will detect and remove voice from recordings"
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Initialize lists to store batch data
@@ -138,6 +170,7 @@ def preprocess_and_save_dataset(
     current_batch_labels = []
     current_batch_indices = []
     batch_file_counter = 0
+    processed_with_voice = 0
 
     # Process each audio file
     for idx, row in tqdm(
@@ -146,6 +179,12 @@ def preprocess_and_save_dataset(
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)
         audio_tensor = torch.tensor(audio_data)
+
+        # Check for voice and remove if needed
+        if voice_remover:
+            audio_tensor, has_voice = voice_remover(audio_tensor)
+            if has_voice:
+                processed_with_voice += 1
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
@@ -224,6 +263,12 @@ def preprocess_and_save_dataset(
                     "label": batch_data["labels"][idx].item(),
                 }
             )
+
+    # Log final statistics
+    if config.REMOVE_VOICE:
+        logger.info(
+            f"Found and removed voice from {processed_with_voice} recordings ({processed_with_voice/len(metadata_df)*100:.1f}%)"
+        )
 
     processed_metadata_df = pd.DataFrame(processed_metadata)
     return output_dir, processed_metadata_df

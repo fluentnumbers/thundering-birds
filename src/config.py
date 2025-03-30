@@ -56,6 +56,7 @@ class Config:
         MAKE_RGB: bool = False
 
     # Audio processing parameters
+    REMOVE_VOICE: bool = True
     SAMPLE_RATE: int = 32000
     DURATION: float = 5.0
     N_MELS: int = 128
