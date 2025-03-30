@@ -44,6 +44,12 @@ def setup_logger(name: str, run_dir: Path = None) -> logging.Logger:
         logging.getLogger("torch.hub").setLevel(
             logging.WARNING
         )  # Silence torch.hub messages
+        logging.getLogger("torch").setLevel(
+            logging.WARNING
+        )  # Silence general torch messages
+        logging.getLogger("torchaudio").setLevel(
+            logging.WARNING
+        )  # Silence torchaudio messages
 
     return logger
 

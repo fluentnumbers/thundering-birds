@@ -20,7 +20,7 @@ def load_silero_vad():
         model, utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad", model="silero_vad"
         )
-        logger.info("Successfully loaded Silero VAD model")
+        logger.debug("Successfully loaded Silero VAD model")
         return model, utils
     except HTTPError as e:
         logger.error(f"Failed to download model: {e}")
