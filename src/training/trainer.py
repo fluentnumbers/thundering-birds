@@ -22,6 +22,8 @@ from src.models.model_factory import ModelFactory
 from src.utils.logger import WandbLogger, setup_logger
 from src.utils.visualization import save_attention_outputs, save_melspectrogram
 
+logger = setup_logger(__name__)
+
 
 def train_epoch(
     model: nn.Module,
@@ -154,10 +156,18 @@ def train(config, run_dir: Path):
 
     # Preprocess and save datasets
     train_data_dir, train_processed_df = preprocess_and_save_dataset(
-        train_df, config, train_data_dir, batch_size=config.BATCH_SIZE
+        train_df,
+        config,
+        train_data_dir,
+        batch_size=config.BATCH_SIZE,
+        n_workers=config.NUM_WORKERS,
     )
     valid_data_dir, valid_processed_df = preprocess_and_save_dataset(
-        valid_df, config, valid_data_dir, batch_size=config.BATCH_SIZE
+        valid_df,
+        config,
+        valid_data_dir,
+        batch_size=config.BATCH_SIZE,
+        n_workers=config.NUM_WORKERS,
     )
 
     # Create datasets with processed data
