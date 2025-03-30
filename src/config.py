@@ -22,10 +22,10 @@ class Config:
 
     # Data paths
     DATA_ROOT: Path = Path("data/birdclef-2025")
-    TRAIN_AUDIO_DIR: Path = DATA_ROOT / "train_audio"
-    TRAIN_METADATA_PATH: Path = DATA_ROOT / "train_metadata.csv"
-    TEST_AUDIO_DIR: Path = DATA_ROOT / "test_audio"
-    TEST_METADATA_PATH: Path = DATA_ROOT / "test_metadata.csv"
+    TRAIN_AUDIO_PATH: Path = DATA_ROOT / "train_audio"
+    METADATA_PATH: Path = DATA_ROOT / "train.csv"
+    PROCESSED_DATA_DIR: Path = DATA_ROOT / "processed"
+
     # Training parameters
     SEED: int = 42
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"

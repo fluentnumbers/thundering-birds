@@ -39,27 +39,45 @@ class MelSpectrogramTransform:
 
 
 class BirdSoundDataset(Dataset):
-    """Dataset class for bird sound spectrograms using precomputed data."""
+    """Dataset class for bird sound spectrograms using precomputed data stored on disk."""
 
     def __init__(
         self,
-        spectrograms: torch.Tensor,
-        labels: torch.Tensor,
+        processed_metadata_df: pd.DataFrame,
         augmentation=None,
         mode="train",
     ):
-        self.spectrograms = spectrograms
-        self.labels = labels
+        self.processed_metadata_df = processed_metadata_df
         self.augmentation = augmentation
         self.mode = mode
-        self.total_samples = len(spectrograms)
+        self.total_samples = len(processed_metadata_df)
+
+        # Cache for loaded batch data
+        self.current_batch_idx = None
+        self.current_batch_data = None
+
+    def _load_batch(self, batch_idx: int):
+        """Load a batch of spectrograms from disk."""
+        if self.current_batch_idx != batch_idx:
+            batch_file = self.processed_metadata_df.iloc[0]["batch_file"]
+            self.current_batch_data = torch.load(batch_file)
+            self.current_batch_idx = batch_idx
 
     def __len__(self) -> int:
         return self.total_samples
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        spec = self.spectrograms[index]
-        label = self.labels[index]
+        # Get batch information for this index
+        row = self.processed_metadata_df.iloc[index]
+        batch_idx = row["batch_idx"]
+        sample_idx = row["sample_idx"]
+
+        # Load batch if needed
+        self._load_batch(batch_idx)
+
+        # Get spectrogram and label
+        spec = self.current_batch_data["spectrograms"][sample_idx]
+        label = self.current_batch_data["labels"][sample_idx]
 
         # Apply augmentations if any
         if self.augmentation and self.mode == "train":

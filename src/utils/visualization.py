@@ -96,8 +96,11 @@ def save_attention_outputs(
     )
     plt.tight_layout()
 
-    # Create filename with all components
-    img_filename = f"attention_{filename}_epoch{epoch:02d}_{label}(id:{class_id})_batch{batch_id:03d}_sample{sample_id:03d}_chunk{chunk_id:03d}.png"
+    # Create filename with all components in a more organized way
+    img_filename = (
+        f"attention_epoch{epoch:02d}_batch{batch_id:03d}_sample{sample_id:03d}_"
+        f"chunk{chunk_id:03d}_{filename}_{label}_class{class_id:03d}.png"
+    )
 
     # Save to local filesystem
     plt.savefig(save_dir / img_filename)
@@ -126,7 +129,7 @@ def save_attention_outputs(
         plt.imshow(channel_data, aspect="auto", origin="lower", cmap=config["cmap"])
         plt.colorbar()
         plt.title(
-            f"{config['name'].capitalize()} - Epoch {epoch} - {label} (ID: {class_id})"
+            f"{config['name'].capitalize()} - Epoch {epoch} - Label: {label} (ID: {class_id})"
         )
         plt.axis("off")
         plt.tight_layout()

@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from src.config import LOGS_DIR
 from src.data.dataset import BirdSoundDataset, collate_fn, get_transforms
-from src.data.preprocessing import load_metadata, preprocess_dataset
+from src.data.preprocessing import load_metadata, preprocess_and_save_dataset
 from src.models.efficientnet import create_model
 from src.models.model_factory import ModelFactory
 from src.utils.logger import WandbLogger, setup_logger
@@ -123,6 +123,19 @@ def train(config, run_dir: Path):
     torch.manual_seed(config.SEED)
     np.random.seed(config.SEED)
 
+    # Create directories for processed data
+    processed_data_dir = config.PROCESSED_DATA_DIR
+    processed_data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create run-specific subdirectories for train and validation data
+    run_specific_dir = processed_data_dir / run_dir.name
+    run_specific_dir.mkdir(exist_ok=True)
+
+    train_data_dir = run_specific_dir / "train"
+    valid_data_dir = run_specific_dir / "valid"
+    train_data_dir.mkdir(exist_ok=True)
+    valid_data_dir.mkdir(exist_ok=True)
+
     # Load data
     metadata_df = load_metadata(config)
 
@@ -139,20 +152,22 @@ def train(config, run_dir: Path):
             stratify=metadata_df["primary_label"],
         )
 
-    # Precompute datasets
-    train_spectrograms, train_labels = preprocess_dataset(train_df, config)
-    valid_spectrograms, valid_labels = preprocess_dataset(valid_df, config)
+    # Preprocess and save datasets
+    train_data_dir, train_processed_df = preprocess_and_save_dataset(
+        train_df, config, train_data_dir, batch_size=config.BATCH_SIZE
+    )
+    valid_data_dir, valid_processed_df = preprocess_and_save_dataset(
+        valid_df, config, valid_data_dir, batch_size=config.BATCH_SIZE
+    )
 
-    # Create datasets with precomputed data
+    # Create datasets with processed data
     train_dataset = BirdSoundDataset(
-        train_spectrograms,
-        train_labels,
+        train_processed_df,
         augmentation=get_transforms("train"),
         mode="train",
     )
     valid_dataset = BirdSoundDataset(
-        valid_spectrograms,
-        valid_labels,
+        valid_processed_df,
         augmentation=get_transforms("valid"),
         mode="valid",
     )
