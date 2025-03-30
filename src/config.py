@@ -26,11 +26,11 @@ class Config:
     METADATA_PATH: Path = DATA_ROOT / "train.csv"
     PROCESSED_DATA_DIR: Path = DATA_ROOT / "processed"
 
-    NUM_WORKERS: int = 10
     # Training parameters
     SEED: int = 42
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-    BATCH_SIZE: int = 64
+    BATCH_SIZE: int = 32
+    NUM_WORKERS: int = 4
     EPOCHS: int = 5
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True

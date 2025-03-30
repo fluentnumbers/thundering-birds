@@ -156,18 +156,10 @@ def train(config, run_dir: Path):
 
     # Preprocess and save datasets
     train_data_dir, train_processed_df = preprocess_and_save_dataset(
-        train_df,
-        config,
-        train_data_dir,
-        batch_size=config.BATCH_SIZE,
-        n_workers=config.NUM_WORKERS,
+        train_df, config, train_data_dir, batch_size=config.BATCH_SIZE
     )
     valid_data_dir, valid_processed_df = preprocess_and_save_dataset(
-        valid_df,
-        config,
-        valid_data_dir,
-        batch_size=config.BATCH_SIZE,
-        n_workers=config.NUM_WORKERS,
+        valid_df, config, valid_data_dir, batch_size=config.BATCH_SIZE
     )
 
     # Create datasets with processed data
