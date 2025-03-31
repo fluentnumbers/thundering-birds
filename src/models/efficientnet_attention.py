@@ -1,7 +1,8 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from efficientnet_pytorch import EfficientNet
 
 from src.utils.logger import setup_logger
@@ -27,14 +28,18 @@ class CFARLayer(nn.Module):
         # Initialize the convolution kernel for noise estimation
 
         # Fixed uniform kernel for average noise estimation
-        kernel = torch.ones(1, 1, *kernel_size) / (kernel_size[0] * kernel_size[1])
-        kernel = nn.Parameter(kernel, requires_grad=True)
-        self.register_buffer("kernel", kernel)
+        self.kernel = torch.ones(1, 1, *kernel_size) / (kernel_size[0] * kernel_size[1])
+        self.kernel = nn.Parameter(self.kernel, requires_grad=True)
 
         self.scaling_factor = scaling_factor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        local_noise = nn.functional.conv2d(x, self.kernel, padding=self.padding)
+        if self.padding == "same":
+            padding = (self.kernel_size[0] // 2, self.kernel_size[1] // 2)
+        else:
+            raise ValueError("Padding must be 'same'")
+
+        local_noise = nn.functional.conv2d(x, self.kernel, padding=padding)
         threshold = local_noise * self.scaling_factor
 
         # Add logging to monitor values (during development)
@@ -70,6 +75,9 @@ class AttentionChannels(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply normalization first
+        x = self.norm(x)
+
         # Generate two attention channels
         attention1 = self.cfar1(x)
         attention2 = self.cfar2(x)
@@ -99,7 +107,7 @@ class EfficientNetWithAttention(nn.Module):
         )
 
         # Load pre-trained EfficientNet
-        self.efficientnet = EfficientNet.from_pretrained(
+        self.efficientnet = EfficientNet.from_name(
             efficientnet_version, num_classes=num_classes
         )
 
