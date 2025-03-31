@@ -25,8 +25,6 @@ class CFARLayer(nn.Module):
         self.kernel_size = kernel_size
         self.padding = "same"
 
-        # Initialize the convolution kernel for noise estimation
-
         # Fixed uniform kernel for average noise estimation
         self.kernel = torch.ones(1, 1, *kernel_size) / (kernel_size[0] * kernel_size[1])
         self.kernel = nn.Parameter(self.kernel, requires_grad=True)

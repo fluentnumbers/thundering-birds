@@ -66,7 +66,10 @@ def preprocess_and_save_dataset(
 
     # Process each audio file
     for idx, row in tqdm(
-        metadata_df.iterrows(), total=len(metadata_df), desc="Processing audio files"
+        metadata_df.iterrows(),
+        total=len(metadata_df),
+        desc="Processing audio files",
+        unit="file",
     ):
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)

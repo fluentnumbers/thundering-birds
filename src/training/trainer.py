@@ -32,64 +32,71 @@ def train_epoch(
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler._LRScheduler,
     config,
-    epoch: int,
+    epoch_idx: int,
     run_dir: Path,
     wandb_logger: WandbLogger,
-    metadata_df: pd.DataFrame,
 ) -> float:
     """Train for one epoch."""
     model.train()
     total_loss = 0
     total_batches = len(train_loader)
 
-    # Create directory for spectrograms and attention outputs if they don't exist
+    # Create directories for spectrograms and attention outputs if they don't exist
     spectrograms_dir = run_dir / "spectrograms"
     attention_dir = run_dir / "attention_outputs"
     spectrograms_dir.mkdir(exist_ok=True)
     attention_dir.mkdir(exist_ok=True)
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.EPOCHS}")
-    for step, (inputs, labels) in enumerate(pbar):
-        inputs = inputs.to(config.DEVICE)
-        labels = labels.to(config.DEVICE)
+    # Pre-allocate tensors for batch processing
+    pbar = tqdm(
+        train_loader,
+        desc=f"Epoch {epoch_idx+1}/{config.EPOCHS}",
+        total=total_batches,
+        unit="batch",
+    )
+    for batch_idx, (inputs, labels) in enumerate(pbar):
+        # Move data to device in a single operation
+        inputs = inputs.to(config.DEVICE, non_blocking=True)
+        labels = labels.to(config.DEVICE, non_blocking=True)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
 
         # Forward pass
         outputs = model(inputs)
 
-        # Save attention outputs for batches 0 to 5
-        if step <= 5 and config.SAVE_SPECTROGRAMS:
-            # Save attention outputs for all samples in the batch
-            for idx in range(len(inputs)):
-                attention_outputs = model.get_attention_outputs()[idx]
-                label_id = labels[idx].item()
-                label = metadata_df[metadata_df["target"] == label_id][
-                    "primary_label"
-                ].iloc[0]
+        # Save attention outputs for the same 3 samples every epoch
+        if batch_idx == 0 and config.SAVE_SPECTROGRAMS:
+            # Only save the first 3 samples from the first batch
+            for idx in range(min(config.SAVE_SPECTROGRAMS_N_SAMPLES, len(inputs))):
+                try:
+                    attention_outputs = model.get_attention_outputs()[idx]
+                    label_id = labels[idx].item()
 
-                # Get the original filename from metadata_df
-                row = metadata_df[metadata_df["target"] == label_id].iloc[0]
-                original_filename = Path(
-                    row.get("filename", "unknown")
-                ).stem  # Get filename without extension and path
+                    # Get label from the dataset's DataFrame
+                    sample_df = train_loader.dataset.metadata_df.iloc[idx]
+                    label = sample_df["label"]
+                    filename = sample_df["filename"]
+                    original_filename = Path(filename).stem
 
-                # Include filename, class label and start sec in the filename
-                filename = f"{original_filename}_{label}_batch_{step}_sample_{idx}"
+                    # Include filename, class label and start sec in the filename
+                    filename = f"{original_filename}_{label}_epoch_{epoch_idx}_batch_{batch_idx}_sample_{idx}"
 
-                save_attention_outputs(
-                    attention_outputs,
-                    label=label,
-                    class_id=label_id,
-                    filename=filename,
-                    chunk_id=idx,
-                    batch_id=step,
-                    sample_id=idx,
-                    save_dir=attention_dir,
-                    epoch=epoch,
-                    step=step,
-                    wandb_logger=wandb_logger,
-                )
+                    save_attention_outputs(
+                        attention_outputs,
+                        label=label,
+                        class_id=label_id,
+                        filename=filename,
+                        batch_id=batch_idx,
+                        sample_id=idx,
+                        save_dir=attention_dir,
+                        epoch_id=epoch_idx,
+                        wandb_logger=wandb_logger,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to save attention outputs for sample {idx}: {e}"
+                    )
+                    continue
 
         loss = criterion(outputs, labels)
 
@@ -102,18 +109,65 @@ def train_epoch(
         total_loss += loss.item()
 
         # Log batch metrics with reduced frequency
-        if step % 50 == 0:  # Log every 50 steps
+        if batch_idx % 100 == 0:  # Log every 100 batches instead of 50
             wandb_logger.log(
                 {
-                    "batch": step + 1,
+                    "epoch": epoch_idx + 1,
+                    "batch": batch_idx + 1,
                     "batch_loss": loss.item(),
                     "learning_rate": scheduler.get_last_lr()[0],
                 }
             )
 
-        pbar.set_postfix(loss=total_loss / (step + 1))
+        pbar.set_postfix(loss=total_loss / (batch_idx + 1))
 
     return total_loss / len(train_loader)
+
+
+def validate(
+    model: nn.Module,
+    valid_loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    config,
+    epoch_idx: int,
+    wandb_logger: WandbLogger,
+) -> Tuple[float, float]:
+    """Validate the model."""
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, labels in valid_loader:
+            # Move data to device in a single operation
+            inputs = inputs.to(config.DEVICE, non_blocking=True)
+            labels = labels.to(config.DEVICE, non_blocking=True)
+
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            # Update metrics
+            total_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    # Calculate metrics
+    val_accuracy = 100 * correct / total
+    avg_val_loss = total_loss / len(valid_loader)
+
+    # Log validation metrics with reduced frequency
+    wandb_logger.log(
+        {
+            "epoch": epoch_idx,
+            "val_loss": avg_val_loss,
+            "val_accuracy": val_accuracy,
+        }
+    )
+
+    return avg_val_loss, val_accuracy
 
 
 def train(config, run_dir: Path):
@@ -143,16 +197,53 @@ def train(config, run_dir: Path):
 
     # Split data
     if config.DEV_MODE:
-        train_df, valid_df = train_test_split(
-            metadata_df, test_size=0.2, random_state=config.SEED
+        # For DEV_MODE, use a pre-determined split with 5 specific classes
+        # Define a fixed list of 5 classes to use in development mode
+        class_counts = metadata_df["primary_label"].value_counts()
+        min_n_samples = 4
+        classes_to_keep = class_counts[class_counts >= min_n_samples].index.tolist()
+        metadata_df = metadata_df[metadata_df["primary_label"].isin(classes_to_keep)]
+        unique_labels = sorted(metadata_df["primary_label"].unique())[
+            : config.DEV_MODE_N_CLASSES
+        ]
+        metadata_df = metadata_df[metadata_df["primary_label"].isin(unique_labels)]
+
+        # Create a new label mapping for the filtered classes
+        label2id = {label: idx for idx, label in enumerate(unique_labels)}
+        metadata_df["target"] = metadata_df["primary_label"].map(label2id)
+
+        logger.info(
+            f"Filtered out classes with less than {min_n_samples} samples. Remaining classes: {len(unique_labels)}"
         )
-    else:
+
+        # Log the selected classes for reproducibility
+        logger.info(
+            f"DEV_MODE: Using {len(unique_labels)} classes for development: {unique_labels}"
+        )
+        wandb_logger.log({"unique_labels": unique_labels})
+
+        # Create a simple train/test split for these classes
         train_df, valid_df = train_test_split(
             metadata_df,
             test_size=0.2,
             random_state=config.SEED,
-            stratify=metadata_df["primary_label"],
+            stratify=metadata_df["target"],
         )
+        config.N_CLASSES = len(unique_labels)
+
+    else:
+        # Create label mapping for full dataset
+        unique_labels = sorted(metadata_df["primary_label"].unique())
+        label2id = {label: idx for idx, label in enumerate(unique_labels)}
+        metadata_df["target"] = metadata_df["primary_label"].map(label2id)
+
+        train_df, valid_df = train_test_split(
+            metadata_df,
+            test_size=0.2,
+            random_state=config.SEED,
+            stratify=metadata_df["target"],
+        )
+        config.N_CLASSES = len(unique_labels)
 
     # Preprocess and save datasets
     train_data_dir, train_processed_df = preprocess_and_save_dataset(
@@ -174,13 +265,16 @@ def train(config, run_dir: Path):
         mode="valid",
     )
 
-    # Create dataloaders with custom collate function
+    # Create dataloaders with optimized settings for CPU
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=config.NUM_WORKERS,
         collate_fn=collate_fn,
+        pin_memory=True,  # Enable pin_memory for faster data transfer
+        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=2,  # Prefetch 2 batches per worker
     )
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
@@ -188,6 +282,9 @@ def train(config, run_dir: Path):
         shuffle=False,
         num_workers=config.NUM_WORKERS,
         collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     # Initialize model using the factory
@@ -197,12 +294,13 @@ def train(config, run_dir: Path):
     )
     model = model.to(config.DEVICE)
 
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    # Enable torch.backends.cudnn benchmarking for faster training
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = True
 
-    # Initialize training components
+    # Initialize training components with optimized settings
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config.LR_MAX)
+    optimizer = optim.Adam(model.parameters(), lr=config.LR_MAX, eps=1e-8)
 
     # Calculate total steps for scheduler
     total_steps = config.EPOCHS * len(train_loader)
@@ -217,7 +315,14 @@ def train(config, run_dir: Path):
     )
 
     # Training loop
-    for epoch in range(config.EPOCHS):
+    best_val_accuracy = 0.0
+    best_model_path = None
+    patience = 10
+    patience_counter = 0
+
+    # Training loop
+    for epoch_idx in range(config.EPOCHS):
+        # Training phase
         train_loss = train_epoch(
             model,
             train_loader,
@@ -225,32 +330,83 @@ def train(config, run_dir: Path):
             optimizer,
             scheduler,
             config,
-            epoch,
+            epoch_idx,
             run_dir,
             wandb_logger,
-            metadata_df,
         )
 
-        # Log epoch metrics
-        wandb_logger.log({"epoch": epoch, "train_loss": train_loss})
+        # Validation phase
+        val_loss, val_accuracy = validate(
+            model,
+            valid_loader,
+            criterion,
+            config,
+            epoch_idx,
+            wandb_logger,
+        )
 
-        # Save checkpoint
-        if (epoch + 1) % 5 == 0:
-            checkpoint_path = run_dir / f"model_epoch_{epoch+1}.pt"
+        wandb_logger.log(
+            {
+                "epoch": epoch_idx,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_accuracy": val_accuracy,
+                "learning_rate": scheduler.get_last_lr()[0],
+            }
+        )
+
+        # Save best model with reduced frequency
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            best_model_path = run_dir / f"best_model_epoch_{epoch_idx+1}.pt"
             torch.save(
                 {
-                    "epoch": epoch,
+                    "epoch": epoch_idx,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "loss": train_loss,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_accuracy": val_accuracy,
+                },
+                best_model_path,
+            )
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        # Regular checkpoint saving with reduced frequency
+        if (epoch_idx + 1) % 10 == 0:  # Save every 10 epochs instead of 5
+            checkpoint_path = run_dir / f"model_epoch_{epoch_idx+1}.pt"
+            torch.save(
+                {
+                    "epoch": epoch_idx,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_accuracy": val_accuracy,
                 },
                 checkpoint_path,
             )
 
+        # Early stopping
+        if patience_counter >= patience:
+            logger.info(f"Early stopping triggered after {epoch_idx + 1} epochs")
+            break
+
     # Save final model for Kaggle submission
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     final_model_path = run_dir / f"final_model_{timestamp}.pt"
+
+    # Use the best model for final save
+    if best_model_path is not None and best_model_path.exists():
+        best_checkpoint = torch.load(best_model_path)
+        model.load_state_dict(best_checkpoint["model_state_dict"])
+        logger.info(
+            f"Using best model from epoch {best_checkpoint['epoch'] + 1} with validation accuracy {best_checkpoint['val_accuracy']:.2f}%"
+        )
 
     # Get the label mapping from metadata_df
     unique_labels = sorted(metadata_df["primary_label"].unique())

@@ -31,10 +31,10 @@ class Config:
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
     BATCH_SIZE: int = 64
     NUM_WORKERS: int = 10
-    EPOCHS: int = 10
+    EPOCHS: int = 30
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True
-    DEV_MODE_N_CLASSES: int = 5
+    DEV_MODE_N_CLASSES: int = 3
 
     # Model configuration
     MODEL_NAME: str = (
@@ -51,7 +51,7 @@ class Config:
         MODEL_CONFIG = {
             "efficientnet_version": "efficientnet-b0",
             "kernel_size": (5, 5),
-            "cfar_scaling_factors": (1, 20),
+            "cfar_scaling_factors": (1, 2),
         }
         MAKE_RGB: bool = False
 
@@ -74,7 +74,7 @@ class Config:
     TRAIN_VALID_SPLIT: float = 0.2
 
     # Logging and visualization
-    SAVE_SPECTROGRAMS: bool = True
+    SAVE_SPECTROGRAMS: bool = False
     SAVE_SPECTROGRAMS_N_SAMPLES: int = 3
     WANDB_PROJECT: str = "bird-sound-classification"
 
