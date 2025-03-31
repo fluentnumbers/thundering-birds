@@ -29,12 +29,12 @@ class Config:
     # Training parameters
     SEED: int = 42
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-    BATCH_SIZE: int = 32
-    NUM_WORKERS: int = 4
-    EPOCHS: int = 5
+    BATCH_SIZE: int = 64
+    NUM_WORKERS: int = 10
+    EPOCHS: int = 10
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True
-    DEV_MODE_N_SAMPLES: int = 300
+    DEV_MODE_N_CLASSES: int = 5
 
     # Model configuration
     MODEL_NAME: str = (
@@ -75,6 +75,7 @@ class Config:
 
     # Logging and visualization
     SAVE_SPECTROGRAMS: bool = True
+    SAVE_SPECTROGRAMS_N_SAMPLES: int = 3
     WANDB_PROJECT: str = "bird-sound-classification"
 
     @property

@@ -25,21 +25,6 @@ def load_metadata(config) -> pd.DataFrame:
         lambda x: os.path.join(config.TRAIN_AUDIO_PATH, x)
     )
 
-    # Get unique labels and create label mapping
-    labels = sorted(metadata_df["primary_label"].unique())
-    label2id = {label: idx for idx, label in enumerate(labels)}
-    metadata_df["target"] = metadata_df["primary_label"].map(label2id)
-
-    config.N_CLASSES = len(labels)
-
-    # For development: limit to a fractions of  samples while maintaining class distribution
-    if config.DEV_MODE:
-        metadata_df = metadata_df.groupby("primary_label", group_keys=False).apply(
-            lambda x: x.sample(
-                n=min(config.DEV_MODE_N_SAMPLES // config.N_CLASSES, len(x))
-            )
-        )
-
     return metadata_df
 
 
