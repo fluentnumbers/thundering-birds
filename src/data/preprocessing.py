@@ -209,20 +209,20 @@ def preprocess_and_save_dataset(
     all_metadata = []
 
     try:
-        # Process files in chunks to control memory usage
-        chunk_size = 10  # Process 10 files at a time
-        for chunk_start in tqdm(
-            range(0, len(metadata_df), chunk_size),
-            desc=f"Processing audio files by {chunk_size} at once to control memory usage",
-            unit="chunk",
+        # Process files in groups to control memory usage
+        num_files_per_group = 10  # Process 10 files at a time
+        for group_st_idx in tqdm(
+            range(0, len(metadata_df), num_files_per_group),
+            desc=f"Processing audio files by {num_files_per_group} at once to control memory usage",
+            unit="group",
         ):
-            chunk_end = min(chunk_start + chunk_size, len(metadata_df))
-            chunk_df = metadata_df.iloc[chunk_start:chunk_end]
+            group_end_idx = min(group_st_idx + num_files_per_group, len(metadata_df))
+            group_df = metadata_df.iloc[group_st_idx:group_end_idx]
 
             # Process current chunk
             chunk_results = []
             for result in pool.imap(
-                process_func, [row for _, row in chunk_df.iterrows()]
+                process_func, [row for _, row in group_df.iterrows()]
             ):
                 if result["success"]:
                     chunk_results.extend(result["segments"])
