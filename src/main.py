@@ -1,9 +1,14 @@
 import json
+
+# Set multiprocessing start method to 'spawn' for cluster environments
+import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
 
 import torch
 from dotenv import load_dotenv
+
+mp.set_start_method("spawn", force=True)
 
 from src.config import LOGS_DIR, Config
 from src.training.trainer import train

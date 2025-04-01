@@ -33,7 +33,6 @@ def load_metadata(config) -> pd.DataFrame:
 def process_audio_file(
     row: pd.Series,
     config,
-    mel_transform: MelSpectrogramTransform,
     use_voice_removal: bool = False,
 ) -> Dict:
     """Process a single audio file and return its segments.
@@ -41,16 +40,23 @@ def process_audio_file(
     Args:
         row: DataFrame row containing file information
         config: Configuration object
-        mel_transform: MelSpectrogram transformer
         use_voice_removal: Whether to use voice removal
 
     Returns:
         Dictionary containing processed segments and metadata
     """
     try:
+        # Force CPU device for preprocessing
+        device = torch.device("cpu")
+
+        # Initialize mel transform inside the worker
+        mel_transform = MelSpectrogramTransform(config)
+        mel_transform.to_melspectogram = mel_transform.to_melspectogram.to(device)
+        mel_transform.to_db = mel_transform.to_db.to(device)
+
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)
-        audio_tensor = torch.tensor(audio_data, dtype=torch.float32)
+        audio_tensor = torch.tensor(audio_data, dtype=torch.float32, device=device)
 
         # Initialize voice remover inside the worker process if needed
         has_voice = False
@@ -73,11 +79,13 @@ def process_audio_file(
             start_idx = segment_idx * config.UFOLD_OVERLAP
             audio_segment = audio_tensor[start_idx : start_idx + config.NSAMPLES]
 
-            # Convert to mel spectrogram (already on CPU)
+            # Convert to mel spectrogram
             mel_spec = mel_transform(audio_segment)
 
             # Resize to 224x224
-            mel_spec = torch.tensor(cv2.resize(mel_spec.numpy(), (224, 224)))
+            mel_spec = torch.tensor(
+                cv2.resize(mel_spec.numpy(), (224, 224)), device=device
+            )
 
             # Add channel dimension and optionally repeat to 3 channels for RGB
             mel_spec = mel_spec.unsqueeze(0)
@@ -160,11 +168,6 @@ def preprocess_and_save_dataset(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize mel transform on CPU
-    mel_transform = MelSpectrogramTransform(config)
-    mel_transform.to_melspectogram = mel_transform.to_melspectogram.cpu()
-    mel_transform.to_db = mel_transform.to_db.cpu()
-
     # Log if voice removal is enabled
     if config.REMOVE_VOICE:
         logger.info(
@@ -176,7 +179,6 @@ def preprocess_and_save_dataset(
     process_func = partial(
         process_audio_file,
         config=config,
-        mel_transform=mel_transform,
         use_voice_removal=config.REMOVE_VOICE,
     )
 
