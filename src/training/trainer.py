@@ -384,9 +384,6 @@ def save_final_model(model, config, run_dir: Path, metadata_df, wandb_logger):
 
 def train(config, run_dir: Path):
     """Main training pipeline with distributed support."""
-    # Initialize distributed training
-    setup_distributed(config)
-
     # Initialize wandb logger only on main process
     wandb_logger = None
     if config.LOCAL_RANK <= 0:
@@ -483,6 +480,9 @@ def train(config, run_dir: Path):
             batch_size=config.BATCH_SIZE,
             n_workers=config.NUM_WORKERS,
         )
+
+        # Initialize distributed training after preprocessing
+        setup_distributed(config)
 
         # Create datasets with processed data
         train_dataset = BirdSoundDataset(

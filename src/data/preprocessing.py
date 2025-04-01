@@ -177,9 +177,25 @@ def preprocess_and_save_dataset(
 
     # Create a pool of workers
     pool = mp.Pool(n_workers)
+
+    # Create a simplified config for preprocessing that doesn't include distributed training objects
+    preprocess_config = {
+        "SAMPLE_RATE": config.SAMPLE_RATE,
+        "NSAMPLES": config.NSAMPLES,
+        "PADMODE": config.PADMODE,
+        "UFOLD_OVERLAP": config.UFOLD_OVERLAP,
+        "MAKE_RGB": config.MAKE_RGB,
+        "REMOVE_VOICE": config.REMOVE_VOICE,
+        "N_MELS": config.N_MELS,
+        "HOP_LENGTH": config.HOP_LENGTH,
+        "N_FFT": config.N_FFT,
+        "FMIN": config.FMIN,
+        "FMAX": config.FMAX,
+    }
+
     process_func = partial(
         process_audio_file,
-        config=config,
+        config=preprocess_config,
         use_voice_removal=config.REMOVE_VOICE,
     )
 
