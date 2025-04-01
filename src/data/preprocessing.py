@@ -1,7 +1,9 @@
 import logging
+import multiprocessing as mp
 import os
+from functools import partial
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import librosa
@@ -28,58 +30,33 @@ def load_metadata(config) -> pd.DataFrame:
     return metadata_df
 
 
-def preprocess_and_save_dataset(
-    metadata_df: pd.DataFrame,
+def process_audio_file(
+    row: pd.Series,
     config,
-    output_dir: Path,
-    batch_size: int,
-) -> Tuple[Path, pd.DataFrame]:
-    """Preprocess audio files and save spectrograms to disk in batches.
+    mel_transform: MelSpectrogramTransform,
+    use_voice_removal: bool = False,
+) -> Dict:
+    """Process a single audio file and return its segments.
 
     Args:
-        metadata_df: DataFrame containing metadata
+        row: DataFrame row containing file information
         config: Configuration object
-        output_dir: Directory to save processed spectrograms
-        batch_size: Number of spectrograms in each batch
+        mel_transform: MelSpectrogram transformer
+        use_voice_removal: Whether to use voice removal
 
     Returns:
-        Tuple of (output_dir, processed_metadata_df) containing paths to saved spectrograms
+        Dictionary containing processed segments and metadata
     """
-    mel_transform = MelSpectrogramTransform(config)
-
-    # Initialize voice remover if needed
-    voice_remover = None
-    if config.REMOVE_VOICE:
-        voice_remover = SileroVADRemover(config)
-        logger.info(
-            "Voice removal enabled - will detect and remove voice from recordings"
-        )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialize lists to store batch data
-    current_batch_spectrograms = []
-    current_batch_labels = []
-    current_batch_indices = []
-    batch_file_counter = 0
-    processed_with_voice = 0
-
-    # Process each audio file
-    for idx, row in tqdm(
-        metadata_df.iterrows(),
-        total=len(metadata_df),
-        desc="Processing audio files",
-        unit="file",
-    ):
+    try:
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)
         audio_tensor = torch.tensor(audio_data)
 
-        # Check for voice and remove if needed
-        if voice_remover:
+        # Initialize voice remover inside the worker process if needed
+        has_voice = False
+        if use_voice_removal:
+            voice_remover = SileroVADRemover(config)
             audio_tensor, has_voice = voice_remover(audio_tensor)
-            if has_voice:
-                processed_with_voice += 1
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
@@ -91,7 +68,7 @@ def preprocess_and_save_dataset(
         # Calculate number of segments
         n_segments = (len(audio_tensor) - config.NSAMPLES) // config.UFOLD_OVERLAP + 1
 
-        # Process each segment
+        segments = []
         for segment_idx in range(n_segments):
             start_idx = segment_idx * config.UFOLD_OVERLAP
             audio_segment = audio_tensor[start_idx : start_idx + config.NSAMPLES]
@@ -107,63 +84,148 @@ def preprocess_and_save_dataset(
             if config.MAKE_RGB:
                 mel_spec = mel_spec.repeat(3, 1, 1)
 
-            # Append to current batch
-            current_batch_spectrograms.append(mel_spec)
-            current_batch_labels.append(row.target)
-            current_batch_indices.append((idx, segment_idx))
-
-            # Save batch when it reaches batch_size
-            if len(current_batch_spectrograms) >= batch_size:
-                # Stack current batch
-                batch_data = {
-                    "spectrograms": torch.stack(current_batch_spectrograms),
-                    "labels": torch.tensor(current_batch_labels),
-                    "indices": current_batch_indices,
-                }
-
-                # Save batch file
-                batch_file = output_dir / f"batch_{batch_file_counter}.pickle"
-                torch.save(batch_data, batch_file)
-
-                # Reset batch lists
-                current_batch_spectrograms = []
-                current_batch_labels = []
-                current_batch_indices = []
-                batch_file_counter += 1
-
-    # Save any remaining samples
-    if current_batch_spectrograms:
-        batch_data = {
-            "spectrograms": torch.stack(current_batch_spectrograms),
-            "labels": torch.tensor(current_batch_labels),
-            "indices": current_batch_indices,
-        }
-        batch_file = output_dir / f"batch_{batch_file_counter}.pickle"
-        torch.save(batch_data, batch_file)
-
-    # Create a DataFrame with batch file information
-    processed_metadata = []
-    for batch_file in sorted(output_dir.glob("batch_*.pickle")):
-        batch_data = torch.load(batch_file)
-        for idx, (file_idx, segment_idx) in enumerate(batch_data["indices"]):
-            processed_metadata.append(
+            segments.append(
                 {
-                    "batch_file": str(batch_file),
-                    "batch_idx": batch_file.stem.split("_")[
-                        1
-                    ],  # Extract the batch number
-                    "sample_idx": idx,
-                    "file_idx": file_idx,
+                    "spectrogram": mel_spec,
+                    "label": row.target,
+                    "file_idx": row.name,
                     "segment_idx": segment_idx,
-                    "label": batch_data["labels"][idx].item(),
                 }
             )
 
-    # Log final statistics
+        return {
+            "segments": segments,
+            "has_voice": has_voice,
+            "success": True,
+            "error": None,
+        }
+    except Exception as e:
+        return {"segments": [], "has_voice": False, "success": False, "error": str(e)}
+
+
+def save_batch(batch_data: Dict, output_path: Path, batch_idx: int) -> Dict:
+    """Save a batch of spectrograms to disk.
+
+    Args:
+        batch_data: Dictionary containing batch information
+        output_path: Directory to save the batch
+        batch_idx: Index of the batch
+
+    Returns:
+        Dictionary containing metadata about saved samples
+    """
+    batch_file = output_path / f"batch_{batch_idx}.pickle"
+    torch.save(batch_data, batch_file)
+
+    metadata = []
+    for idx, (file_idx, segment_idx) in enumerate(batch_data["indices"]):
+        metadata.append(
+            {
+                "batch_file": str(batch_file),
+                "batch_idx": batch_idx,
+                "sample_idx": idx,
+                "file_idx": file_idx,
+                "segment_idx": segment_idx,
+                "label": batch_data["labels"][idx].item(),
+            }
+        )
+    return metadata
+
+
+def preprocess_and_save_dataset(
+    metadata_df: pd.DataFrame,
+    config,
+    output_dir: Path,
+    batch_size: int,
+    n_workers: int = None,
+) -> Tuple[Path, pd.DataFrame]:
+    """Preprocess audio files in parallel and save spectrograms to disk in batches.
+
+    Args:
+        metadata_df: DataFrame containing metadata
+        config: Configuration object
+        output_dir: Directory to save processed spectrograms
+        batch_size: Number of spectrograms in each batch
+        n_workers: Number of worker processes (defaults to CPU count - 1)
+
+    Returns:
+        Tuple of (output_dir, processed_metadata_df)
+    """
+    if n_workers is None:
+        n_workers = max(1, mp.cpu_count() - 1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    mel_transform = MelSpectrogramTransform(config)
+
+    # Log if voice removal is enabled
     if config.REMOVE_VOICE:
         logger.info(
-            f"Found and removed voice from {processed_with_voice} recordings ({processed_with_voice/len(metadata_df)*100:.1f}%)"
+            "Voice removal enabled - will detect and remove voice from recordings"
         )
 
-    processed_metadata_df = pd.DataFrame(processed_metadata)
+    # Create a pool of workers
+    pool = mp.Pool(n_workers)
+    process_func = partial(
+        process_audio_file,
+        config=config,
+        mel_transform=mel_transform,
+        use_voice_removal=config.REMOVE_VOICE,
+    )
+
+    # Process files in parallel
+    results = []
+    processed_with_voice = 0
+    failed_files = []
+
+    for result in tqdm(
+        pool.imap(process_func, [row for _, row in metadata_df.iterrows()]),
+        total=len(metadata_df),
+        desc=f"Processing audio files with {n_workers} workers",
+        unit="file",
+    ):
+        if result["success"]:
+            results.extend(result["segments"])
+            if result["has_voice"]:
+                processed_with_voice += 1
+        else:
+            failed_files.append(result["error"])
+
+    pool.close()
+    pool.join()
+
+    # Sort segments by file_idx and segment_idx for reproducibility
+    results.sort(key=lambda x: (x["file_idx"], x["segment_idx"]))
+
+    # Organize segments into batches
+    all_metadata = []
+
+    for batch_idx in tqdm(
+        range(0, len(results), batch_size), desc="Saving batches", unit="batch"
+    ):
+        batch_segments = results[batch_idx : batch_idx + batch_size]
+
+        # Prepare batch data
+        batch_data = {
+            "spectrograms": torch.stack([s["spectrogram"] for s in batch_segments]),
+            "labels": torch.tensor([s["label"] for s in batch_segments]),
+            "indices": [(s["file_idx"], s["segment_idx"]) for s in batch_segments],
+        }
+
+        # Save batch and collect metadata
+        batch_metadata = save_batch(batch_data, output_dir, batch_idx // batch_size)
+        all_metadata.extend(batch_metadata)
+
+    # Log statistics
+    if config.REMOVE_VOICE:
+        logger.info(
+            f"Found and removed voice from {processed_with_voice} recordings "
+            f"({processed_with_voice/len(metadata_df)*100:.1f}%)"
+        )
+
+    if failed_files:
+        logger.warning(f"Failed to process {len(failed_files)} files")
+        for error in failed_files[:5]:  # Log first 5 errors
+            logger.warning(f"Error: {error}")
+
+    processed_metadata_df = pd.DataFrame(all_metadata)
     return output_dir, processed_metadata_df

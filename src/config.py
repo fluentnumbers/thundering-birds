@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
@@ -29,8 +30,8 @@ class Config:
     # Training parameters
     SEED: int = 42
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-    BATCH_SIZE: int = 64
-    NUM_WORKERS: int = 10
+    BATCH_SIZE: int = 128
+    NUM_WORKERS: int = os.cpu_count()
     EPOCHS: int = 30
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True

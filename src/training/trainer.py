@@ -18,12 +18,13 @@ from tqdm import tqdm
 from src.config import LOGS_DIR
 from src.data.dataset import BirdSoundDataset, collate_fn, get_transforms
 from src.data.preprocessing import load_metadata, preprocess_and_save_dataset
-from src.models.efficientnet import create_model
 from src.models.model_factory import ModelFactory
 from src.utils.logger import WandbLogger, setup_logger
-from src.utils.visualization import save_attention_outputs, save_melspectrogram
+from src.utils.visualization import save_attention_outputs
 
 logger = setup_logger(__name__)
+torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+torch.backends.mkldnn.enabled = True  # Enable MKL-DNN acceleration if available
 
 
 def train_epoch(
@@ -110,7 +111,7 @@ def train_epoch(
         total_loss += loss.item()
 
         # Log batch metrics with reduced frequency
-        if batch_idx % 100 == 0:  # Log every 100 batches instead of 50
+        if batch_idx % 100 == 0:  # Log every 100 batches instead of every batch
             wandb_logger.log(
                 {
                     "epoch": epoch_idx + 1,
@@ -261,10 +262,18 @@ def train(config, run_dir: Path):
 
     # Preprocess and save datasets
     train_data_dir, train_processed_df = preprocess_and_save_dataset(
-        train_df, config, train_data_dir, batch_size=config.BATCH_SIZE
+        train_df,
+        config,
+        train_data_dir,
+        batch_size=config.BATCH_SIZE,
+        n_workers=config.NUM_WORKERS,
     )
     valid_data_dir, valid_processed_df = preprocess_and_save_dataset(
-        valid_df, config, valid_data_dir, batch_size=config.BATCH_SIZE
+        valid_df,
+        config,
+        valid_data_dir,
+        batch_size=config.BATCH_SIZE,
+        n_workers=config.NUM_WORKERS,
     )
 
     # Create datasets with processed data
@@ -307,13 +316,14 @@ def train(config, run_dir: Path):
         num_classes=config.N_CLASSES,
     )
     model = model.to(config.DEVICE)
+    model = model.to(memory_format=torch.channels_last)
 
     # Enable torch.backends.cudnn benchmarking for faster training
     if torch.backends.cudnn.is_available():
         torch.backends.cudnn.benchmark = True
 
     # Initialize training components with optimized settings
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(reduction="mean")
     optimizer = optim.Adam(model.parameters(), lr=config.LR_MAX, eps=1e-8)
 
     # Calculate total steps for scheduler
@@ -327,6 +337,11 @@ def train(config, run_dir: Path):
         div_factor=1e3,
         final_div_factor=1e4,
     )
+
+    # Set number of threads for intra-op parallelism
+    torch.set_num_threads(min(4, os.cpu_count()))
+    # Set number of threads for inter-op parallelism
+    torch.set_num_interop_threads(min(4, os.cpu_count()))
 
     # Training loop
     best_val_f1 = 0.0
@@ -397,14 +412,14 @@ def train(config, run_dir: Path):
             checkpoint_path = run_dir / f"model_epoch_{epoch_idx+1}.pt"
             torch.save(
                 {
-                    "epoch": epoch_idx,
+                    "epoch": int(epoch_idx),  # Convert numpy values to Python types
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "val_accuracy": val_accuracy,
-                    "val_f1": val_f1,
+                    "train_loss": float(train_loss),
+                    "val_loss": float(val_loss),
+                    "val_accuracy": float(val_accuracy),
+                    "val_f1": float(val_f1) if "val_f1" in locals() else None,
                 },
                 checkpoint_path,
             )
@@ -420,7 +435,7 @@ def train(config, run_dir: Path):
 
     # Use the best model for final save
     if best_model_path is not None and best_model_path.exists():
-        best_checkpoint = torch.load(best_model_path)
+        best_checkpoint = torch.load(best_model_path, weights_only=False)
         model.load_state_dict(best_checkpoint["model_state_dict"])
         logger.info(
             f"Using best model from epoch {best_checkpoint['epoch'] + 1} with validation accuracy {best_checkpoint['val_accuracy']:.2f}%"
