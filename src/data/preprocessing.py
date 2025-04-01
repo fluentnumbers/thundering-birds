@@ -50,7 +50,7 @@ def process_audio_file(
     try:
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)
-        audio_tensor = torch.tensor(audio_data)
+        audio_tensor = torch.tensor(audio_data, dtype=torch.float32)
 
         # Initialize voice remover inside the worker process if needed
         has_voice = False
@@ -73,7 +73,7 @@ def process_audio_file(
             start_idx = segment_idx * config.UFOLD_OVERLAP
             audio_segment = audio_tensor[start_idx : start_idx + config.NSAMPLES]
 
-            # Convert to mel spectrogram
+            # Convert to mel spectrogram (already on CPU)
             mel_spec = mel_transform(audio_segment)
 
             # Resize to 224x224
@@ -159,7 +159,11 @@ def preprocess_and_save_dataset(
         n_workers = max(1, mp.cpu_count() - 1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize mel transform on CPU
     mel_transform = MelSpectrogramTransform(config)
+    mel_transform.to_melspectogram = mel_transform.to_melspectogram.cpu()
+    mel_transform.to_db = mel_transform.to_db.cpu()
 
     # Log if voice removal is enabled
     if config.REMOVE_VOICE:
@@ -181,21 +185,26 @@ def preprocess_and_save_dataset(
     processed_with_voice = 0
     failed_files = []
 
-    for result in tqdm(
-        pool.imap(process_func, [row for _, row in metadata_df.iterrows()]),
-        total=len(metadata_df),
-        desc=f"Processing audio files with {n_workers} workers",
-        unit="file",
-    ):
-        if result["success"]:
-            results.extend(result["segments"])
-            if result["has_voice"]:
-                processed_with_voice += 1
-        else:
-            failed_files.append(result["error"])
-
-    pool.close()
-    pool.join()
+    try:
+        for result in tqdm(
+            pool.imap(process_func, [row for _, row in metadata_df.iterrows()]),
+            total=len(metadata_df),
+            desc=f"Processing audio files with {n_workers} workers",
+            unit="file",
+        ):
+            if result["success"]:
+                results.extend(result["segments"])
+                if result["has_voice"]:
+                    processed_with_voice += 1
+            else:
+                failed_files.append(result["error"])
+    except Exception as e:
+        logger.error(f"Error during parallel processing: {e}")
+        pool.terminate()
+        raise
+    finally:
+        pool.close()
+        pool.join()
 
     # Sort segments by file_idx and segment_idx for reproducibility
     results.sort(key=lambda x: (x["file_idx"], x["segment_idx"]))
