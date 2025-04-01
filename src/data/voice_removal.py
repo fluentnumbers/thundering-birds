@@ -20,7 +20,9 @@ def load_silero_vad():
         model, utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad", model="silero_vad"
         )
-        logger.debug("Successfully loaded Silero VAD model")
+        # Force model to CPU
+        model = model.cpu()
+        logger.debug("Successfully loaded Silero VAD model on CPU")
         return model, utils
     except HTTPError as e:
         logger.error(f"Failed to download model: {e}")
@@ -48,10 +50,12 @@ class SileroVADRemover:
             rolloff=0.85,
             resampling_method="sinc_interp_kaiser",
             beta=8.555504641634386,
-        )
+        ).cpu()  # Force resampler to CPU
 
         torch.set_num_threads(1)
         self.model, (self.get_speech_timestamps, _, _, _, _) = load_silero_vad()
+        if self.model is not None:
+            self.model.eval()  # Set to eval mode
 
     def remove_voice(
         self, audio: torch.Tensor

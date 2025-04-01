@@ -138,9 +138,11 @@ class EfficientNetWithAttention(nn.Module):
         # Replace the original classifier
         self.efficientnet._fc = self.classifier
 
-        self.attention_outputs = None
+        # Register attention outputs as a buffer to avoid gradient computation
+        self.register_buffer("attention_outputs", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Store attention outputs as a buffer to avoid gradient computation
         self.attention_outputs = self.attention(x)
         return self.efficientnet(self.attention_outputs)
 
