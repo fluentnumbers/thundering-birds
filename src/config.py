@@ -30,8 +30,10 @@ class Config:
     # Training parameters
     SEED: int = 42
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-    BATCH_SIZE: int = 128
-    NUM_WORKERS: int = os.cpu_count()
+    MIXED_PRECISION: bool = True  # Enable mixed precision training
+    GRADIENT_ACCUMULATION_STEPS: int = 1  # For gradient accumulation
+    BATCH_SIZE: int = 128  # Increased for GPU training
+    NUM_WORKERS: int = min(8, os.cpu_count())  # Limit workers for GPU training
     EPOCHS: int = 30
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True

@@ -153,6 +153,13 @@ class EfficientNetWithAttention(nn.Module):
         """
         return self.attention_outputs
 
+    def clear_attention_outputs(self) -> None:
+        """
+        Clears the stored attention outputs to free up memory.
+        Should be called after saving or using the attention outputs.
+        """
+        self.attention_outputs = None
+
 
 def create_model(
     num_classes: int,

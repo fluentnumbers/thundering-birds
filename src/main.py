@@ -2,6 +2,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from src.config import LOGS_DIR, Config
 from src.training.trainer import train
 from src.utils.logger import setup_logger
@@ -35,4 +37,5 @@ def main():
 
 
 if __name__ == "__main__":
+    load_dotenv(".env")
     main()

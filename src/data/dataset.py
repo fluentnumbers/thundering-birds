@@ -70,6 +70,20 @@ class BirdSoundDataset(Dataset):
         self.current_batch_idx = None
         self.current_batch_data = None
 
+    def get_batch_metadata(self, start_idx: int, batch_size: int) -> pd.DataFrame:
+        """
+        Get metadata for a batch of samples starting from start_idx.
+
+        Args:
+            start_idx: Starting index of the batch
+            batch_size: Number of samples in the batch
+
+        Returns:
+            DataFrame containing metadata for the batch
+        """
+        end_idx = min(start_idx + batch_size, len(self.metadata_df))
+        return self.metadata_df.iloc[start_idx:end_idx]
+
     def _load_batch(self, batch_idx: int):
         """Load a batch of spectrograms from disk."""
         if self.current_batch_idx != batch_idx:

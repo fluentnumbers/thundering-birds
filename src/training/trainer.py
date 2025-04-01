@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,8 +11,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import wandb
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from src.config import LOGS_DIR
@@ -24,7 +26,33 @@ from src.utils.visualization import save_attention_outputs
 
 logger = setup_logger(__name__)
 torch.serialization.add_safe_globals([np.core.multiarray.scalar])
-torch.backends.mkldnn.enabled = True  # Enable MKL-DNN acceleration if available
+
+# Enable MKL-DNN acceleration if available
+torch.backends.mkldnn.enabled = True
+
+
+def step_scheduler(
+    scheduler: optim.lr_scheduler._LRScheduler, val_loss: float = None
+) -> None:
+    """Step the learning rate scheduler based on its type.
+
+    Args:
+        scheduler: The learning rate scheduler to step
+        val_loss: Optional validation loss for ReduceLROnPlateau scheduler
+    """
+    if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+        # OneCycleLR should be stepped per batch
+        scheduler.step()
+    elif isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+        # ReduceLROnPlateau needs the validation loss
+        if val_loss is None:
+            raise ValueError(
+                "val_loss must be provided for ReduceLROnPlateau scheduler"
+            )
+        scheduler.step(val_loss)
+    else:
+        # Other schedulers (StepLR, etc.) just need step()
+        scheduler.step()
 
 
 def train_epoch(
@@ -37,8 +65,9 @@ def train_epoch(
     epoch_idx: int,
     run_dir: Path,
     wandb_logger: WandbLogger,
+    scaler: GradScaler = None,
 ) -> float:
-    """Train for one epoch."""
+    """Train one epoch."""
     model.train()
     total_loss = 0
     total_batches = len(train_loader)
@@ -56,23 +85,57 @@ def train_epoch(
         total=total_batches,
         unit="batch",
     )
+
+    # Initialize gradients at the start of the epoch
+    # This is needed because we're using gradient accumulation:
+    # 1. First zero_grad() ensures we start with clean gradients
+    # 2. Subsequent zero_grad() calls after optimizer.step() clear gradients for the next accumulation cycle
+    optimizer.zero_grad(set_to_none=True)
+
     for batch_idx, (inputs, labels) in enumerate(pbar):
         # Move data to device in a single operation
         inputs = inputs.to(config.DEVICE, non_blocking=True)
         labels = labels.to(config.DEVICE, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+        # Forward pass with mixed precision if enabled
+        if config.MIXED_PRECISION and scaler is not None:
+            with autocast(device_type="cuda" if config.DEVICE == "cuda" else "cpu"):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss = (
+                    loss / config.GRADIENT_ACCUMULATION_STEPS
+                )  # Scale loss for gradient accumulation
+        else:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss = loss / config.GRADIENT_ACCUMULATION_STEPS
 
-        # Forward pass
-        outputs = model(inputs)
+        # Backward pass with gradient scaling if mixed precision is enabled
+        if config.MIXED_PRECISION and scaler is not None:
+            scaler.scale(loss).backward()
+            if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        else:
+            loss.backward()
+            if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        # Update learning rate based on scheduler type
+        if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+            step_scheduler(scheduler)
+
+        # Update metrics
+        total_loss += loss.item() * config.GRADIENT_ACCUMULATION_STEPS
 
         # Save attention outputs for batches 0 to 5
         if batch_idx == 0 and config.SAVE_SPECTROGRAMS:
-            # Get metadata for the current batch
-            batch_start_idx = batch_idx * train_loader.batch_size
-            batch_metadata = train_loader.dataset.metadata_df.iloc[
-                batch_start_idx : batch_start_idx + len(inputs)
-            ]
+            # Get metadata for the current batch using the dataset's method
+            batch_metadata = train_loader.dataset.get_batch_metadata(
+                batch_idx * config.BATCH_SIZE, config.BATCH_SIZE
+            )
 
             # Save attention outputs for all samples in the batch
             for idx in range(min(config.SAVE_SPECTROGRAMS_N_SAMPLES, len(inputs))):
@@ -83,9 +146,7 @@ def train_epoch(
                     # Get original filename and class name from metadata
                     sample_metadata = batch_metadata.iloc[idx]
                     original_filename = Path(sample_metadata["filename"]).stem
-                    label = sample_metadata[
-                        "primary_label"
-                    ]  # Use actual class name instead of numeric label
+                    label = sample_metadata["primary_label"]
 
                     # Include filename, class label and start sec in the filename
                     filename = f"{label}_{original_filename}_epoch_{epoch_idx}_batch_{batch_idx}_sample_{idx}"
@@ -107,15 +168,8 @@ def train_epoch(
                     )
                     continue
 
-        loss = criterion(outputs, labels)
-
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-        # Update metrics
-        total_loss += loss.item()
+            # Clear attention outputs after saving to prevent memory leaks
+            model.clear_attention_outputs()
 
         # Log batch metrics with reduced frequency
         if batch_idx % 100 == 0:  # Log every 100 batches instead of every batch
@@ -123,14 +177,17 @@ def train_epoch(
                 {
                     "epoch": epoch_idx + 1,
                     "batch": batch_idx + 1,
-                    "batch_loss": loss.item(),
+                    "batch_loss": loss.item() * config.GRADIENT_ACCUMULATION_STEPS,
                     "learning_rate": scheduler.get_last_lr()[0],
                 }
             )
 
         pbar.set_postfix(loss=total_loss / (batch_idx + 1))
 
-    return total_loss / len(train_loader)
+    # Calculate average loss over actual optimizer steps
+    # With gradient accumulation, actual steps = len(train_loader) / gradient_accumulation_steps
+    actual_steps = len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS
+    return total_loss / actual_steps
 
 
 def validate(
@@ -200,6 +257,10 @@ def train(config, run_dir: Path):
     # Set random seeds
     torch.manual_seed(config.SEED)
     np.random.seed(config.SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True
 
     # Create directories for processed data
     processed_data_dir = config.PROCESSED_DATA_DIR
@@ -219,8 +280,7 @@ def train(config, run_dir: Path):
 
     # Split data
     if config.DEV_MODE:
-        # For DEV_MODE, use a pre-determined split with 5 specific classes
-        # Define a fixed list of 5 classes to use in development mode
+        # For DEV_MODE, use a pre-determined split with config.DEV_MODE_N_CLASSES specific classes
         class_counts = metadata_df["primary_label"].value_counts()
         min_n_samples = 4
         classes_to_keep = class_counts[class_counts >= min_n_samples].index.tolist()
@@ -295,14 +355,14 @@ def train(config, run_dir: Path):
         mode="valid",
     )
 
-    # Create dataloaders with optimized settings for CPU
+    # Create dataloaders with optimized settings for GPU
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=config.NUM_WORKERS,
         collate_fn=collate_fn,
-        pin_memory=True,  # Enable pin_memory for faster data transfer
+        pin_memory=True,  # Enable pin_memory for faster data transfer to GPU
         persistent_workers=True,  # Keep workers alive between epochs
         prefetch_factor=2,  # Prefetch 2 batches per worker
     )
@@ -322,12 +382,18 @@ def train(config, run_dir: Path):
         model_config=config.model_config,
         num_classes=config.N_CLASSES,
     )
-    model = model.to(config.DEVICE)
-    model = model.to(memory_format=torch.channels_last)
 
-    # Enable torch.backends.cudnn benchmarking for faster training
-    if torch.backends.cudnn.is_available():
-        torch.backends.cudnn.benchmark = True
+    # Move model to device and enable mixed precision
+    model = model.to(config.DEVICE)
+    if config.DEVICE == "cuda":
+        model = model.to(
+            memory_format=torch.channels_last
+        )  # Optimize memory format for GPU
+
+    # Initialize gradient scaler for mixed precision training
+    scaler = (
+        GradScaler() if config.MIXED_PRECISION and config.DEVICE == "cuda" else None
+    )
 
     # Initialize training components with optimized settings
     criterion = nn.CrossEntropyLoss(reduction="mean")
@@ -344,11 +410,6 @@ def train(config, run_dir: Path):
         div_factor=1e3,
         final_div_factor=1e4,
     )
-
-    # Set number of threads for intra-op parallelism
-    torch.set_num_threads(min(4, os.cpu_count()))
-    # Set number of threads for inter-op parallelism
-    torch.set_num_interop_threads(min(4, os.cpu_count()))
 
     # Training loop
     best_val_f1 = 0.0
@@ -369,6 +430,7 @@ def train(config, run_dir: Path):
             epoch_idx,
             run_dir,
             wandb_logger,
+            scaler,
         )
 
         # Validation phase with F1 score
@@ -380,6 +442,10 @@ def train(config, run_dir: Path):
             epoch_idx,
             wandb_logger,
         )
+
+        # Step the learning rate scheduler if it's not OneCycleLR
+        if not isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+            step_scheduler(scheduler, val_loss)
 
         # Log epoch metrics
         wandb_logger.log(
@@ -394,7 +460,7 @@ def train(config, run_dir: Path):
         )
 
         # Save best model (now considering F1 score)
-        if val_f1 > best_val_f1:  # Change criterion to F1 score
+        if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             best_model_path = run_dir / f"best_model_epoch_{epoch_idx+1}.pt"
             torch.save(
@@ -403,6 +469,9 @@ def train(config, run_dir: Path):
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": (
+                        scaler.state_dict() if scaler is not None else None
+                    ),
                     "train_loss": train_loss,
                     "val_loss": val_loss,
                     "val_accuracy": val_accuracy,
@@ -419,10 +488,13 @@ def train(config, run_dir: Path):
             checkpoint_path = run_dir / f"model_epoch_{epoch_idx+1}.pt"
             torch.save(
                 {
-                    "epoch": int(epoch_idx),  # Convert numpy values to Python types
+                    "epoch": int(epoch_idx),
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": (
+                        scaler.state_dict() if scaler is not None else None
+                    ),
                     "train_loss": float(train_loss),
                     "val_loss": float(val_loss),
                     "val_accuracy": float(val_accuracy),
@@ -456,10 +528,8 @@ def train(config, run_dir: Path):
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "num_classes": config.N_CLASSES,  # Save number of classes directly
-            "class_mapping": {
-                idx: label for label, idx in label2id.items()
-            },  # Reverse mapping for inference
+            "num_classes": config.N_CLASSES,
+            "class_mapping": {idx: label for label, idx in label2id.items()},
         },
         final_model_path,
     )
@@ -499,7 +569,5 @@ def train(config, run_dir: Path):
             wandb_logger.wandb.log_artifact(artifact)
         except Exception as e:
             logging.warning(f"Failed to save model to wandb: {e}")
-
-    wandb_logger.finish()
 
     wandb_logger.finish()
