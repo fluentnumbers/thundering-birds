@@ -152,6 +152,7 @@ def preprocess_and_save_dataset(
     n_workers: int = None,
 ) -> Tuple[Path, pd.DataFrame]:
     """Preprocess audio files in parallel and save spectrograms to disk in batches.
+    Uses a streaming approach to save batches as they become ready to prevent memory issues.
 
     Args:
         metadata_df: DataFrame containing metadata
@@ -182,24 +183,69 @@ def preprocess_and_save_dataset(
         use_voice_removal=config.REMOVE_VOICE,
     )
 
-    # Process files in parallel
-    results = []
+    # Initialize counters and storage
+    current_batch = []
+    current_batch_idx = 0
     processed_with_voice = 0
     failed_files = []
+    all_metadata = []
 
     try:
-        for result in tqdm(
-            pool.imap(process_func, [row for _, row in metadata_df.iterrows()]),
-            total=len(metadata_df),
-            desc=f"Processing audio files with {n_workers} workers",
-            unit="file",
+        # Process files in chunks to control memory usage
+        chunk_size = 10  # Process 10 files at a time
+        for chunk_start in tqdm(
+            range(0, len(metadata_df), chunk_size),
+            desc=f"Processing audio files by {chunk_size} at once to control memory usage",
+            unit="chunk",
         ):
-            if result["success"]:
-                results.extend(result["segments"])
-                if result["has_voice"]:
-                    processed_with_voice += 1
-            else:
-                failed_files.append(result["error"])
+            chunk_end = min(chunk_start + chunk_size, len(metadata_df))
+            chunk_df = metadata_df.iloc[chunk_start:chunk_end]
+
+            # Process current chunk
+            chunk_results = []
+            for result in pool.imap(
+                process_func, [row for _, row in chunk_df.iterrows()]
+            ):
+                if result["success"]:
+                    chunk_results.extend(result["segments"])
+                    if result["has_voice"]:
+                        processed_with_voice += 1
+                else:
+                    failed_files.append(result["error"])
+
+            # Sort segments by file_idx and segment_idx for reproducibility
+            chunk_results.sort(key=lambda x: (x["file_idx"], x["segment_idx"]))
+
+            # Add to current batch and save if full
+            for segment in chunk_results:
+                current_batch.append(segment)
+                if len(current_batch) >= batch_size:
+                    # Prepare batch data
+                    batch_data = {
+                        "spectrograms": torch.stack(
+                            [s["spectrogram"] for s in current_batch]
+                        ),
+                        "labels": torch.tensor([s["label"] for s in current_batch]),
+                        "indices": [
+                            (s["file_idx"], s["segment_idx"]) for s in current_batch
+                        ],
+                        "filenames": [s["filename"] for s in current_batch],
+                        "class_names": [s["primary_label"] for s in current_batch],
+                    }
+
+                    # Save batch and collect metadata
+                    batch_metadata = save_batch(
+                        batch_data, output_dir, current_batch_idx
+                    )
+                    all_metadata.extend(batch_metadata)
+
+                    # Clear current batch and increment counter
+                    current_batch = []
+                    current_batch_idx += 1
+
+            # Clear chunk results to free memory
+            chunk_results = None
+
     except Exception as e:
         logger.error(f"Error during parallel processing: {e}")
         pool.terminate()
@@ -208,28 +254,16 @@ def preprocess_and_save_dataset(
         pool.close()
         pool.join()
 
-    # Sort segments by file_idx and segment_idx for reproducibility
-    results.sort(key=lambda x: (x["file_idx"], x["segment_idx"]))
-
-    # Organize segments into batches
-    all_metadata = []
-
-    for batch_idx in tqdm(
-        range(0, len(results), batch_size), desc="Saving batches", unit="batch"
-    ):
-        batch_segments = results[batch_idx : batch_idx + batch_size]
-
-        # Prepare batch data with additional information
+    # Save any remaining segments as the final batch
+    if current_batch:
         batch_data = {
-            "spectrograms": torch.stack([s["spectrogram"] for s in batch_segments]),
-            "labels": torch.tensor([s["label"] for s in batch_segments]),
-            "indices": [(s["file_idx"], s["segment_idx"]) for s in batch_segments],
-            "filenames": [s["filename"] for s in batch_segments],
-            "class_names": [s["primary_label"] for s in batch_segments],
+            "spectrograms": torch.stack([s["spectrogram"] for s in current_batch]),
+            "labels": torch.tensor([s["label"] for s in current_batch]),
+            "indices": [(s["file_idx"], s["segment_idx"]) for s in current_batch],
+            "filenames": [s["filename"] for s in current_batch],
+            "class_names": [s["primary_label"] for s in current_batch],
         }
-
-        # Save batch and collect metadata
-        batch_metadata = save_batch(batch_data, output_dir, batch_idx // batch_size)
+        batch_metadata = save_batch(batch_data, output_dir, current_batch_idx)
         all_metadata.extend(batch_metadata)
 
     # Log statistics
