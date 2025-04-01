@@ -30,11 +30,17 @@ class Config:
     # Training parameters
     SEED: int = 42
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-    MIXED_PRECISION: bool = True  # Enable mixed precision training
-    GRADIENT_ACCUMULATION_STEPS: int = 1  # For gradient accumulation
-    BATCH_SIZE: int = 128  # Increased for GPU training
-    NUM_WORKERS: int = min(8, os.cpu_count())  # Limit workers for GPU training
-    EPOCHS: int = 30
+    MIXED_PRECISION: bool = (
+        torch.cuda.is_available()
+    )  # Only enable if CUDA is available
+    GRADIENT_ACCUMULATION_STEPS: int = (
+        4 if torch.cuda.is_available() else 8  # CPU or low memory GPU
+    )
+    BATCH_SIZE: int = (
+        128 if torch.cuda.is_available() else 64
+    )  # Smaller batch size for CPU
+    NUM_WORKERS: int = min(10, os.cpu_count() or 1)  # Safe default for num_workers
+    EPOCHS: int = 3
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True
     DEV_MODE_N_CLASSES: int = 3
@@ -80,6 +86,19 @@ class Config:
     SAVE_SPECTROGRAMS: bool = False
     SAVE_SPECTROGRAMS_N_SAMPLES: int = 3
     WANDB_PROJECT: str = "bird-sound-classification"
+
+    # Distributed Training Configuration - only enabled if CUDA is available
+    DISTRIBUTED_TRAINING: bool = (
+        torch.cuda.is_available()
+    )  # Enable distributed training only if CUDA available
+    WORLD_SIZE: int = (
+        -1 if not torch.cuda.is_available() else torch.cuda.device_count()
+    )  # Total number of processes
+    LOCAL_RANK: int = -1  # GPU device ID for each process, set by environment
+    DIST_BACKEND: str = (
+        "nccl" if torch.cuda.is_available() else "gloo"
+    )  # Use NCCL for GPU, gloo for CPU
+    DIST_URL: str = "env://"  # URL used to establish distributed training
 
     @property
     def model_config(self) -> ModelConfig:

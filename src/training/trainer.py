@@ -9,12 +9,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 import wandb
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from src.config import LOGS_DIR
@@ -116,16 +119,18 @@ def train_epoch(
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.step(optimizer)
                 scaler.update()
+                # Step the scheduler after optimizer step
+                if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 optimizer.step()
+                # Step the scheduler after optimizer step
+                if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-
-        # Update learning rate based on scheduler type
-        if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
-            step_scheduler(scheduler)
 
         # Update metrics
         total_loss += loss.item() * config.GRADIENT_ACCUMULATION_STEPS
@@ -186,7 +191,7 @@ def train_epoch(
 
     # Calculate average loss over actual optimizer steps
     # With gradient accumulation, actual steps = len(train_loader) / gradient_accumulation_steps
-    actual_steps = len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS
+    actual_steps = max(1, len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS)
     return total_loss / actual_steps
 
 
@@ -249,282 +254,42 @@ def validate(
     return avg_loss, accuracy, f1
 
 
-def train(config, run_dir: Path):
-    """Main training pipeline."""
-    # Initialize wandb logger with the existing run_dir
-    wandb_logger = WandbLogger(run_dir.name, run_dir)
+def setup_distributed(config):
+    """Initialize distributed training."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        config.LOCAL_RANK = int(os.environ["RANK"])
+        config.WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 
-    # Set random seeds
-    torch.manual_seed(config.SEED)
-    np.random.seed(config.SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.SEED)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
-
-    # Create directories for processed data
-    processed_data_dir = config.PROCESSED_DATA_DIR
-    processed_data_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create run-specific subdirectories for train and validation data
-    run_specific_dir = processed_data_dir / run_dir.name
-    run_specific_dir.mkdir(exist_ok=True)
-
-    train_data_dir = run_specific_dir / "train"
-    valid_data_dir = run_specific_dir / "valid"
-    train_data_dir.mkdir(exist_ok=True)
-    valid_data_dir.mkdir(exist_ok=True)
-
-    # Load data
-    metadata_df = load_metadata(config)
-
-    # Split data
-    if config.DEV_MODE:
-        # For DEV_MODE, use a pre-determined split with config.DEV_MODE_N_CLASSES specific classes
-        class_counts = metadata_df["primary_label"].value_counts()
-        min_n_samples = 4
-        classes_to_keep = class_counts[class_counts >= min_n_samples].index.tolist()
-        metadata_df = metadata_df[metadata_df["primary_label"].isin(classes_to_keep)]
-        unique_labels = sorted(metadata_df["primary_label"].unique())[
-            : config.DEV_MODE_N_CLASSES
-        ]
-        metadata_df = metadata_df[metadata_df["primary_label"].isin(unique_labels)]
-
-        # Create a new label mapping for the filtered classes
-        label2id = {label: idx for idx, label in enumerate(unique_labels)}
-        metadata_df["target"] = metadata_df["primary_label"].map(label2id)
-
-        logger.info(
-            f"Filtered out classes with less than {min_n_samples} samples. Remaining classes: {len(unique_labels)}"
-        )
-
-        # Log the selected classes for reproducibility
-        logger.info(
-            f"DEV_MODE: Using {len(unique_labels)} classes for development: {unique_labels}"
-        )
-        wandb_logger.log({"unique_labels": unique_labels})
-
-        # Create a simple train/test split for these classes
-        train_df, valid_df = train_test_split(
-            metadata_df,
-            test_size=0.2,
-            random_state=config.SEED,
-            stratify=metadata_df["target"],
-        )
-        config.N_CLASSES = len(unique_labels)
-
-    else:
-        # Create label mapping for full dataset
-        unique_labels = sorted(metadata_df["primary_label"].unique())
-        label2id = {label: idx for idx, label in enumerate(unique_labels)}
-        metadata_df["target"] = metadata_df["primary_label"].map(label2id)
-
-        train_df, valid_df = train_test_split(
-            metadata_df,
-            test_size=0.2,
-            random_state=config.SEED,
-            stratify=metadata_df["target"],
-        )
-        config.N_CLASSES = len(unique_labels)
-
-    # Preprocess and save datasets
-    train_data_dir, train_processed_df = preprocess_and_save_dataset(
-        train_df,
-        config,
-        train_data_dir,
-        batch_size=config.BATCH_SIZE,
-        n_workers=config.NUM_WORKERS,
-    )
-    valid_data_dir, valid_processed_df = preprocess_and_save_dataset(
-        valid_df,
-        config,
-        valid_data_dir,
-        batch_size=config.BATCH_SIZE,
-        n_workers=config.NUM_WORKERS,
-    )
-
-    # Create datasets with processed data
-    train_dataset = BirdSoundDataset(
-        train_processed_df,
-        augmentation=get_transforms("train"),
-        mode="train",
-    )
-    valid_dataset = BirdSoundDataset(
-        valid_processed_df,
-        augmentation=get_transforms("valid"),
-        mode="valid",
-    )
-
-    # Create dataloaders with optimized settings for GPU
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=config.NUM_WORKERS,
-        collate_fn=collate_fn,
-        pin_memory=True,  # Enable pin_memory for faster data transfer to GPU
-        persistent_workers=True,  # Keep workers alive between epochs
-        prefetch_factor=2,  # Prefetch 2 batches per worker
-    )
-    valid_loader = torch.utils.data.DataLoader(
-        valid_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        collate_fn=collate_fn,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
-
-    # Initialize model using the factory
-    model = ModelFactory.create_model(
-        model_config=config.model_config,
-        num_classes=config.N_CLASSES,
-    )
-
-    # Move model to device and enable mixed precision
-    model = model.to(config.DEVICE)
-    if config.DEVICE == "cuda":
-        model = model.to(
-            memory_format=torch.channels_last
-        )  # Optimize memory format for GPU
-
-    # Initialize gradient scaler for mixed precision training
-    scaler = (
-        GradScaler() if config.MIXED_PRECISION and config.DEVICE == "cuda" else None
-    )
-
-    # Initialize training components with optimized settings
-    criterion = nn.CrossEntropyLoss(reduction="mean")
-    optimizer = optim.Adam(model.parameters(), lr=config.LR_MAX, eps=1e-8)
-
-    # Calculate total steps for scheduler
-    total_steps = config.EPOCHS * len(train_loader)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=config.LR_MAX,
-        total_steps=total_steps,
-        pct_start=0.10,
-        anneal_strategy="cos",
-        div_factor=1e3,
-        final_div_factor=1e4,
-    )
-
-    # Training loop
-    best_val_f1 = 0.0
-    best_model_path = None
-    patience = 10
-    patience_counter = 0
-
-    # Training loop
-    for epoch_idx in range(config.EPOCHS):
-        # Training phase
-        train_loss = train_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            scheduler,
-            config,
-            epoch_idx,
-            run_dir,
-            wandb_logger,
-            scaler,
-        )
-
-        # Validation phase with F1 score
-        val_loss, val_accuracy, val_f1 = validate(
-            model,
-            valid_loader,
-            criterion,
-            config,
-            epoch_idx,
-            wandb_logger,
-        )
-
-        # Step the learning rate scheduler if it's not OneCycleLR
-        if not isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
-            step_scheduler(scheduler, val_loss)
-
-        # Log epoch metrics
-        wandb_logger.log(
-            {
-                "epoch": epoch_idx,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "val_accuracy": val_accuracy,
-                "val_f1": val_f1 * 100,
-                "learning_rate": scheduler.get_last_lr()[0],
-            }
-        )
-
-        # Save best model (now considering F1 score)
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            best_model_path = run_dir / f"best_model_epoch_{epoch_idx+1}.pt"
-            torch.save(
-                {
-                    "epoch": epoch_idx,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": (
-                        scaler.state_dict() if scaler is not None else None
-                    ),
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "val_accuracy": val_accuracy,
-                    "val_f1": val_f1,
-                },
-                best_model_path,
+    if config.DISTRIBUTED_TRAINING:
+        if config.LOCAL_RANK != -1:  # for distributed training
+            torch.cuda.set_device(config.LOCAL_RANK)
+            dist.init_process_group(
+                backend=config.DIST_BACKEND,
+                init_method=config.DIST_URL,
+                world_size=config.WORLD_SIZE,
+                rank=config.LOCAL_RANK,
             )
-            patience_counter = 0
-        else:
-            patience_counter += 1
+            logger.info(f"Initialized distributed training on rank {config.LOCAL_RANK}")
 
-        # Regular checkpoint saving with reduced frequency
-        if (epoch_idx + 1) % 10 == 0:  # Save every 10 epochs instead of 5
-            checkpoint_path = run_dir / f"model_epoch_{epoch_idx+1}.pt"
-            torch.save(
-                {
-                    "epoch": int(epoch_idx),
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": (
-                        scaler.state_dict() if scaler is not None else None
-                    ),
-                    "train_loss": float(train_loss),
-                    "val_loss": float(val_loss),
-                    "val_accuracy": float(val_accuracy),
-                    "val_f1": float(val_f1) if "val_f1" in locals() else None,
-                },
-                checkpoint_path,
-            )
 
-        # Early stopping
-        if patience_counter >= patience:
-            logger.info(f"Early stopping triggered after {epoch_idx + 1} epochs")
-            break
+def cleanup_distributed():
+    """Cleanup distributed training resources."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
-    # Save final model for Kaggle submission
+
+def save_final_model(model, config, run_dir: Path, metadata_df, wandb_logger):
+    """Save the final model with metadata for inference."""
+    # Create timestamp for the final model
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     final_model_path = run_dir / f"final_model_{timestamp}.pt"
-
-    # Use the best model for final save
-    if best_model_path is not None and best_model_path.exists():
-        best_checkpoint = torch.load(best_model_path, weights_only=False)
-        model.load_state_dict(best_checkpoint["model_state_dict"])
-        logger.info(
-            f"Using best model from epoch {best_checkpoint['epoch'] + 1} with validation accuracy {best_checkpoint['val_accuracy']:.2f}%"
-        )
+    onnx_path = run_dir / f"final_model_{timestamp}.onnx"  # Initialize onnx_path here
 
     # Get the label mapping from metadata_df
     unique_labels = sorted(metadata_df["primary_label"].unique())
     label2id = {label: idx for idx, label in enumerate(unique_labels)}
 
-    # Save only the essential data in a format that can be loaded without source code
+    # Save model with essential data for inference
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -533,27 +298,49 @@ def train(config, run_dir: Path):
         },
         final_model_path,
     )
+    logger.info(f"Saved final model to {final_model_path}")
 
     # Export to ONNX format for faster inference (optional)
     try:
-        dummy_input = torch.randn(1, 3, 224, 224, device=config.DEVICE)
-        onnx_path = run_dir / "model.onnx"
-        torch.onnx.export(
-            model,
-            dummy_input,
-            onnx_path,
-            export_params=True,
-            opset_version=12,
-            do_constant_folding=True,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
-        )
-    except Exception as e:
-        logging.warning(f"Failed to export ONNX model: {e}")
+        # Set model to eval mode and ensure it's on the correct device
+        model.eval()
+        model = model.to(config.DEVICE)
 
-    # Save model to wandb
-    if wandb_logger.enabled:
+        # Create dummy input with correct shape and device
+        dummy_input = torch.randn(1, 3, 224, 224, device=config.DEVICE)
+
+        # Ensure model is in inference mode and all parameters are properly initialized
+        with torch.no_grad():
+            # Forward pass to ensure all BatchNorm layers are properly initialized
+            _ = model(dummy_input)
+
+            # Ensure all BatchNorm layers are properly initialized
+            for module in model.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.reset_running_stats()
+                    module.eval()
+
+            # Forward pass again after resetting BatchNorm stats
+            _ = model(dummy_input)
+
+            torch.onnx.export(
+                model,
+                dummy_input,
+                onnx_path,
+                export_params=True,
+                opset_version=12,
+                do_constant_folding=True,
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+                keep_initializers_as_inputs=True,
+            )
+            logger.info(f"Successfully exported ONNX model to {onnx_path}")
+    except Exception as e:
+        logger.warning(f"Failed to export ONNX model: {e}")
+
+    # Save model to wandb if enabled
+    if wandb_logger and wandb_logger.enabled:
         try:
             artifact = wandb_logger.wandb.Artifact(
                 name=f"model-{run_dir.name}",
@@ -568,6 +355,294 @@ def train(config, run_dir: Path):
             # Log the artifact to wandb
             wandb_logger.wandb.log_artifact(artifact)
         except Exception as e:
-            logging.warning(f"Failed to save model to wandb: {e}")
+            logger.warning(f"Failed to save model to wandb: {e}")
 
-    wandb_logger.finish()
+
+def train(config, run_dir: Path):
+    """Main training pipeline with distributed support."""
+    # Initialize distributed training
+    setup_distributed(config)
+
+    # Initialize wandb logger only on main process
+    wandb_logger = None
+    if config.LOCAL_RANK <= 0:
+        wandb_logger = WandbLogger(run_dir.name, run_dir)
+
+    try:
+        # Set random seeds
+        torch.manual_seed(config.SEED)
+        np.random.seed(config.SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.SEED)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = True
+
+        # Create directories for processed data
+        processed_data_dir = config.PROCESSED_DATA_DIR
+        processed_data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create run-specific subdirectories for train and validation data
+        run_specific_dir = processed_data_dir / run_dir.name
+        run_specific_dir.mkdir(exist_ok=True)
+
+        train_data_dir = run_specific_dir / "train"
+        valid_data_dir = run_specific_dir / "valid"
+        train_data_dir.mkdir(exist_ok=True)
+        valid_data_dir.mkdir(exist_ok=True)
+
+        # Load data
+        metadata_df = load_metadata(config)
+
+        # Split data
+        if config.DEV_MODE:
+            # For DEV_MODE, use a pre-determined split with config.DEV_MODE_N_CLASSES specific classes
+            class_counts = metadata_df["primary_label"].value_counts()
+            min_n_samples = 4
+            classes_to_keep = class_counts[class_counts >= min_n_samples].index.tolist()
+            metadata_df = metadata_df[
+                metadata_df["primary_label"].isin(classes_to_keep)
+            ]
+            unique_labels = sorted(metadata_df["primary_label"].unique())[
+                : config.DEV_MODE_N_CLASSES
+            ]
+            metadata_df = metadata_df[metadata_df["primary_label"].isin(unique_labels)]
+
+            # Create a new label mapping for the filtered classes
+            label2id = {label: idx for idx, label in enumerate(unique_labels)}
+            metadata_df["target"] = metadata_df["primary_label"].map(label2id)
+
+            logger.info(
+                f"Filtered out classes with less than {min_n_samples} samples. Remaining classes: {len(unique_labels)}"
+            )
+
+            # Log the selected classes for reproducibility
+            logger.info(
+                f"DEV_MODE: Using {len(unique_labels)} classes for development: {unique_labels}"
+            )
+            wandb_logger.log({"unique_labels": unique_labels})
+
+            # Create a simple train/test split for these classes
+            train_df, valid_df = train_test_split(
+                metadata_df,
+                test_size=0.2,
+                random_state=config.SEED,
+                stratify=metadata_df["target"],
+            )
+            config.N_CLASSES = len(unique_labels)
+
+        else:
+            # Create label mapping for full dataset
+            unique_labels = sorted(metadata_df["primary_label"].unique())
+            label2id = {label: idx for idx, label in enumerate(unique_labels)}
+            metadata_df["target"] = metadata_df["primary_label"].map(label2id)
+
+            train_df, valid_df = train_test_split(
+                metadata_df,
+                test_size=0.2,
+                random_state=config.SEED,
+                stratify=metadata_df["target"],
+            )
+            config.N_CLASSES = len(unique_labels)
+
+        # Preprocess and save datasets
+        train_data_dir, train_processed_df = preprocess_and_save_dataset(
+            train_df,
+            config,
+            train_data_dir,
+            batch_size=config.BATCH_SIZE,
+            n_workers=config.NUM_WORKERS,
+        )
+        valid_data_dir, valid_processed_df = preprocess_and_save_dataset(
+            valid_df,
+            config,
+            valid_data_dir,
+            batch_size=config.BATCH_SIZE,
+            n_workers=config.NUM_WORKERS,
+        )
+
+        # Create datasets with processed data
+        train_dataset = BirdSoundDataset(
+            train_processed_df,
+            augmentation=get_transforms("train"),
+            mode="train",
+        )
+        valid_dataset = BirdSoundDataset(
+            valid_processed_df,
+            augmentation=get_transforms("valid"),
+            mode="valid",
+        )
+
+        # Create distributed samplers
+        train_sampler = (
+            DistributedSampler(train_dataset) if config.DISTRIBUTED_TRAINING else None
+        )
+        valid_sampler = (
+            DistributedSampler(valid_dataset, shuffle=False)
+            if config.DISTRIBUTED_TRAINING
+            else None
+        )
+
+        # Create dataloaders with distributed settings
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=config.BATCH_SIZE,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=config.NUM_WORKERS,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+        valid_loader = torch.utils.data.DataLoader(
+            valid_dataset,
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            sampler=valid_sampler,
+            num_workers=config.NUM_WORKERS,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+
+        # Initialize model using the factory
+        model = ModelFactory.create_model(
+            model_config=config.model_config,
+            num_classes=config.N_CLASSES,
+        )
+
+        # Move model to device and wrap with DDP
+        model = model.to(config.DEVICE)
+        if config.DEVICE == "cuda":
+            model = model.to(memory_format=torch.channels_last)
+            if config.DISTRIBUTED_TRAINING:
+                model = DDP(model, device_ids=[config.LOCAL_RANK])
+
+        # Initialize gradient scaler for mixed precision training
+        scaler = (
+            GradScaler() if config.MIXED_PRECISION and config.DEVICE == "cuda" else None
+        )
+
+        # Initialize training components with optimized settings
+        criterion = nn.CrossEntropyLoss(reduction="mean")
+        optimizer = optim.Adam(model.parameters(), lr=config.LR_MAX, eps=1e-8)
+
+        # Calculate total steps for scheduler
+        total_steps = config.EPOCHS * len(train_loader)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config.LR_MAX,
+            total_steps=total_steps,
+            pct_start=0.10,
+            anneal_strategy="cos",
+            div_factor=1e3,
+            final_div_factor=1e4,
+        )
+
+        # Training loop
+        best_val_f1 = 0.0
+        best_model_path = None
+        patience = 10
+        patience_counter = 0
+
+        for epoch_idx in range(config.EPOCHS):
+            if config.DISTRIBUTED_TRAINING:
+                train_sampler.set_epoch(epoch_idx)
+
+            train_loss = train_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                scheduler,
+                config,
+                epoch_idx,
+                run_dir,
+                wandb_logger,
+                scaler,
+            )
+
+            # Validation phase
+            val_loss, val_accuracy, val_f1 = validate(
+                model,
+                valid_loader,
+                criterion,
+                config,
+                epoch_idx,
+                wandb_logger,
+            )
+
+            # Log metrics only on main process
+            if config.LOCAL_RANK <= 0:
+                wandb_logger.log(
+                    {
+                        "epoch": epoch_idx,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "val_accuracy": val_accuracy,
+                        "val_f1": val_f1 * 100,
+                        "learning_rate": scheduler.get_last_lr()[0],
+                    }
+                )
+
+                # Save checkpoints only on main process
+                if val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
+                    best_model_path = run_dir / f"best_model_epoch_{epoch_idx+1}.pt"
+                    torch.save(
+                        {
+                            "epoch": epoch_idx,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "scaler_state_dict": (
+                                scaler.state_dict() if scaler is not None else None
+                            ),
+                            "train_loss": train_loss,
+                            "val_loss": val_loss,
+                            "val_accuracy": val_accuracy,
+                            "val_f1": val_f1,
+                        },
+                        best_model_path,
+                    )
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                # Regular checkpoint saving with reduced frequency
+                if (epoch_idx + 1) % 10 == 0:  # Save every 10 epochs instead of 5
+                    checkpoint_path = run_dir / f"model_epoch_{epoch_idx+1}.pt"
+                    torch.save(
+                        {
+                            "epoch": int(epoch_idx),
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "scaler_state_dict": (
+                                scaler.state_dict() if scaler is not None else None
+                            ),
+                            "train_loss": float(train_loss),
+                            "val_loss": float(val_loss),
+                            "val_accuracy": float(val_accuracy),
+                            "val_f1": float(val_f1) if "val_f1" in locals() else None,
+                        },
+                        checkpoint_path,
+                    )
+
+                # Early stopping
+                if patience_counter >= patience:
+                    logger.info(
+                        f"Early stopping triggered after {epoch_idx + 1} epochs"
+                    )
+                    break
+
+        # Final model saving only on main process
+        if config.LOCAL_RANK <= 0:
+            save_final_model(model, config, run_dir, metadata_df, wandb_logger)
+
+    finally:
+        # Cleanup distributed training
+        cleanup_distributed()
+        if wandb_logger:
+            wandb_logger.finish()

@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import torch
 from dotenv import load_dotenv
 
 from src.config import LOGS_DIR, Config
@@ -17,10 +18,17 @@ def main():
     # Create run directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = LOGS_DIR / f"basic_pipeline_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup logging
     logger = setup_logger(__name__, run_dir)
-    logger.info(f"Using device: {config.DEVICE}")
+
+    # Log device information
+    device_info = (
+        f"Using device: {config.DEVICE}"
+        f"{' with ' + str(torch.cuda.device_count()) + ' GPUs' if torch.cuda.is_available() else ''}"
+    )
+    logger.info(device_info)
 
     # Save config to run directory
     config_dict = {k: v for k, v in config.__dict__.items() if not k.startswith("_")}
