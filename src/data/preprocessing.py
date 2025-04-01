@@ -32,14 +32,14 @@ def load_metadata(config) -> pd.DataFrame:
 
 def process_audio_file(
     row: pd.Series,
-    config,
+    config: Dict,
     use_voice_removal: bool = False,
 ) -> Dict:
     """Process a single audio file and return its segments.
 
     Args:
         row: DataFrame row containing file information
-        config: Configuration object
+        config: Dictionary containing configuration parameters
         use_voice_removal: Whether to use voice removal
 
     Returns:
@@ -55,7 +55,7 @@ def process_audio_file(
         mel_transform.to_db = mel_transform.to_db.to(device)
 
         # Load audio
-        audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)
+        audio_data, _ = librosa.load(row.filepath, sr=config["SAMPLE_RATE"])
         audio_tensor = torch.tensor(audio_data, dtype=torch.float32, device=device)
 
         # Initialize voice remover inside the worker process if needed
@@ -66,18 +66,20 @@ def process_audio_file(
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
-        rsamples = nsamples % config.NSAMPLES
+        rsamples = nsamples % config["NSAMPLES"]
         audio_tensor = torch.nn.functional.pad(
-            audio_tensor, (0, config.NSAMPLES - rsamples), mode=config.PADMODE
+            audio_tensor, (0, config["NSAMPLES"] - rsamples), mode=config["PADMODE"]
         )
 
         # Calculate number of segments
-        n_segments = (len(audio_tensor) - config.NSAMPLES) // config.UFOLD_OVERLAP + 1
+        n_segments = (len(audio_tensor) - config["NSAMPLES"]) // config[
+            "UFOLD_OVERLAP"
+        ] + 1
 
         segments = []
         for segment_idx in range(n_segments):
-            start_idx = segment_idx * config.UFOLD_OVERLAP
-            audio_segment = audio_tensor[start_idx : start_idx + config.NSAMPLES]
+            start_idx = segment_idx * config["UFOLD_OVERLAP"]
+            audio_segment = audio_tensor[start_idx : start_idx + config["NSAMPLES"]]
 
             # Convert to mel spectrogram
             mel_spec = mel_transform(audio_segment)
@@ -89,7 +91,7 @@ def process_audio_file(
 
             # Add channel dimension and optionally repeat to 3 channels for RGB
             mel_spec = mel_spec.unsqueeze(0)
-            if config.MAKE_RGB:
+            if config["MAKE_RGB"]:
                 mel_spec = mel_spec.repeat(3, 1, 1)
 
             segments.append(

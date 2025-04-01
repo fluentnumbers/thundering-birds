@@ -16,22 +16,35 @@ logger = setup_logger(__name__)
 
 
 class MelSpectrogramTransform:
-    """Computes the Mel Spectogram of an audio sample."""
+    """Transform audio to mel spectrogram with configurable parameters."""
 
     def __init__(self, config):
+        """Initialize the transform with configuration parameters.
+
+        Args:
+            config: Dictionary containing configuration parameters
+        """
         self.to_melspectogram = torchaudio.transforms.MelSpectrogram(
-            sample_rate=config.SAMPLE_RATE,
-            n_fft=config.N_FFT,
-            hop_length=config.HOP_LENGTH,
-            f_max=config.FMAX,
-            f_min=config.FMIN,
-            n_mels=config.N_MELS,
+            sample_rate=config["SAMPLE_RATE"],
+            n_fft=config["N_FFT"],
+            hop_length=config["HOP_LENGTH"],
+            n_mels=config["N_MELS"],
+            f_min=config["FMIN"],
+            f_max=config["FMAX"],
         )
-        self.to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
+        self.to_db = torchaudio.transforms.AmplitudeToDB()
         self.etol = 1e-8
         logger.debug("Initialized MelSpectrogramTransform")
 
     def __call__(self, audio_sample: torch.Tensor) -> torch.Tensor:
+        """Convert audio to mel spectrogram.
+
+        Args:
+            audio_sample: Audio tensor of shape (n_samples,)
+
+        Returns:
+            Mel spectrogram tensor of shape (n_mels, time)
+        """
         if torch.isnan(audio_sample).any():
             mean_value = torch.nanmean(audio_sample)
             audio_sample = torch.nan_to_num(audio_sample, nan=mean_value)
@@ -39,11 +52,13 @@ class MelSpectrogramTransform:
                 f"Found NaN values in audio sample, replaced with mean: {mean_value}"
             )
 
-        output = self.to_melspectogram(audio_sample)
-        output = librosa.power_to_db(output, ref=np.max)
-        output = (output - output.min()) / (output.max() - output.min() + self.etol)
+        mel_spec = self.to_melspectogram(audio_sample)
+        mel_spec = self.to_db(mel_spec)
+        mel_spec = (mel_spec - mel_spec.min()) / (
+            mel_spec.max() - mel_spec.min() + self.etol
+        )
 
-        return torch.tensor(output)
+        return mel_spec.clone().detach()
 
 
 class BirdSoundDataset(Dataset):
