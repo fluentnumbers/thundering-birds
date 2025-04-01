@@ -517,7 +517,9 @@ def train(config, run_dir: Path):
         if config.DEVICE == "cuda":
             model = model.to(memory_format=torch.channels_last)
             if config.DISTRIBUTED_TRAINING:
-                model = DDP(model, device_ids=[config.LOCAL_RANK])
+                model = DDP(
+                    model, device_ids=[config.LOCAL_RANK], find_unused_parameters=True
+                )
 
         # Initialize gradient scaler for mixed precision training
         scaler = (
