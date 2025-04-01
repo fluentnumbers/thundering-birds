@@ -44,6 +44,7 @@ class Config:
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True
     DEV_MODE_N_CLASSES: int = 3
+    EARLY_STOPPING_PATIENCE: int = 10  # Number of epochs to wait before early stopping
 
     # Model configuration
     MODEL_NAME: str = (

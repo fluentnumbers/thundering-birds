@@ -545,7 +545,6 @@ def train(config, run_dir: Path):
         # Training loop
         best_val_f1 = 0.0
         best_model_path = None
-        patience = 10
         patience_counter = 0
 
         for epoch_idx in range(config.EPOCHS):
@@ -633,7 +632,7 @@ def train(config, run_dir: Path):
                     )
 
                 # Early stopping
-                if patience_counter >= patience:
+                if patience_counter >= config.EARLY_STOPPING_PATIENCE:
                     logger.info(
                         f"Early stopping triggered after {epoch_idx + 1} epochs"
                     )
