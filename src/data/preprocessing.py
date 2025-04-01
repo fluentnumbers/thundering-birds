@@ -90,6 +90,8 @@ def process_audio_file(
                     "label": row.target,
                     "file_idx": row.name,
                     "segment_idx": segment_idx,
+                    "filename": row.filename,
+                    "primary_label": row.primary_label,
                 }
             )
 
@@ -127,6 +129,8 @@ def save_batch(batch_data: Dict, output_path: Path, batch_idx: int) -> Dict:
                 "file_idx": file_idx,
                 "segment_idx": segment_idx,
                 "label": batch_data["labels"][idx].item(),
+                "filename": batch_data["filenames"][idx],
+                "primary_label": batch_data["class_names"][idx],
             }
         )
     return metadata
@@ -204,11 +208,13 @@ def preprocess_and_save_dataset(
     ):
         batch_segments = results[batch_idx : batch_idx + batch_size]
 
-        # Prepare batch data
+        # Prepare batch data with additional information
         batch_data = {
             "spectrograms": torch.stack([s["spectrogram"] for s in batch_segments]),
             "labels": torch.tensor([s["label"] for s in batch_segments]),
             "indices": [(s["file_idx"], s["segment_idx"]) for s in batch_segments],
+            "filenames": [s["filename"] for s in batch_segments],
+            "class_names": [s["primary_label"] for s in batch_segments],
         }
 
         # Save batch and collect metadata

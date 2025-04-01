@@ -20,7 +20,6 @@ def save_melspectrogram(
     sample_id: int,
     save_dir: Path,
     epoch: int,
-    step: int,
     wandb_logger: WandbLogger,
 ) -> None:
     """Save mel spectrogram as an image and optionally log to wandb."""
@@ -46,7 +45,6 @@ def save_melspectrogram(
         spec,
         f"Label: {label} (ID: {class_id}), File: {filename}, Chunk: {chunk_id}",
         epoch=epoch,
-        step=step,
         label=label,
         class_id=class_id,
         filename=filename,
@@ -61,17 +59,15 @@ def save_attention_outputs(
     label: str,
     class_id: int,
     filename: str,
-    chunk_id: int,
     batch_id: int,
     sample_id: int,
     save_dir: Path,
-    epoch: int,
-    step: int,
+    epoch_id: int,
     wandb_logger: WandbLogger,
 ) -> None:
     """Save attention outputs as images and optionally log to wandb."""
     # Convert to numpy and normalize for visualization
-    attention_np = attention_outputs.cpu().numpy()
+    attention_np = attention_outputs.cpu().detach().numpy()
 
     # Create figure with 3 subplots for each channel
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -92,15 +88,12 @@ def save_attention_outputs(
     axes[2].axis("off")
 
     plt.suptitle(
-        f"Epoch {epoch} - Label: {label} (ID: {class_id})\nFile: {filename}\nChunk: {chunk_id}"
+        f"Epoch {epoch_id} - Label: {label} (ID: {class_id})\nFile: {filename}"
     )
     plt.tight_layout()
 
     # Create filename with all components in a more organized way
-    img_filename = (
-        f"attention_epoch{epoch:02d}_batch{batch_id:03d}_sample{sample_id:03d}_"
-        f"chunk{chunk_id:03d}_{filename}_{label}_class{class_id:03d}.png"
-    )
+    img_filename = f"attention_{filename}.png"
 
     # Save to local filesystem
     plt.savefig(save_dir / img_filename)
@@ -129,7 +122,7 @@ def save_attention_outputs(
         plt.imshow(channel_data, aspect="auto", origin="lower", cmap=config["cmap"])
         plt.colorbar()
         plt.title(
-            f"{config['name'].capitalize()} - Epoch {epoch} - Label: {label} (ID: {class_id})"
+            f"{config['name'].capitalize()} - Epoch {epoch_id} - Label: {label} (ID: {class_id})"
         )
         plt.axis("off")
         plt.tight_layout()
@@ -147,13 +140,11 @@ def save_attention_outputs(
         # Log to wandb with channel-specific name
         wandb_logger.log_image(
             img_array,
-            f"{config['name'].capitalize()} - Epoch {epoch} - Label: {label} (ID: {class_id}), File: {filename}, Chunk: {chunk_id}",
-            epoch=epoch,
-            step=step,
+            f"{config['name'].capitalize()} - Epoch {epoch_id} - Label: {label} (ID: {class_id}), File: {filename}",
+            epoch=epoch_id,
             label=label,
             class_id=class_id,
             filename=filename,
-            chunk_id=chunk_id,
             batch_id=batch_id,
             sample_id=sample_id,
             channel=config["name"],

@@ -66,22 +66,29 @@ def train_epoch(
         # Forward pass
         outputs = model(inputs)
 
-        # Save attention outputs for the same 3 samples every epoch
+        # Save attention outputs for batches 0 to 5
         if batch_idx == 0 and config.SAVE_SPECTROGRAMS:
-            # Only save the first 3 samples from the first batch
+            # Get metadata for the current batch
+            batch_start_idx = batch_idx * train_loader.batch_size
+            batch_metadata = train_loader.dataset.metadata_df.iloc[
+                batch_start_idx : batch_start_idx + len(inputs)
+            ]
+
+            # Save attention outputs for all samples in the batch
             for idx in range(min(config.SAVE_SPECTROGRAMS_N_SAMPLES, len(inputs))):
                 try:
                     attention_outputs = model.get_attention_outputs()[idx]
                     label_id = labels[idx].item()
 
-                    # Get label from the dataset's DataFrame
-                    sample_df = train_loader.dataset.metadata_df.iloc[idx]
-                    label = sample_df["label"]
-                    filename = sample_df["filename"]
-                    original_filename = Path(filename).stem
+                    # Get original filename and class name from metadata
+                    sample_metadata = batch_metadata.iloc[idx]
+                    original_filename = Path(sample_metadata["filename"]).stem
+                    label = sample_metadata[
+                        "primary_label"
+                    ]  # Use actual class name instead of numeric label
 
                     # Include filename, class label and start sec in the filename
-                    filename = f"{original_filename}_{label}_epoch_{epoch_idx}_batch_{batch_idx}_sample_{idx}"
+                    filename = f"{label}_{original_filename}_epoch_{epoch_idx}_batch_{batch_idx}_sample_{idx}"
 
                     save_attention_outputs(
                         attention_outputs,
@@ -492,5 +499,7 @@ def train(config, run_dir: Path):
             wandb_logger.wandb.log_artifact(artifact)
         except Exception as e:
             logging.warning(f"Failed to save model to wandb: {e}")
+
+    wandb_logger.finish()
 
     wandb_logger.finish()
