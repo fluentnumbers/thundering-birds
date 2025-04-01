@@ -100,6 +100,8 @@ class Config:
         "nccl" if torch.cuda.is_available() else "gloo"
     )  # Use NCCL for GPU, gloo for CPU
     DIST_URL: str = "env://"  # URL used to establish distributed training
+    MASTER_ADDR: str = os.environ.get("MASTER_ADDR", "localhost")
+    MASTER_PORT: str = os.environ.get("MASTER_PORT", "29500")
 
     @property
     def model_config(self) -> ModelConfig:

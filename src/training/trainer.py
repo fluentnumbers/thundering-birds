@@ -70,23 +70,29 @@ def train_epoch(
     wandb_logger: WandbLogger,
     scaler: GradScaler = None,
 ) -> float:
-    """Train one epoch."""
+    """Train one epoch with distributed training support."""
     model.train()
     total_loss = 0
     total_batches = len(train_loader)
 
     # Create directories for spectrograms and attention outputs if they don't exist
-    spectrograms_dir = run_dir / "spectrograms"
-    attention_dir = run_dir / "attention_outputs"
-    spectrograms_dir.mkdir(exist_ok=True)
-    attention_dir.mkdir(exist_ok=True)
+    if config.LOCAL_RANK <= 0:  # Only create directories on main process
+        spectrograms_dir = run_dir / "spectrograms"
+        attention_dir = run_dir / "attention_outputs"
+        spectrograms_dir.mkdir(exist_ok=True)
+        attention_dir.mkdir(exist_ok=True)
 
-    # Pre-allocate tensors for batch processing
+    # Pre-allocate tensors for batch processing with rank-specific description
+    rank_desc = f"Rank {config.LOCAL_RANK}" if config.DISTRIBUTED_TRAINING else "CPU"
     pbar = tqdm(
         train_loader,
-        desc=f"Epoch {epoch_idx+1}/{config.EPOCHS}",
+        desc=f"Epoch {epoch_idx+1}/{config.EPOCHS} [{rank_desc}]",
         total=total_batches,
         unit="batch",
+        position=(
+            config.LOCAL_RANK if config.DISTRIBUTED_TRAINING else 0
+        ),  # Stack progress bars vertically
+        leave=True,  # Keep the progress bar after completion
     )
 
     # Initialize gradients at the start of the epoch
@@ -105,9 +111,7 @@ def train_epoch(
             with autocast(device_type="cuda" if config.DEVICE == "cuda" else "cpu"):
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
-                loss = (
-                    loss / config.GRADIENT_ACCUMULATION_STEPS
-                )  # Scale loss for gradient accumulation
+                loss = loss / config.GRADIENT_ACCUMULATION_STEPS
         else:
             outputs = model(inputs)
             loss = criterion(outputs, labels)
@@ -119,7 +123,6 @@ def train_epoch(
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.step(optimizer)
                 scaler.update()
-                # Step the scheduler after optimizer step
                 if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -127,13 +130,21 @@ def train_epoch(
             loss.backward()
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 optimizer.step()
-                # Step the scheduler after optimizer step
                 if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
-        # Update metrics
-        total_loss += loss.item() * config.GRADIENT_ACCUMULATION_STEPS
+        # Update metrics with proper synchronization
+        loss_value = loss.item() * config.GRADIENT_ACCUMULATION_STEPS
+        if config.DISTRIBUTED_TRAINING:
+            # Synchronize loss across all processes
+            loss_tensor = torch.tensor(loss_value, device=config.DEVICE)
+            dist.all_reduce(
+                loss_tensor, op=dist.ReduceOp.SUM, group=config.process_group
+            )
+            loss_value = loss_tensor.item() / config.WORLD_SIZE
+
+        total_loss += loss_value
 
         # Save attention outputs for batches 0 to 5
         if batch_idx == 0 and config.SAVE_SPECTROGRAMS:
@@ -176,21 +187,21 @@ def train_epoch(
             # Clear attention outputs after saving to prevent memory leaks
             model.clear_attention_outputs()
 
-        # Log batch metrics with reduced frequency
-        if batch_idx % 100 == 0:  # Log every 100 batches instead of every batch
+        # Log batch metrics with reduced frequency and only on main process
+        if batch_idx % 100 == 0 and config.LOCAL_RANK <= 0:
             wandb_logger.log(
                 {
                     "epoch": epoch_idx + 1,
                     "batch": batch_idx + 1,
-                    "batch_loss": loss.item() * config.GRADIENT_ACCUMULATION_STEPS,
+                    "batch_loss": loss_value,
                     "learning_rate": scheduler.get_last_lr()[0],
                 }
             )
 
+        # Update progress bar with current loss
         pbar.set_postfix(loss=total_loss / (batch_idx + 1))
 
     # Calculate average loss over actual optimizer steps
-    # With gradient accumulation, actual steps = len(train_loader) / gradient_accumulation_steps
     actual_steps = max(1, len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS)
     return total_loss / actual_steps
 
@@ -255,21 +266,34 @@ def validate(
 
 
 def setup_distributed(config):
-    """Initialize distributed training."""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        config.LOCAL_RANK = int(os.environ["RANK"])
-        config.WORLD_SIZE = int(os.environ["WORLD_SIZE"])
-
+    """Initialize distributed training for Databricks cluster."""
     if config.DISTRIBUTED_TRAINING:
-        if config.LOCAL_RANK != -1:  # for distributed training
-            torch.cuda.set_device(config.LOCAL_RANK)
-            dist.init_process_group(
-                backend=config.DIST_BACKEND,
-                init_method=config.DIST_URL,
-                world_size=config.WORLD_SIZE,
-                rank=config.LOCAL_RANK,
-            )
-            logger.info(f"Initialized distributed training on rank {config.LOCAL_RANK}")
+        # Get rank from environment
+        if "RANK" in os.environ:
+            config.LOCAL_RANK = int(os.environ["RANK"])
+        else:
+            # If not set, assume we're the driver (rank 0)
+            config.LOCAL_RANK = 0
+
+        # Set up the device
+        torch.cuda.set_device(config.LOCAL_RANK)
+
+        # Initialize the distributed process group
+        dist.init_process_group(
+            backend=config.DIST_BACKEND,
+            init_method=f"tcp://{config.MASTER_ADDR}:{config.MASTER_PORT}",
+            world_size=config.WORLD_SIZE,
+            rank=config.LOCAL_RANK,
+        )
+
+        logger.info(
+            f"Initialized distributed training on rank {config.LOCAL_RANK} "
+            f"with {config.WORLD_SIZE} processes"
+        )
+
+        # Set up process group for all_reduce operations
+        if not hasattr(config, "process_group"):
+            config.process_group = dist.new_group()
 
 
 def cleanup_distributed():
