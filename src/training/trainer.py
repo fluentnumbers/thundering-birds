@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
@@ -131,16 +132,15 @@ def validate(
     config,
     epoch_idx: int,
     wandb_logger: WandbLogger,
-) -> Tuple[float, float]:
-    """Validate the model."""
+) -> Tuple[float, float, float]:
+    """Validate the model and compute metrics."""
     model.eval()
     total_loss = 0
-    correct = 0
-    total = 0
+    all_preds = []
+    all_labels = []
 
     with torch.no_grad():
         for inputs, labels in valid_loader:
-            # Move data to device in a single operation
             inputs = inputs.to(config.DEVICE, non_blocking=True)
             labels = labels.to(config.DEVICE, non_blocking=True)
 
@@ -151,23 +151,37 @@ def validate(
             # Update metrics
             total_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+
+            # Store predictions and labels for F1 calculation
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
     # Calculate metrics
-    val_accuracy = 100 * correct / total
-    avg_val_loss = total_loss / len(valid_loader)
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
 
-    # Log validation metrics with reduced frequency
+    # Calculate accuracy
+    correct = (all_preds == all_labels).sum()
+    total = len(all_labels)
+    accuracy = 100 * correct / total
+
+    # Calculate F1 score (macro average across all classes)
+    f1 = f1_score(all_labels, all_preds, average="macro")
+
+    # Calculate average loss
+    avg_loss = total_loss / len(valid_loader)
+
+    # Log validation metrics
     wandb_logger.log(
         {
             "epoch": epoch_idx,
-            "val_loss": avg_val_loss,
-            "val_accuracy": val_accuracy,
+            "val_loss": avg_loss,
+            "val_accuracy": accuracy,
+            "val_f1": f1 * 100,  # Convert to percentage for consistency
         }
     )
 
-    return avg_val_loss, val_accuracy
+    return avg_loss, accuracy, f1
 
 
 def train(config, run_dir: Path):
@@ -315,7 +329,7 @@ def train(config, run_dir: Path):
     )
 
     # Training loop
-    best_val_accuracy = 0.0
+    best_val_f1 = 0.0
     best_model_path = None
     patience = 10
     patience_counter = 0
@@ -335,8 +349,8 @@ def train(config, run_dir: Path):
             wandb_logger,
         )
 
-        # Validation phase
-        val_loss, val_accuracy = validate(
+        # Validation phase with F1 score
+        val_loss, val_accuracy, val_f1 = validate(
             model,
             valid_loader,
             criterion,
@@ -345,19 +359,21 @@ def train(config, run_dir: Path):
             wandb_logger,
         )
 
+        # Log epoch metrics
         wandb_logger.log(
             {
                 "epoch": epoch_idx,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_accuracy": val_accuracy,
+                "val_f1": val_f1 * 100,
                 "learning_rate": scheduler.get_last_lr()[0],
             }
         )
 
-        # Save best model with reduced frequency
-        if val_accuracy > best_val_accuracy:
-            best_val_accuracy = val_accuracy
+        # Save best model (now considering F1 score)
+        if val_f1 > best_val_f1:  # Change criterion to F1 score
+            best_val_f1 = val_f1
             best_model_path = run_dir / f"best_model_epoch_{epoch_idx+1}.pt"
             torch.save(
                 {
@@ -368,6 +384,7 @@ def train(config, run_dir: Path):
                     "train_loss": train_loss,
                     "val_loss": val_loss,
                     "val_accuracy": val_accuracy,
+                    "val_f1": val_f1,
                 },
                 best_model_path,
             )
@@ -387,6 +404,7 @@ def train(config, run_dir: Path):
                     "train_loss": train_loss,
                     "val_loss": val_loss,
                     "val_accuracy": val_accuracy,
+                    "val_f1": val_f1,
                 },
                 checkpoint_path,
             )

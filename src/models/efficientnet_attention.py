@@ -23,7 +23,15 @@ class CFARLayer(nn.Module):
     ):
         super().__init__()
         self.kernel_size = kernel_size
-        self.padding = "same"
+
+        # Calculate padding for 'same' output size
+        self.padding = (
+            kernel_size[0] // 2,  # Vertical padding
+            kernel_size[1] // 2,  # Horizontal padding
+        )
+
+        # Add activation
+        self.activation = nn.ReLU()
 
         # Fixed uniform kernel for average noise estimation
         self.kernel = torch.ones(1, 1, *kernel_size) / (kernel_size[0] * kernel_size[1])
@@ -32,22 +40,11 @@ class CFARLayer(nn.Module):
         self.scaling_factor = scaling_factor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.padding == "same":
-            padding = (self.kernel_size[0] // 2, self.kernel_size[1] // 2)
-        else:
-            raise ValueError("Padding must be 'same'")
-
-        local_noise = nn.functional.conv2d(x, self.kernel, padding=padding)
+        # Apply manual padding for 'same' output size
+        local_noise = F.conv2d(x, self.kernel, padding=self.padding)
         threshold = local_noise * self.scaling_factor
-
-        # Add logging to monitor values (during development)
-        if torch.rand(1).item() < 0.01:  # Log 1% of forward passes
-            logger.info(
-                f"CFAR stats - Input: mean={x.mean():.4f}, std={x.std():.4f}, "
-                f"Threshold: mean={threshold.mean():.4f}, std={threshold.std():.4f}"
-            )
-
-        return torch.where(x > threshold, x, torch.zeros_like(x))
+        detected = torch.where(x > threshold, x, torch.zeros_like(x))
+        return self.activation(detected)
 
 
 class AttentionChannels(nn.Module):
@@ -61,27 +58,47 @@ class AttentionChannels(nn.Module):
         scaling_factors: Tuple[float, float] = (5, 20),
     ):
         super().__init__()
-        self.norm = nn.BatchNorm2d(1)  # Add normalization
+        self.norm = nn.BatchNorm2d(1)
 
+        # CFAR layers
         self.cfar1 = CFARLayer(
-            kernel_size=kernel_size,
-            scaling_factor=scaling_factors[0],
+            kernel_size=kernel_size, scaling_factor=scaling_factors[0]
         )
         self.cfar2 = CFARLayer(
-            kernel_size=kernel_size,
-            scaling_factor=scaling_factors[1],
+            kernel_size=kernel_size, scaling_factor=scaling_factors[1]
+        )
+
+        # Convert to RGB-like channels with learned transformation
+        self.to_rgb = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, 3, kernel_size=1),
+        )
+
+        # ImageNet normalization parameters
+        self.register_buffer(
+            "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply normalization first
         x = self.norm(x)
-
-        # Generate two attention channels
         attention1 = self.cfar1(x)
         attention2 = self.cfar2(x)
 
-        # Combine original spectrogram with attention channels
-        return torch.cat((x, attention1, attention2), dim=1)
+        # Combine channels
+        combined = torch.cat((x, attention1, attention2), dim=1)
+
+        # Convert to RGB-like space
+        rgb_like = self.to_rgb(combined)
+
+        # Apply ImageNet normalization
+        normalized = (rgb_like - self.mean) / self.std
+
+        return normalized
 
 
 class EfficientNetWithAttention(nn.Module):
@@ -98,24 +115,33 @@ class EfficientNetWithAttention(nn.Module):
     ):
         super().__init__()
 
-        # Attention mechanism
         self.attention = AttentionChannels(
             kernel_size=kernel_size,
             scaling_factors=cfar_scaling_factors,
         )
 
         # Load pre-trained EfficientNet
-        self.efficientnet = EfficientNet.from_name(
+        self.efficientnet = EfficientNet.from_pretrained(
             efficientnet_version, num_classes=num_classes
         )
 
-        # Store attention outputs
+        # Add final classification layers with appropriate dropout
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=0.5),  # Dropout after feature extraction
+            nn.Linear(self.efficientnet._fc.in_features, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(p=0.3),  # Dropout before final classification
+            nn.Linear(512, num_classes),
+        )
+
+        # Replace the original classifier
+        self.efficientnet._fc = self.classifier
+
         self.attention_outputs = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Generate three-channel input using attention mechanism
         self.attention_outputs = self.attention(x)
-        # Pass through EfficientNet
         return self.efficientnet(self.attention_outputs)
 
     def get_attention_outputs(self) -> Optional[torch.Tensor]:
