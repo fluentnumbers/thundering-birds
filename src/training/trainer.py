@@ -472,12 +472,12 @@ def train(config, run_dir: Path):
             logger.info(f"Creating new processed data directory: {processed_data_dir}")
             # Create run-specific subdirectories for train and validation data
             run_specific_dir = processed_data_dir / run_dir.name
-            run_specific_dir.mkdir(exist_ok=True)
+            run_specific_dir.mkdir(exist_ok=True, parents=True)
 
             train_data_dir = run_specific_dir / "train"
             valid_data_dir = run_specific_dir / "valid"
-            train_data_dir.mkdir(exist_ok=True)
-            valid_data_dir.mkdir(exist_ok=True)
+            train_data_dir.mkdir(exist_ok=True, parents=True)
+            valid_data_dir.mkdir(exist_ok=True, parents=True)
 
         # Save metadata info file
         metadata_info_path = run_specific_dir / "dataset_metadata.json"
