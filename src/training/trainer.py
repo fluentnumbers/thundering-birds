@@ -179,15 +179,13 @@ def train_epoch(
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.step(optimizer)
                 scaler.update()
-                if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
-                    scheduler.step()
+                scheduler.step()  # Step the scheduler after optimizer step
                 optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 optimizer.step()
-                if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
-                    scheduler.step()
+                scheduler.step()  # Step the scheduler after optimizer step
                 optimizer.zero_grad(set_to_none=True)
 
         # Update metrics with proper synchronization
