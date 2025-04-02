@@ -210,10 +210,10 @@ def preprocess_and_save_dataset(
 
     try:
         # Process files in groups to control memory usage
-        num_files_per_group = 10  # Process 10 files at a time
+        num_files_per_group = 100  # Process 10 files at a time
         for group_st_idx in tqdm(
             range(0, len(metadata_df), num_files_per_group),
-            desc=f"Processing audio files by {num_files_per_group} at once to control memory usage",
+            desc=f"Processing audio files in groups of {num_files_per_group}",
             unit="group",
         ):
             group_end_idx = min(group_st_idx + num_files_per_group, len(metadata_df))

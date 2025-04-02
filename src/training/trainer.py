@@ -58,6 +58,62 @@ def step_scheduler(
         scheduler.step()
 
 
+def split_train_validation_data(metadata_df, config, logger, wandb_logger=None):
+    """Split the dataset into training and validation sets.
+
+    Args:
+        metadata_df: DataFrame containing metadata
+        config: Configuration object
+        logger: Logger instance
+        wandb_logger: Optional WandB logger instance
+
+    Returns:
+        Tuple of (train_df, valid_df)
+    """
+    if config.DEV_MODE:
+        # For DEV_MODE, use a pre-determined split with config.DEV_MODE_N_CLASSES specific classes
+        class_counts = metadata_df["primary_label"].value_counts()
+        min_n_samples = 4
+        unique_labels = sorted(
+            class_counts[class_counts >= min_n_samples].index.tolist()
+        )[: config.DEV_MODE_N_CLASSES]
+        metadata_df = metadata_df[metadata_df["primary_label"].isin(unique_labels)]
+        label2id = {label: idx for idx, label in enumerate(unique_labels)}
+        metadata_df["target"] = metadata_df["primary_label"].map(label2id)
+
+        logger.info(
+            f"DEV_MODE: Filtered out classes with less than {min_n_samples} samples. Training on {len(unique_labels)} classes: {unique_labels}"
+        )
+
+        if wandb_logger:
+            wandb_logger.log({"unique_labels": unique_labels})
+
+        # Create a simple train/test split for these classes
+        train_df, valid_df = train_test_split(
+            metadata_df,
+            test_size=0.2,
+            random_state=config.SEED,
+            stratify=metadata_df["target"],
+        )
+        config.N_CLASSES = len(unique_labels)
+
+    else:
+        # Create label mapping for full dataset
+        unique_labels = sorted(metadata_df["primary_label"].unique())
+        label2id = {label: idx for idx, label in enumerate(unique_labels)}
+        metadata_df["target"] = metadata_df["primary_label"].map(label2id)
+
+        train_df, valid_df = train_test_split(
+            metadata_df,
+            test_size=0.2,
+            random_state=config.SEED,
+            stratify=metadata_df["target"],
+        )
+        config.N_CLASSES = len(unique_labels)
+
+    return train_df, valid_df
+
+
 def train_epoch(
     model: nn.Module,
     train_loader: torch.utils.data.DataLoader,
@@ -400,86 +456,97 @@ def train(config, run_dir: Path):
 
         # Create directories for processed data
         processed_data_dir = config.PROCESSED_DATA_DIR
-        processed_data_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create run-specific subdirectories for train and validation data
-        run_specific_dir = processed_data_dir / run_dir.name
-        run_specific_dir.mkdir(exist_ok=True)
-
-        train_data_dir = run_specific_dir / "train"
-        valid_data_dir = run_specific_dir / "valid"
-        train_data_dir.mkdir(exist_ok=True)
-        valid_data_dir.mkdir(exist_ok=True)
-
-        # Load data
-        metadata_df = load_metadata(config)
-
-        # Split data
-        if config.DEV_MODE:
-            # For DEV_MODE, use a pre-determined split with config.DEV_MODE_N_CLASSES specific classes
-            class_counts = metadata_df["primary_label"].value_counts()
-            min_n_samples = 4
-            classes_to_keep = class_counts[class_counts >= min_n_samples].index.tolist()
-            metadata_df = metadata_df[
-                metadata_df["primary_label"].isin(classes_to_keep)
-            ]
-            unique_labels = sorted(metadata_df["primary_label"].unique())[
-                : config.DEV_MODE_N_CLASSES
-            ]
-            metadata_df = metadata_df[metadata_df["primary_label"].isin(unique_labels)]
-
-            # Create a new label mapping for the filtered classes
-            label2id = {label: idx for idx, label in enumerate(unique_labels)}
-            metadata_df["target"] = metadata_df["primary_label"].map(label2id)
-
+        # Check if processed data directory already exists and contains files
+        if (
+            processed_data_dir.exists()
+            and (processed_data_dir / "train_metadata.csv").exists()
+            and (processed_data_dir / "valid_metadata.csv").exists()
+        ):
             logger.info(
-                f"Filtered out classes with less than {min_n_samples} samples. Remaining classes: {len(unique_labels)}"
+                f"Using existing processed data directory: {processed_data_dir}"
             )
-
-            # Log the selected classes for reproducibility
-            logger.info(
-                f"DEV_MODE: Using {len(unique_labels)} classes for development: {unique_labels}"
-            )
-            wandb_logger.log({"unique_labels": unique_labels})
-
-            # Create a simple train/test split for these classes
-            train_df, valid_df = train_test_split(
-                metadata_df,
-                test_size=0.2,
-                random_state=config.SEED,
-                stratify=metadata_df["target"],
-            )
-            config.N_CLASSES = len(unique_labels)
-
+            run_specific_dir = processed_data_dir
+            train_data_dir = run_specific_dir / "train"
+            valid_data_dir = run_specific_dir / "valid"
         else:
-            # Create label mapping for full dataset
-            unique_labels = sorted(metadata_df["primary_label"].unique())
-            label2id = {label: idx for idx, label in enumerate(unique_labels)}
-            metadata_df["target"] = metadata_df["primary_label"].map(label2id)
+            logger.info(f"Creating new processed data directory: {processed_data_dir}")
+            # Create run-specific subdirectories for train and validation data
+            run_specific_dir = processed_data_dir / run_dir.name
+            run_specific_dir.mkdir(exist_ok=True)
 
-            train_df, valid_df = train_test_split(
-                metadata_df,
-                test_size=0.2,
-                random_state=config.SEED,
-                stratify=metadata_df["target"],
+            train_data_dir = run_specific_dir / "train"
+            valid_data_dir = run_specific_dir / "valid"
+            train_data_dir.mkdir(exist_ok=True)
+            valid_data_dir.mkdir(exist_ok=True)
+
+        # Save metadata info file
+        metadata_info_path = run_specific_dir / "dataset_metadata.json"
+
+        # Check if we have existing processed data
+        if metadata_info_path.exists():
+            logger.info("Found existing processed data, loading metadata...")
+            with open(metadata_info_path, "r") as f:
+                metadata_info = json.load(f)
+            train_processed_df = pd.read_csv(run_specific_dir / "train_metadata.csv")
+            valid_processed_df = pd.read_csv(run_specific_dir / "valid_metadata.csv")
+            config.N_CLASSES = metadata_info["n_classes"]
+            logger.info(
+                f"Loaded existing processed data with {config.N_CLASSES} classes"
             )
-            config.N_CLASSES = len(unique_labels)
+        else:
+            # Load and process data as before
+            metadata_df = load_metadata(config)
 
-        # Preprocess and save datasets
-        train_data_dir, train_processed_df = preprocess_and_save_dataset(
-            train_df,
-            config,
-            train_data_dir,
-            batch_size=config.BATCH_SIZE,
-            n_workers=config.NUM_WORKERS,
-        )
-        valid_data_dir, valid_processed_df = preprocess_and_save_dataset(
-            valid_df,
-            config,
-            valid_data_dir,
-            batch_size=config.BATCH_SIZE,
-            n_workers=config.NUM_WORKERS,
-        )
+            # Split data
+            train_df, valid_df = split_train_validation_data(
+                metadata_df, config, logger, wandb_logger
+            )
+
+            # Preprocess and save datasets
+            train_data_dir, train_processed_df = preprocess_and_save_dataset(
+                train_df,
+                config,
+                train_data_dir,
+                batch_size=config.BATCH_SIZE,
+                n_workers=config.NUM_WORKERS,
+            )
+            valid_data_dir, valid_processed_df = preprocess_and_save_dataset(
+                valid_df,
+                config,
+                valid_data_dir,
+                batch_size=config.BATCH_SIZE,
+                n_workers=config.NUM_WORKERS,
+            )
+
+            # Save metadata info and processed DataFrames
+            metadata_info = {
+                "n_classes": config.N_CLASSES,
+                "train_size": len(train_processed_df),
+                "valid_size": len(valid_processed_df),
+                "batch_size": config.BATCH_SIZE,
+                "seed": config.SEED,
+                "dev_mode": config.DEV_MODE,
+                "processing_date": datetime.now().isoformat(),
+            }
+
+            with open(metadata_info_path, "w") as f:
+                json.dump(metadata_info, f, indent=4)
+
+            # Save DataFrames with processed data info
+            train_processed_df.to_csv(
+                run_specific_dir / "train_metadata.csv", index=False
+            )
+            valid_processed_df.to_csv(
+                run_specific_dir / "valid_metadata.csv", index=False
+            )
+
+            logger.info(f"Saved dataset metadata to {metadata_info_path}")
+            logger.info(
+                f"Saved train metadata to {run_specific_dir / 'train_metadata.csv'}"
+            )
+            logger.info(
+                f"Saved valid metadata to {run_specific_dir / 'valid_metadata.csv'}"
+            )
 
         # Initialize distributed training after preprocessing
         setup_distributed(config)
@@ -552,18 +619,22 @@ def train(config, run_dir: Path):
 
         # Initialize training components with optimized settings
         criterion = nn.CrossEntropyLoss(reduction="mean")
-        optimizer = optim.Adam(model.parameters(), lr=config.LR_MAX, eps=1e-8)
+        optimizer = optim.AdamW(  # Changed to AdamW for better weight decay
+            model.parameters(),
+            lr=config.LR_MAX,
+            weight_decay=0.01,  # Add weight decay for regularization
+            eps=1e-8,
+        )
 
-        # Calculate total steps for scheduler
-        total_steps = config.EPOCHS * len(train_loader)
-        scheduler = optim.lr_scheduler.OneCycleLR(
+        # Calculate total steps and setup cosine annealing scheduler
+        num_steps_per_epoch = len(train_loader)
+        T_max = config.EPOCHS * num_steps_per_epoch  # Total number of steps
+
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            max_lr=config.LR_MAX,
-            total_steps=total_steps,
-            pct_start=0.10,
-            anneal_strategy="cos",
-            div_factor=1e3,
-            final_div_factor=1e4,
+            T_max=T_max,  # Total number of steps
+            eta_min=config.LR_MAX * 1e-4,  # Minimum learning rate
+            verbose=False,
         )
 
         # Training loop
