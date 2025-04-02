@@ -30,6 +30,8 @@ def load_silero_vad(config):
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
             force_reload=False,
+            trust_repo=True,
+            verbose=False,
         )
 
         # Force model to CPU
