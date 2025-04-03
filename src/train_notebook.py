@@ -2,12 +2,14 @@
 
 
 import gc
+import json
 import logging
 import math
 import os
 import random
 import time
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -15,7 +17,6 @@ import librosa
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import timm
 import torch
 import torch.nn as nn
@@ -27,8 +28,14 @@ from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+from src.config import LOGS_DIR
+from src.utils.logger import WandbLogger, setup_logger
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+
+# Setup logger
+logger = setup_logger(__name__)
 
 
 class CFG:
@@ -66,8 +73,8 @@ class CFG:
     FMAX = 14000
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    epochs = 10
-    batch_size = 32
+    epochs = 20
+    batch_size = 64
     criterion = "BCEWithLogitsLoss"
 
     n_fold = 5
@@ -90,9 +97,6 @@ class CFG:
             self.selected_folds = [0]
 
 
-cfg = CFG()
-
-
 def set_seed(seed=42):
     """
     Set seed for reproducibility
@@ -105,9 +109,6 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-set_seed(cfg.seed)
 
 
 def audio2melspec(audio_data, cfg):
@@ -167,13 +168,13 @@ def process_audio_file(audio_path, cfg):
         return mel_spec.astype(np.float32)
 
     except Exception as e:
-        print(f"Error processing {audio_path}: {e}")
+        logger.error(f"Error processing {audio_path}: {e}")
         return None
 
 
 def generate_spectrograms(df, cfg):
     """Generate spectrograms from audio files"""
-    print("Generating mel spectrograms from audio files...")
+    logger.info("Generating mel spectrograms from audio files...")
     start_time = time.time()
 
     all_bird_data = {}
@@ -193,13 +194,13 @@ def generate_spectrograms(df, cfg):
                 all_bird_data[samplename] = mel_spec
 
         except Exception as e:
-            print(f"Error processing {row.filepath}: {e}")
+            logger.error(f"Error processing {row.filepath}: {e}")
             errors.append((row.filepath, str(e)))
 
     end_time = time.time()
-    print(f"Processing completed in {end_time - start_time:.2f} seconds")
-    print(f"Successfully processed {len(all_bird_data)} files out of {len(df)}")
-    print(f"Failed to process {len(errors)} files")
+    logger.info(f"Processing completed in {end_time - start_time:.2f} seconds")
+    logger.info(f"Successfully processed {len(all_bird_data)} files out of {len(df)}")
+    logger.info(f"Failed to process {len(errors)} files")
 
     return all_bird_data
 
@@ -619,6 +620,13 @@ def calculate_auc(targets, outputs):
 
 def run_training(df, cfg):
     """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
+    # Create run directory with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = LOGS_DIR / f"training_run_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Setup logger with run directory
+    logger = setup_logger(__name__, run_dir)
 
     taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
     species_ids = df["primary_label"].unique().tolist()
@@ -627,19 +635,22 @@ def run_training(df, cfg):
     if cfg.debug:
         cfg.update_debug_settings()
 
+    # Initialize wandb logger with run directory
+    wandb_logger = WandbLogger(f"training_run_{timestamp}", run_dir)
+
     spectrograms = None
     if cfg.LOAD_DATA:
-        print("Loading pre-computed mel spectrograms from NPY file...")
+        logger.info("Loading pre-computed mel spectrograms from NPY file...")
         try:
             spectrograms = np.load(cfg.spectrogram_npy, allow_pickle=True).item()
-            print(f"Loaded {len(spectrograms)} pre-computed mel spectrograms")
+            logger.info(f"Loaded {len(spectrograms)} pre-computed mel spectrograms")
         except Exception as e:
-            print(f"Error loading pre-computed spectrograms: {e}")
-            print("Will generate spectrograms on-the-fly instead.")
+            logger.error(f"Error loading pre-computed spectrograms: {e}")
+            logger.info("Will generate spectrograms on-the-fly instead.")
             cfg.LOAD_DATA = False
 
     if not cfg.LOAD_DATA:
-        print("Will generate spectrograms on-the-fly during training.")
+        logger.info("Will generate spectrograms on-the-fly during training.")
         if "filepath" not in df.columns:
             df["filepath"] = cfg.train_datadir + "/" + df.filename
         if "samplename" not in df.columns:
@@ -655,13 +666,13 @@ def run_training(df, cfg):
         if fold not in cfg.selected_folds:
             continue
 
-        print(f'\n{"="*30} Fold {fold} {"="*30}')
+        logger.info(f'\n{"="*30} Fold {fold} {"="*30}')
 
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df = df.iloc[val_idx].reset_index(drop=True)
 
-        print(f"Training set: {len(train_df)} samples")
-        print(f"Validation set: {len(val_df)} samples")
+        logger.info(f"Training set: {len(train_df)} samples")
+        logger.info(f"Validation set: {len(val_df)} samples")
 
         train_dataset = BirdCLEFDatasetFromNPY(
             train_df, cfg, spectrograms=spectrograms, mode="train"
@@ -708,7 +719,7 @@ def run_training(df, cfg):
         best_epoch = 0
 
         for epoch in range(cfg.epochs):
-            print(f"\nEpoch {epoch+1}/{cfg.epochs}")
+            logger.info(f"\nEpoch {epoch+1}/{cfg.epochs}")
 
             train_loss, train_auc = train_one_epoch(
                 model,
@@ -729,14 +740,33 @@ def run_training(df, cfg):
                 else:
                     scheduler.step()
 
-            print(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
-            print(f"Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
+            # Log metrics to wandb with fold grouping
+            wandb_logger.log(
+                {
+                    "epoch": epoch + 1,  # Same epoch axis for all folds
+                    "fold": fold,
+                    "train_loss": train_loss,
+                    "train_auc": train_auc,
+                    "val_loss": val_loss,
+                    "val_auc": val_auc,
+                    "learning_rate": (
+                        scheduler.get_last_lr()[0] if scheduler else cfg.lr
+                    ),
+                    "_step": epoch + 1,  # For consistent x-axis
+                    "_group": f"fold_{fold}",  # Group by fold
+                }
+            )
+
+            logger.info(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
+            logger.info(f"Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
 
             if val_auc > best_auc:
                 best_auc = val_auc
                 best_epoch = epoch + 1
-                print(f"New best AUC: {best_auc:.4f} at epoch {best_epoch}")
+                logger.info(f"New best AUC: {best_auc:.4f} at epoch {best_epoch}")
 
+                # Save model checkpoint in run directory
+                checkpoint_path = run_dir / f"model_fold{fold}_epoch{epoch+1}.pth"
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
@@ -749,48 +779,66 @@ def run_training(df, cfg):
                         "train_auc": train_auc,
                         "cfg": cfg,
                     },
-                    f"model_fold{fold}.pth",
+                    checkpoint_path,
                 )
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         best_scores.append(best_auc)
-        print(f"\nBest AUC for fold {fold}: {best_auc:.4f} at epoch {best_epoch}")
+        logger.info(f"\nBest AUC for fold {fold}: {best_auc:.4f} at epoch {best_epoch}")
 
         # Clear memory
         del model, optimizer, scheduler, train_loader, val_loader
         torch.cuda.empty_cache()
         gc.collect()
 
-    print("\n" + "=" * 60)
-    print("Cross-Validation Results:")
+    logger.info("\n" + "=" * 60)
+    logger.info("Cross-Validation Results:")
     for fold, score in enumerate(best_scores):
-        print(f"Fold {cfg.selected_folds[fold]}: {score:.4f}")
-    print(f"Mean AUC: {np.mean(best_scores):.4f}")
-    print("=" * 60)
+        logger.info(f"Fold {cfg.selected_folds[fold]}: {score:.4f}")
+    logger.info(f"Mean AUC: {np.mean(best_scores):.4f}")
+    logger.info("=" * 60)
+
+    # Save final results
+    results = {
+        "best_scores": best_scores,
+        "mean_auc": float(np.mean(best_scores)),
+        "std_auc": float(np.std(best_scores)),
+        "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
+    }
+    with open(run_dir / "results.json", "w") as f:
+        json.dump(results, f, indent=4)
+    logger.info(f"Saved results to {run_dir / 'results.json'}")
+
+    # Finish wandb run
+    wandb_logger.finish()
 
 
 if __name__ == "__main__":
     import time
 
-    print("\nLoading training data...")
+    cfg = CFG()
+    set_seed(cfg.seed)
+    logger.info("Loading training data...")
     train_df = pd.read_csv(cfg.train_csv)
     taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
 
-    print("\nStarting training...")
-    print(f"LOAD_DATA is set to {cfg.LOAD_DATA}")
+    logger.info("Starting training...")
+    logger.info(f"LOAD_DATA is set to {cfg.LOAD_DATA}")
+
     if cfg.LOAD_DATA:
-        print("Using pre-computed mel spectrograms from NPY file")
+        logger.info("Using pre-computed mel spectrograms from NPY file")
     else:
-        print("Will generate spectrograms on-the-fly during training")
+        logger.info("Will generate spectrograms on-the-fly during training")
 
     # Analyze class distribution
-    print("\nClass distribution in training data:")
+    logger.info("Class distribution in training data:")
     class_counts = train_df["primary_label"].value_counts().sort_index()
     top_3_classes = class_counts[class_counts >= 4][:3].index.tolist()
 
     # Filter the dataframe to keep only the top 3 classes
     train_df = train_df[train_df["primary_label"].isin(top_3_classes)]
-    print(f"\nFiltered training data to {len(train_df)} samples from top 3 classes")
+    logger.info(f"Filtered training data to {len(train_df)} samples from top 3 classes")
 
     run_training(train_df, cfg)
 
-    print("\nTraining complete!")
+    logger.info("Training complete!")
