@@ -34,30 +34,6 @@ torch.serialization.add_safe_globals([np.core.multiarray.scalar])
 torch.backends.mkldnn.enabled = True
 
 
-def step_scheduler(
-    scheduler: optim.lr_scheduler._LRScheduler, val_loss: float = None
-) -> None:
-    """Step the learning rate scheduler based on its type.
-
-    Args:
-        scheduler: The learning rate scheduler to step
-        val_loss: Optional validation loss for ReduceLROnPlateau scheduler
-    """
-    if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
-        # OneCycleLR should be stepped per batch
-        scheduler.step()
-    elif isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-        # ReduceLROnPlateau needs the validation loss
-        if val_loss is None:
-            raise ValueError(
-                "val_loss must be provided for ReduceLROnPlateau scheduler"
-            )
-        scheduler.step(val_loss)
-    else:
-        # Other schedulers (StepLR, etc.) just need step()
-        scheduler.step()
-
-
 def split_train_validation_data(metadata_df, config, logger, wandb_logger=None):
     """Split the dataset into training and validation sets.
 
@@ -168,25 +144,25 @@ def train_epoch(
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
                 loss = loss / config.GRADIENT_ACCUMULATION_STEPS
-        else:
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss = loss / config.GRADIENT_ACCUMULATION_STEPS
 
-        # Backward pass with gradient scaling if mixed precision is enabled
-        if config.MIXED_PRECISION and scaler is not None:
+            # Backward pass with gradient scaling
             scaler.scale(loss).backward()
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()  # Step the scheduler after optimizer step
                 optimizer.zero_grad(set_to_none=True)
         else:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss = loss / config.GRADIENT_ACCUMULATION_STEPS
             loss.backward()
+
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 optimizer.step()
-                scheduler.step()  # Step the scheduler after optimizer step
                 optimizer.zero_grad(set_to_none=True)
+
+        # Step the scheduler after every batch, regardless of gradient accumulation
+        scheduler.step()
 
         # Update metrics with proper synchronization
         loss_value = loss.item() * config.GRADIENT_ACCUMULATION_STEPS
