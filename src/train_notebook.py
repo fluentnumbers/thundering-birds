@@ -96,8 +96,8 @@ class CFG:
 
     def update_debug_settings(self):
         if self.debug:
-            self.epochs = 2
-            self.selected_folds = [0]
+            self.epochs = 20
+            self.selected_folds = [0, 1, 2, 3, 4]
 
 
 def set_seed(seed=42):
@@ -805,14 +805,15 @@ if __name__ == "__main__":
     else:
         logger.info("Will generate spectrograms on-the-fly during training")
 
-    # Analyze class distribution
-    logger.info("Class distribution in training data:")
-    class_counts = train_df["primary_label"].value_counts().sort_index()
-    top_3_classes = class_counts[class_counts >= 4][:3].index.tolist()
+    if cfg.debug:
+        # Filter the dataframe to keep only the top 3 classes
+        class_counts = train_df["primary_label"].value_counts().sort_index()
+        top_3_classes = class_counts[class_counts >= 4][:3].index.tolist()
 
-    # Filter the dataframe to keep only the top 3 classes
-    train_df = train_df[train_df["primary_label"].isin(top_3_classes)]
-    logger.info(f"Filtered training data to {len(train_df)} samples from top 3 classes")
+        train_df = train_df[train_df["primary_label"].isin(top_3_classes)]
+        logger.info(
+            f"Filtered training data to {len(train_df)} samples from top 3 classes"
+        )
 
     run_training(train_df, cfg)
 
