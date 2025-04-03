@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from dotenv import load_dotenv
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from torch.optim import lr_scheduler
@@ -217,7 +218,7 @@ class BirdCLEFDatasetFromNPY(Dataset):
         self.spectrograms = spectrograms
 
         taxonomy_df = pd.read_csv(self.cfg.taxonomy_csv)
-        self.species_ids = self.df["primary_label"].unique().tolist()
+        self.species_ids = taxonomy_df["primary_label"].tolist()
         self.num_classes = len(self.species_ids)
         self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
 
@@ -604,7 +605,7 @@ def run_training(df, cfg):
     logger = setup_logger(__name__, run_dir)
 
     taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
-    species_ids = df["primary_label"].unique().tolist()
+    species_ids = taxonomy_df["primary_label"].unique().tolist()
     cfg.num_classes = len(species_ids)
 
     if cfg.debug:
@@ -789,7 +790,7 @@ def run_training(df, cfg):
 
 
 if __name__ == "__main__":
-    import time
+    load_dotenv(".env")
 
     cfg = CFG()
     set_seed(cfg.seed)
