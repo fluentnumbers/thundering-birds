@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 from src.config import LOGS_DIR
+from src.models.efficientnet_attention import EfficientNetWithAttention
 from src.utils.logger import WandbLogger, setup_logger
 
 warnings.filterwarnings("ignore")
@@ -47,7 +48,7 @@ class CFG:
     num_workers = 10
     DATA_ROOT: Path = Path("data/birdclef-2025")
 
-    OUTPUT_DIR = Path("logs")
+    OUTPUT_DIR = LOGS_DIR
 
     train_datadir = (DATA_ROOT / "train_audio").as_posix()
     train_csv = (DATA_ROOT / "train.csv").as_posix()
@@ -57,9 +58,11 @@ class CFG:
 
     # spectrogram_npy = "/kaggle/input/birdclef25-mel-spectrograms/birdclef2025_melspec_5sec_256_256.npy"
 
-    model_name = "efficientnet_b0"
+    model_name = "efficientnet-b0"
     pretrained = True
     in_channels = 1
+    kernel_size = (3, 3)
+    cfar_scaling_factors = (1, 2)
 
     LOAD_DATA = False
     FS = 32000
@@ -351,54 +354,26 @@ class BirdCLEFModel(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        cfg.num_classes = 3
-
-        self.backbone = timm.create_model(
-            cfg.model_name,
-            pretrained=cfg.pretrained,
-            in_chans=cfg.in_channels,
-            drop_rate=0.2,
-            drop_path_rate=0.2,
+        # Initialize EfficientNetWithAttention model
+        self.model = EfficientNetWithAttention(
+            num_classes=cfg.num_classes,
+            efficientnet_version=cfg.model_name,
+            kernel_size=cfg.kernel_size,
+            cfar_scaling_factors=cfg.cfar_scaling_factors,
         )
-
-        if "efficientnet" in cfg.model_name:
-            backbone_out = self.backbone.classifier.in_features
-            self.backbone.classifier = nn.Identity()
-        elif "resnet" in cfg.model_name:
-            backbone_out = self.backbone.fc.in_features
-            self.backbone.fc = nn.Identity()
-        else:
-            backbone_out = self.backbone.get_classifier().in_features
-            self.backbone.reset_classifier(0, "")
-
-        self.pooling = nn.AdaptiveAvgPool2d(1)
-
-        self.feat_dim = backbone_out
-
-        self.classifier = nn.Linear(backbone_out, cfg.num_classes)
 
         self.mixup_enabled = hasattr(cfg, "mixup_alpha") and cfg.mixup_alpha > 0
         if self.mixup_enabled:
             self.mixup_alpha = cfg.mixup_alpha
 
     def forward(self, x, targets=None):
-
         if self.training and self.mixup_enabled and targets is not None:
             mixed_x, targets_a, targets_b, lam = self.mixup_data(x, targets)
             x = mixed_x
         else:
             targets_a, targets_b, lam = None, None, None
 
-        features = self.backbone(x)
-
-        if isinstance(features, dict):
-            features = features["features"]
-
-        if len(features.shape) == 4:
-            features = self.pooling(features)
-            features = features.view(features.size(0), -1)
-
-        logits = self.classifier(features)
+        logits = self.model(x)
 
         if self.training and self.mixup_enabled and targets is not None:
             loss = self.mixup_criterion(
