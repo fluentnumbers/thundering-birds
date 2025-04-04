@@ -32,6 +32,7 @@ def load_metadata(config) -> pd.DataFrame:
 
 def process_audio_file(
     row: pd.Series,
+    config: Dict,
     config,
     use_voice_removal: bool = False,
 ) -> Dict:
@@ -39,6 +40,8 @@ def process_audio_file(
 
     Args:
         row: DataFrame row containing file information
+        config: Dictionary containing configuration parameters
+
         config: Configuration object
         use_voice_removal: Whether to use voice removal
 
@@ -55,7 +58,7 @@ def process_audio_file(
         mel_transform.to_db = mel_transform.to_db.to(device)
 
         # Load audio
-        audio_data, _ = librosa.load(row.filepath, sr=config.SAMPLE_RATE)
+        audio_data, _ = librosa.load(row.filepath, sr=config["SAMPLE_RATE"])
         audio_tensor = torch.tensor(audio_data, dtype=torch.float32, device=device)
 
         # Initialize voice remover inside the worker process if needed
@@ -66,18 +69,20 @@ def process_audio_file(
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
-        rsamples = nsamples % config.NSAMPLES
+        rsamples = nsamples % config["NSAMPLES"]
         audio_tensor = torch.nn.functional.pad(
-            audio_tensor, (0, config.NSAMPLES - rsamples), mode=config.PADMODE
+            audio_tensor, (0, config["NSAMPLES"] - rsamples), mode=config["PADMODE"]
         )
 
         # Calculate number of segments
-        n_segments = (len(audio_tensor) - config.NSAMPLES) // config.UFOLD_OVERLAP + 1
+        n_segments = (len(audio_tensor) - config["NSAMPLES"]) // config[
+            "UFOLD_OVERLAP"
+        ] + 1
 
         segments = []
         for segment_idx in range(n_segments):
-            start_idx = segment_idx * config.UFOLD_OVERLAP
-            audio_segment = audio_tensor[start_idx : start_idx + config.NSAMPLES]
+            start_idx = segment_idx * config["UFOLD_OVERLAP"]
+            audio_segment = audio_tensor[start_idx : start_idx + config["NSAMPLES"]]
 
             # Convert to mel spectrogram
             mel_spec = mel_transform(audio_segment)
@@ -89,7 +94,7 @@ def process_audio_file(
 
             # Add channel dimension and optionally repeat to 3 channels for RGB
             mel_spec = mel_spec.unsqueeze(0)
-            if config.MAKE_RGB:
+            if config["MAKE_RGB"]:
                 mel_spec = mel_spec.repeat(3, 1, 1)
 
             segments.append(
@@ -177,9 +182,25 @@ def preprocess_and_save_dataset(
 
     # Create a pool of workers
     pool = mp.Pool(n_workers)
+
+    # Create a simplified config for preprocessing that doesn't include distributed training objects
+    preprocess_config = {
+        "SAMPLE_RATE": config.SAMPLE_RATE,
+        "NSAMPLES": config.NSAMPLES,
+        "PADMODE": config.PADMODE,
+        "UFOLD_OVERLAP": config.UFOLD_OVERLAP,
+        "MAKE_RGB": config.MAKE_RGB,
+        "REMOVE_VOICE": config.REMOVE_VOICE,
+        "N_MELS": config.N_MELS,
+        "HOP_LENGTH": config.HOP_LENGTH,
+        "N_FFT": config.N_FFT,
+        "FMIN": config.FMIN,
+        "FMAX": config.FMAX,
+    }
+
     process_func = partial(
         process_audio_file,
-        config=config,
+        config=preprocess_config,
         use_voice_removal=config.REMOVE_VOICE,
     )
 
@@ -191,20 +212,20 @@ def preprocess_and_save_dataset(
     all_metadata = []
 
     try:
-        # Process files in chunks to control memory usage
-        chunk_size = 10  # Process 10 files at a time
-        for chunk_start in tqdm(
-            range(0, len(metadata_df), chunk_size),
-            desc=f"Processing audio files by {chunk_size} at once to control memory usage",
-            unit="chunk",
+        # Process files in groups to control memory usage
+        num_files_per_group = 100  # Process 10 files at a time
+        for group_st_idx in tqdm(
+            range(0, len(metadata_df), num_files_per_group),
+            desc=f"Processing audio files in groups of {num_files_per_group}",
+            unit="group",
         ):
-            chunk_end = min(chunk_start + chunk_size, len(metadata_df))
-            chunk_df = metadata_df.iloc[chunk_start:chunk_end]
+            group_end_idx = min(group_st_idx + num_files_per_group, len(metadata_df))
+            group_df = metadata_df.iloc[group_st_idx:group_end_idx]
 
             # Process current chunk
             chunk_results = []
             for result in pool.imap(
-                process_func, [row for _, row in chunk_df.iterrows()]
+                process_func, [row for _, row in group_df.iterrows()]
             ):
                 if result["success"]:
                     chunk_results.extend(result["segments"])

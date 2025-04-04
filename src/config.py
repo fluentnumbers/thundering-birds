@@ -40,7 +40,7 @@ class Config:
         128 if torch.cuda.is_available() else 64
     )  # Smaller batch size for CPU
     NUM_WORKERS: int = min(10, os.cpu_count() or 1)  # Safe default for num_workers
-    EPOCHS: int = 3
+    EPOCHS: int = 30
     LR_MAX: float = 1e-3
     DEV_MODE: bool = True
     DEV_MODE_N_CLASSES: int = 3
@@ -100,6 +100,8 @@ class Config:
         "nccl" if torch.cuda.is_available() else "gloo"
     )  # Use NCCL for GPU, gloo for CPU
     DIST_URL: str = "env://"  # URL used to establish distributed training
+    MASTER_ADDR: str = os.environ.get("MASTER_ADDR", "localhost")
+    MASTER_PORT: str = os.environ.get("MASTER_PORT", "29500")
 
     @property
     def model_config(self) -> ModelConfig:
