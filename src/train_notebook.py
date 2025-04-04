@@ -29,21 +29,16 @@ from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
-from src.config import LOGS_DIR
 from src.models.efficientnet_attention import EfficientNetWithAttention
 from src.utils.logger import WandbLogger, setup_logger
 
 warnings.filterwarnings("ignore")
-logging.basicConfig(level=logging.ERROR)
-
-# Setup logger
-logger = setup_logger(__name__)
+LOGS_DIR = Path("logs")
 
 
 class CFG:
 
     seed = 42
-    debug = False
     apex = False
     print_freq = 100
     num_workers = 10
@@ -78,7 +73,7 @@ class CFG:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs = 20
-    batch_size = 64
+    batch_size = 128
     criterion = "BCEWithLogitsLoss"
 
     n_fold = 5
@@ -93,10 +88,14 @@ class CFG:
     T_max = epochs
 
     aug_prob = 0.5
+
     mixup_alpha = 0.5
+
+    debug = True
 
     def update_debug_settings(self):
         if self.debug:
+            self.debug_n_classes = 3
             self.epochs = 20
             self.selected_folds = [0, 1, 2, 3, 4]
 
@@ -210,15 +209,14 @@ def generate_spectrograms(df, cfg):
 
 
 class BirdCLEFDatasetFromNPY(Dataset):
-    def __init__(self, df, cfg, spectrograms=None, mode="train"):
+    def __init__(self, df, cfg, species_ids, spectrograms=None, mode="train"):
         self.df = df
         self.cfg = cfg
         self.mode = mode
 
         self.spectrograms = spectrograms
 
-        taxonomy_df = pd.read_csv(self.cfg.taxonomy_csv)
-        self.species_ids = taxonomy_df["primary_label"].tolist()
+        self.species_ids = species_ids
         self.num_classes = len(self.species_ids)
         self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
 
@@ -236,11 +234,6 @@ class BirdCLEFDatasetFromNPY(Dataset):
             print(
                 f"Found {found_samples} matching spectrograms for {mode} dataset out of {len(self.df)} samples"
             )
-
-        if cfg.debug:
-            self.df = self.df.sample(
-                min(1000, len(self.df)), random_state=cfg.seed
-            ).reset_index(drop=True)
 
     def __len__(self):
         return len(self.df)
@@ -596,23 +589,21 @@ def calculate_auc(targets, outputs):
 
 def run_training(df, cfg):
     """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
-    # Create run directory with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = LOGS_DIR / f"training_run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Setup logger with run directory
-    logger = setup_logger(__name__, run_dir)
-
-    taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
-    species_ids = taxonomy_df["primary_label"].unique().tolist()
-    cfg.num_classes = len(species_ids)
 
     if cfg.debug:
         cfg.update_debug_settings()
+        # Filter the dataframe to keep only the top 3 classes
+        class_counts = df["primary_label"].value_counts().sort_index()
+        top_3_classes = class_counts[class_counts >= 4][
+            : cfg.debug_n_classes
+        ].index.tolist()
 
-    # Initialize wandb logger with run directory
-    wandb_logger = WandbLogger(f"training_run_{timestamp}", run_dir)
+        df = df[df["primary_label"].isin(top_3_classes)]
+        logger.info(
+            f"Filtered training data to {len(df)} audio files from {cfg.debug_n_classes} classes"
+        )
+    species_ids = df["primary_label"].unique().tolist()
+    cfg.num_classes = len(species_ids)
 
     spectrograms = None
     if cfg.LOAD_DATA:
@@ -647,14 +638,14 @@ def run_training(df, cfg):
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df = df.iloc[val_idx].reset_index(drop=True)
 
-        logger.info(f"Training set: {len(train_df)} samples")
-        logger.info(f"Validation set: {len(val_df)} samples")
+        logger.info(f"Training set: {len(train_df)} audio files")
+        logger.info(f"Validation set: {len(val_df)} audio files")
 
         train_dataset = BirdCLEFDatasetFromNPY(
-            train_df, cfg, spectrograms=spectrograms, mode="train"
+            train_df, cfg, species_ids, spectrograms=spectrograms, mode="train"
         )
         val_dataset = BirdCLEFDatasetFromNPY(
-            val_df, cfg, spectrograms=spectrograms, mode="valid"
+            val_df, cfg, species_ids, spectrograms=spectrograms, mode="valid"
         )
 
         train_loader = DataLoader(
@@ -794,9 +785,17 @@ if __name__ == "__main__":
 
     cfg = CFG()
     set_seed(cfg.seed)
+
+    # Create run directory with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = LOGS_DIR / f"training_run_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(__name__, run_dir)
+    # Initialize wandb logger with run directory
+    wandb_logger = WandbLogger(f"training_run_{timestamp}", run_dir)
+
     logger.info("Loading training data...")
     train_df = pd.read_csv(cfg.train_csv)
-    taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
 
     logger.info("Starting training...")
     logger.info(f"LOAD_DATA is set to {cfg.LOAD_DATA}")
@@ -805,16 +804,6 @@ if __name__ == "__main__":
         logger.info("Using pre-computed mel spectrograms from NPY file")
     else:
         logger.info("Will generate spectrograms on-the-fly during training")
-
-    if cfg.debug:
-        # Filter the dataframe to keep only the top 3 classes
-        class_counts = train_df["primary_label"].value_counts().sort_index()
-        top_3_classes = class_counts[class_counts >= 4][:3].index.tolist()
-
-        train_df = train_df[train_df["primary_label"].isin(top_3_classes)]
-        logger.info(
-            f"Filtered training data to {len(train_df)} samples from top 3 classes"
-        )
 
     run_training(train_df, cfg)
 

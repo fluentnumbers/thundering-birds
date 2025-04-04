@@ -5,10 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from efficientnet_pytorch import EfficientNet
 
-from src.utils.logger import setup_logger
-
-logger = setup_logger(__name__)
-
 
 class CFARLayer(nn.Module):
     """
