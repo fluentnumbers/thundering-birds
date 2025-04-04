@@ -33,7 +33,6 @@ def load_silero_vad(config):
             trust_repo=True,
             verbose=False,
         )
-
         # Force model to CPU
         model = model.cpu()
         logger.debug("Successfully loaded Silero VAD model on CPU")
@@ -81,7 +80,12 @@ class SileroVADRemover:
             rolloff=0.85,
             resampling_method="sinc_interp_kaiser",
             beta=8.555504641634386,
-        ).to(self.device)
+        ).cpu()  # Force resampler to CPU
+
+        torch.set_num_threads(1)
+        self.model, (self.get_speech_timestamps, _, _, _, _) = load_silero_vad()
+        if self.model is not None:
+            self.model.eval()  # Set to eval mode
 
     def __call__(self, audio: torch.Tensor) -> Tuple[torch.Tensor, bool]:
         """Remove voice from audio if detected.

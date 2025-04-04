@@ -150,6 +150,9 @@ def train_epoch(
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.step(optimizer)
                 scaler.update()
+                # Step the scheduler after optimizer step
+                if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
         else:
             outputs = model(inputs)
@@ -159,6 +162,9 @@ def train_epoch(
 
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 optimizer.step()
+                # Step the scheduler after optimizer step
+                if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
         # Step the scheduler after every batch, regardless of gradient accumulation
@@ -175,6 +181,7 @@ def train_epoch(
             loss_value = loss_tensor.item() / config.WORLD_SIZE
 
         total_loss += loss_value
+
 
         # Save attention outputs for batches 0 to 5
         if batch_idx == 0 and config.SAVE_SPECTROGRAMS:
@@ -330,7 +337,6 @@ def cleanup_distributed():
     """Cleanup distributed training resources."""
     if dist.is_initialized():
         dist.destroy_process_group()
-
 
 def save_final_model(model, config, run_dir: Path, metadata_df, wandb_logger):
     """Save the final model with metadata for inference."""
@@ -525,6 +531,7 @@ def train(config, run_dir: Path):
         # Initialize distributed training after preprocessing
         setup_distributed(config)
 
+
         # Create datasets with processed data
         train_dataset = BirdSoundDataset(
             train_processed_df,
@@ -609,6 +616,7 @@ def train(config, run_dir: Path):
             T_max=T_max,  # Total number of steps
             eta_min=config.LR_MAX * 1e-4,  # Minimum learning rate
             verbose=False,
+
         )
 
         # Training loop

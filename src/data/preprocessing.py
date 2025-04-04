@@ -33,6 +33,7 @@ def load_metadata(config) -> pd.DataFrame:
 def process_audio_file(
     row: pd.Series,
     config: Dict,
+    config,
     use_voice_removal: bool = False,
 ) -> Dict:
     """Process a single audio file and return its segments.
@@ -40,6 +41,8 @@ def process_audio_file(
     Args:
         row: DataFrame row containing file information
         config: Dictionary containing configuration parameters
+
+        config: Configuration object
         use_voice_removal: Whether to use voice removal
 
     Returns:
