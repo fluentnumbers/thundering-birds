@@ -25,7 +25,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from dotenv import load_dotenv
 from easydict import EasyDict
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset
@@ -434,8 +434,31 @@ def get_criterion(cfg):
     return criterion
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
+def calculate_metrics(targets, outputs):
+    """Calculate AUC and F1 scores for all classes"""
+    num_classes = targets.shape[1]
+    aucs = []
+    f1s = []
 
+    probs = 1 / (1 + np.exp(-outputs))
+    preds = (probs > 0.5).astype(int)
+
+    for i in range(num_classes):
+        if np.sum(targets[:, i]) > 0:
+            class_auc = roc_auc_score(targets[:, i], probs[:, i])
+            class_f1 = f1_score(targets[:, i], preds[:, i], zero_division=0)
+            aucs.append(class_auc)
+            f1s.append(class_f1)
+
+    return {
+        "auc": np.mean(aucs) if aucs else 0.0,
+        "f1": np.mean(f1s) if f1s else 0.0,
+        "aucs": aucs,
+        "f1s": f1s,
+    }
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
     model.train()
     losses = []
     all_targets = []
@@ -445,7 +468,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
     pbar = tqdm(enumerate_loader, total=len(loader), desc="Training")
 
     for step, batch in pbar:
-
         inputs = batch["melspec"].to(device)
         targets = batch["target"].to(device)
 
@@ -479,14 +501,13 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
-    auc = calculate_auc(all_targets, all_outputs)
+    metrics = calculate_metrics(all_targets, all_outputs)
     avg_loss = np.mean(losses)
 
-    return avg_loss, auc
+    return avg_loss, metrics
 
 
 def validate(model, loader, criterion, device):
-
     model.eval()
     losses = []
     all_targets = []
@@ -495,7 +516,6 @@ def validate(model, loader, criterion, device):
     pbar = tqdm(loader, desc="Validation")
     with torch.no_grad():
         for batch in pbar:
-
             inputs = batch["melspec"].to(device)
             targets = batch["target"].to(device)
 
@@ -517,27 +537,10 @@ def validate(model, loader, criterion, device):
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
-
-    auc = calculate_auc(all_targets, all_outputs)
+    metrics = calculate_metrics(all_targets, all_outputs)
     avg_loss = np.mean(losses)
 
-    return avg_loss, auc
-
-
-def calculate_auc(targets, outputs):
-
-    num_classes = targets.shape[1]
-    aucs = []
-
-    probs = 1 / (1 + np.exp(-outputs))
-
-    for i in range(num_classes):
-
-        if np.sum(targets[:, i]) > 0:
-            class_auc = roc_auc_score(targets[:, i], probs[:, i])
-            aucs.append(class_auc)
-
-    return np.mean(aucs) if aucs else 0.0
+    return avg_loss, metrics
 
 
 def run_training(df, cfg):
@@ -620,12 +623,13 @@ def run_training(df, cfg):
             scheduler = get_scheduler(optimizer, cfg)
 
         best_auc = 0
+        best_f1 = 0
         best_epoch = 0
 
         for epoch in range(cfg.epochs):
             logger.info(f"\nEpoch {epoch+1}/{cfg.epochs}")
 
-            train_loss, train_auc = train_one_epoch(
+            train_loss, train_metrics = train_one_epoch(
                 model,
                 train_loader,
                 optimizer,
@@ -634,7 +638,7 @@ def run_training(df, cfg):
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None,
             )
 
-            val_loss, val_auc = validate(model, val_loader, criterion, cfg.device)
+            val_loss, val_metrics = validate(model, val_loader, criterion, cfg.device)
 
             if scheduler is not None and not isinstance(
                 scheduler, lr_scheduler.OneCycleLR
@@ -647,27 +651,37 @@ def run_training(df, cfg):
             # Log metrics to wandb with fold grouping
             wandb_logger.log(
                 {
-                    "epoch": epoch + 1,  # Same epoch axis for all folds
+                    "epoch": epoch + 1,
                     "fold": fold,
                     "train_loss": train_loss,
-                    "train_auc": train_auc,
+                    "train_auc": train_metrics["auc"],
+                    "train_f1": train_metrics["f1"],
                     "val_loss": val_loss,
-                    "val_auc": val_auc,
+                    "val_auc": val_metrics["auc"],
+                    "val_f1": val_metrics["f1"],
                     "learning_rate": (
                         scheduler.get_last_lr()[0] if scheduler else cfg.lr
                     ),
-                    "_step": epoch + 1,  # For consistent x-axis
-                    "_group": f"fold_{fold}",  # Group by fold
+                    "_step": epoch + 1,
+                    "_group": f"fold_{fold}",
                 }
             )
 
-            logger.debug(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
-            logger.debug(f"Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
+            logger.debug(
+                f"Train Loss: {train_loss:.4f}, Train AUC: {train_metrics['auc']:.4f}, Train F1: {train_metrics['f1']:.4f}"
+            )
+            logger.debug(
+                f"Val Loss: {val_loss:.4f}, Val AUC: {val_metrics['auc']:.4f}, Val F1: {val_metrics['f1']:.4f}"
+            )
 
-            if val_auc > best_auc:
-                best_auc = val_auc
+            # Save model if either AUC or F1 improves
+            if val_metrics["auc"] > best_auc or val_metrics["f1"] > best_f1:
+                best_auc = max(best_auc, val_metrics["auc"])
+                best_f1 = max(best_f1, val_metrics["f1"])
                 best_epoch = epoch + 1
-                logger.info(f"New best AUC: {best_auc:.4f} at epoch {best_epoch}")
+                logger.info(
+                    f"New best metrics - AUC: {best_auc:.4f}, F1: {best_f1:.4f} at epoch {best_epoch}"
+                )
 
                 # Save model checkpoint in run directory
                 checkpoint_path = run_dir / f"model_fold{fold}_epoch{epoch+1}.pth"
@@ -679,16 +693,20 @@ def run_training(df, cfg):
                             scheduler.state_dict() if scheduler else None
                         ),
                         "epoch": epoch,
-                        "val_auc": val_auc,
-                        "train_auc": train_auc,
+                        "val_auc": val_metrics["auc"],
+                        "val_f1": val_metrics["f1"],
+                        "train_auc": train_metrics["auc"],
+                        "train_f1": train_metrics["f1"],
                         "cfg": cfg,
                     },
                     checkpoint_path,
                 )
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-        best_scores.append(best_auc)
-        logger.info(f"\nBest AUC for fold {fold}: {best_auc:.4f} at epoch {best_epoch}")
+        best_scores.append({"auc": best_auc, "f1": best_f1})
+        logger.info(
+            f"\nBest metrics for fold {fold}: AUC: {best_auc:.4f}, F1: {best_f1:.4f} at epoch {best_epoch}"
+        )
 
         # Clear memory
         del model, optimizer, scheduler, train_loader, val_loader
@@ -697,16 +715,21 @@ def run_training(df, cfg):
 
     logger.info("\n" + "=" * 60)
     logger.info("Cross-Validation Results:")
-    for fold, score in enumerate(best_scores):
-        logger.info(f"Fold {cfg.selected_folds[fold]}: {score:.4f}")
-    logger.info(f"Mean AUC: {np.mean(best_scores):.4f}")
+    for fold, scores in enumerate(best_scores):
+        logger.info(
+            f"Fold {cfg.selected_folds[fold]}: AUC: {scores['auc']:.4f}, F1: {scores['f1']:.4f}"
+        )
+    logger.info(f"Mean AUC: {np.mean([s['auc'] for s in best_scores]):.4f}")
+    logger.info(f"Mean F1: {np.mean([s['f1'] for s in best_scores]):.4f}")
     logger.info("=" * 60)
 
     # Save final results
     results = {
         "best_scores": best_scores,
-        "mean_auc": float(np.mean(best_scores)),
-        "std_auc": float(np.std(best_scores)),
+        "mean_auc": float(np.mean([s["auc"] for s in best_scores])),
+        "mean_f1": float(np.mean([s["f1"] for s in best_scores])),
+        "std_auc": float(np.std([s["auc"] for s in best_scores])),
+        "std_f1": float(np.std([s["f1"] for s in best_scores])),
         "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
     }
     with open(run_dir / "results.json", "w") as f:
