@@ -9,6 +9,7 @@ import os
 import random
 import time
 import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -23,12 +24,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from dotenv import load_dotenv
+from easydict import EasyDict
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+from src.data.preprocessing import process_audio_file
 from src.models.efficientnet_attention import EfficientNetWithAttention
 from src.utils.logger import WandbLogger, setup_logger
 
@@ -36,7 +39,22 @@ warnings.filterwarnings("ignore")
 LOGS_DIR = Path("logs")
 
 
+@dataclass
 class CFG:
+
+    preprocessing = EasyDict()
+    preprocessing.REMOVE_VOICE = False
+    preprocessing.SAMPLE_RATE = 32000
+    preprocessing.PADMODE = "constant"
+    preprocessing.N_FFT = 1024
+    preprocessing.HOP_LENGTH = 512
+    preprocessing.N_MELS = 128
+    preprocessing.FMIN = 50
+    preprocessing.FMAX = 14000
+    preprocessing.SEGMENT_DURATION = 5  # seconds
+    preprocessing.NSAMPLES = preprocessing.SEGMENT_DURATION * preprocessing.SAMPLE_RATE
+    preprocessing.UFOLD_OVERLAP = preprocessing.NSAMPLES // 2  # 2.5 seconds overlap
+    preprocessing.MAKE_RGB = False
 
     seed = 42
     apex = False
@@ -44,15 +62,11 @@ class CFG:
     num_workers = 10
     DATA_ROOT: Path = Path("data/birdclef-2025")
 
-    OUTPUT_DIR = LOGS_DIR
-
-    train_datadir = (DATA_ROOT / "train_audio").as_posix()
+    train_datadir = (DATA_ROOT / "train_audio_no_voice").as_posix()
     train_csv = (DATA_ROOT / "train.csv").as_posix()
     test_soundscapes = (DATA_ROOT / "test_soundscapes").as_posix()
     submission_csv = (DATA_ROOT / "sample_submission.csv").as_posix()
     taxonomy_csv = (DATA_ROOT / "taxonomy.csv").as_posix()
-
-    # spectrogram_npy = "/kaggle/input/birdclef25-mel-spectrograms/birdclef2025_melspec_5sec_256_256.npy"
 
     model_name = "efficientnet-b0"
     pretrained = True
@@ -64,12 +78,6 @@ class CFG:
     FS = 32000
     TARGET_DURATION = 5.0
     TARGET_SHAPE = (256, 256)
-
-    N_FFT = 1024
-    HOP_LENGTH = 512
-    N_MELS = 128
-    FMIN = 50
-    FMAX = 14000
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs = 20
@@ -139,7 +147,7 @@ def audio2melspec(audio_data, cfg):
     return mel_spec_norm
 
 
-def process_audio_file(audio_path, cfg):
+def process_audio_file2(audio_path, cfg):
     """Process a single audio file to get the mel spectrogram"""
     try:
         audio_data, _ = librosa.load(audio_path, sr=cfg.FS)
@@ -173,39 +181,6 @@ def process_audio_file(audio_path, cfg):
     except Exception as e:
         logger.error(f"Error processing {audio_path}: {e}")
         return None
-
-
-def generate_spectrograms(df, cfg):
-    """Generate spectrograms from audio files"""
-    logger.info("Generating mel spectrograms from audio files...")
-    start_time = time.time()
-
-    all_bird_data = {}
-    errors = []
-
-    for i, row in tqdm(df.iterrows(), total=len(df)):
-        if cfg.debug and i >= 1000:
-            break
-
-        try:
-            samplename = row["samplename"]
-            filepath = row["filepath"]
-
-            mel_spec = process_audio_file(filepath, cfg)
-
-            if mel_spec is not None:
-                all_bird_data[samplename] = mel_spec
-
-        except Exception as e:
-            logger.error(f"Error processing {row.filepath}: {e}")
-            errors.append((row.filepath, str(e)))
-
-    end_time = time.time()
-    logger.info(f"Processing completed in {end_time - start_time:.2f} seconds")
-    logger.info(f"Successfully processed {len(all_bird_data)} files out of {len(df)}")
-    logger.info(f"Failed to process {len(errors)} files")
-
-    return all_bird_data
 
 
 class BirdCLEFDatasetFromNPY(Dataset):

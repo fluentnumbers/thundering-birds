@@ -13,7 +13,6 @@ import torch
 from tqdm import tqdm
 
 from src.data.dataset import MelSpectrogramTransform
-from src.data.voice_removal import SileroVADRemover
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +32,6 @@ def load_metadata(config) -> pd.DataFrame:
 def process_audio_file(
     row: pd.Series,
     config: Dict,
-    config,
-    use_voice_removal: bool = False,
 ) -> Dict:
     """Process a single audio file and return its segments.
 
@@ -60,12 +57,6 @@ def process_audio_file(
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config["SAMPLE_RATE"])
         audio_tensor = torch.tensor(audio_data, dtype=torch.float32, device=device)
-
-        # Initialize voice remover inside the worker process if needed
-        has_voice = False
-        if use_voice_removal:
-            voice_remover = SileroVADRemover(config)
-            audio_tensor, has_voice = voice_remover(audio_tensor)
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
@@ -100,7 +91,7 @@ def process_audio_file(
             segments.append(
                 {
                     "spectrogram": mel_spec,
-                    "label": row.target,
+                    # "label": row.target,
                     "file_idx": row.name,
                     "segment_idx": segment_idx,
                     "filename": row.filename,
@@ -110,12 +101,11 @@ def process_audio_file(
 
         return {
             "segments": segments,
-            "has_voice": has_voice,
             "success": True,
             "error": None,
         }
     except Exception as e:
-        return {"segments": [], "has_voice": False, "success": False, "error": str(e)}
+        return {"segments": [], "success": False, "error": str(e)}
 
 
 def save_batch(batch_data: Dict, output_path: Path, batch_idx: int) -> Dict:
@@ -201,7 +191,6 @@ def preprocess_and_save_dataset(
     process_func = partial(
         process_audio_file,
         config=preprocess_config,
-        use_voice_removal=config.REMOVE_VOICE,
     )
 
     # Initialize counters and storage
