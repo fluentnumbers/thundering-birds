@@ -5,6 +5,7 @@ import gc
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 import random
 import time
@@ -68,7 +69,7 @@ class CFG:
     seed = 42
     apex = False
     print_freq = 100
-    num_workers = 0
+    num_workers = 12
     DATA_ROOT: Path = Path("data/birdclef-2025")
 
     train_datadir = (DATA_ROOT / "train_audio_no_voice").as_posix()
@@ -156,6 +157,38 @@ def audio2melspec(audio_data, cfg):
     return mel_spec_norm
 
 
+def process_file_worker(args):
+    """Worker function for processing files in parallel"""
+    file_idx, row, cfg = args
+    try:
+        result = process_audio_file(row, cfg.preprocessing)
+        if result["success"] and result["segments"]:
+            # Convert segments to tensors
+            tensor_segments = []
+            for segment in result["segments"]:
+                if isinstance(segment["spectrogram"], np.ndarray):
+                    tensor_segments.append(
+                        {
+                            "spectrogram": torch.from_numpy(segment["spectrogram"]),
+                            "filename": segment.get("filename", row["filename"]),
+                            "segment_idx": segment.get("segment_idx", 0),
+                        }
+                    )
+                else:
+                    tensor_segments.append(segment)
+            return file_idx, tensor_segments
+    except Exception as e:
+        logger.warning(f"Failed to process {row['samplename']}: {e}")
+
+    # Return zero segment if processing fails
+    zero_segment = {
+        "spectrogram": torch.zeros((1, 224, 224), dtype=torch.float32),
+        "filename": row["filename"],
+        "segment_idx": 0,
+    }
+    return file_idx, [zero_segment]
+
+
 class BirdCLEFDatasetFromNPY(Dataset):
     def __init__(self, df, cfg, species_ids, mode="train"):
         self.df = df
@@ -182,11 +215,76 @@ class BirdCLEFDatasetFromNPY(Dataset):
         self.total_segments = 0
         self.file_indices = []  # List of (file_idx, segment_idx) pairs
 
-        # Pre-process all files to get total segments count
-        for file_idx in range(len(self.df)):
-            segments = self._process_file(file_idx)
-            self.total_segments += len(segments)
-            self.file_indices.extend([(file_idx, i) for i in range(len(segments))])
+        # Process files in parallel
+        self._process_all_files()
+
+    def _process_all_files(self):
+        """Process all files in parallel and cache results"""
+        # First, check which files need processing
+        files_to_process = []
+        for file_idx, row in self.df.iterrows():
+            cache_path = self._get_cache_path(file_idx)
+            if not cache_path.exists():
+                files_to_process.append((file_idx, row, self.cfg))
+            else:
+                # Load from cache and update indices
+                try:
+                    segments = torch.load(cache_path)
+                    self.file_segments[file_idx] = segments
+                    self.total_segments += len(segments)
+                    self.file_indices.extend(
+                        [(file_idx, i) for i in range(len(segments))]
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to load cache for {cache_path}, will reprocess: {e}"
+                    )
+                    files_to_process.append((file_idx, row, self.cfg))
+
+        if not files_to_process:
+            logger.info("All files are already cached, no processing needed")
+            return
+
+        logger.info(
+            f"Processing {len(files_to_process)} files out of {len(self.df)} total files"
+        )
+
+        # Process files in batches to manage memory
+        batch_size = 100  # Process 100 files at a time
+        total_batches = (len(files_to_process) + batch_size - 1) // batch_size
+
+        with mp.Pool(processes=np.min([self.cfg.num_workers, mp.cpu_count()])) as pool:
+            # Create a progress bar for the overall process
+            with tqdm(total=len(files_to_process), desc="Processing files") as pbar:
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min((batch_idx + 1) * batch_size, len(files_to_process))
+                    batch_args = files_to_process[start_idx:end_idx]
+
+                    # Process current batch
+                    batch_results = list(pool.imap(process_file_worker, batch_args))
+
+                    # Save results and update indices
+                    for file_idx, segments in batch_results:
+                        # Save to cache
+                        self._save_to_cache(file_idx, segments)
+
+                        # Update in-memory segments (only keep the most recent batch)
+                        if file_idx in self.file_segments:
+                            del self.file_segments[file_idx]
+                        self.file_segments[file_idx] = segments
+
+                        # Update total segments and indices
+                        self.total_segments += len(segments)
+                        self.file_indices.extend(
+                            [(file_idx, i) for i in range(len(segments))]
+                        )
+
+                    # Update progress bar
+                    pbar.update(len(batch_args))
+
+                    # Clear memory after each batch
+                    gc.collect()
 
     def _get_cache_path(self, file_idx):
         """Get the cache path for a file"""
@@ -211,54 +309,6 @@ class BirdCLEFDatasetFromNPY(Dataset):
             torch.save(segments, cache_path)
         except Exception as e:
             logger.warning(f"Failed to save cache for {cache_path}: {e}")
-
-    def _process_file(self, file_idx):
-        """Process a file and cache its segments"""
-        if file_idx in self.file_segments:
-            return self.file_segments[file_idx]
-
-        # Try to load from cache first
-        cached_segments = self._load_from_cache(file_idx)
-        if cached_segments is not None:
-            self.file_segments[file_idx] = cached_segments
-            return cached_segments
-
-        # Process the file if not in cache
-        row = self.df.iloc[file_idx]
-        result = process_audio_file(row, self.cfg.preprocessing)
-
-        if result["success"] and result["segments"]:
-            segments = result["segments"]
-            # Convert segments to tensors and save to cache
-            tensor_segments = []
-            for segment in segments:
-                if isinstance(segment["spectrogram"], np.ndarray):
-                    tensor_segments.append(
-                        {
-                            "spectrogram": torch.from_numpy(segment["spectrogram"]),
-                            "filename": segment.get("filename", row["filename"]),
-                            "segment_idx": segment.get("segment_idx", 0),
-                        }
-                    )
-                else:
-                    tensor_segments.append(segment)
-
-            self._save_to_cache(file_idx, tensor_segments)
-            self.file_segments[file_idx] = tensor_segments
-            return tensor_segments
-        else:
-            # Return a single zero segment if processing fails
-            zero_segment = {
-                "spectrogram": torch.zeros((1, 224, 224), dtype=torch.float32),
-                "filename": row["filename"],
-                "segment_idx": 0,
-            }
-            self.file_segments[file_idx] = [zero_segment]
-            if self.mode == "train":
-                logger.warning(
-                    f"Warning: Failed to process {row['samplename']}, using zero segment"
-                )
-            return [zero_segment]
 
     def __len__(self):
         return self.total_segments
