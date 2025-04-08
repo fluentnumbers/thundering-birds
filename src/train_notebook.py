@@ -62,7 +62,7 @@ class CFG:
     preprocessing.UFOLD_OVERLAP = preprocessing.NSAMPLES // 2  # 2.5 seconds overlap
     preprocessing.MAKE_RGB = False
     preprocessing.SILENCE_THRESHOLD = (
-        0.5  # if more than 50% of the segment is silence, skip it
+        0.8  # if more than 50% of the segment is silence, skip it
     )
 
     seed = 42
@@ -85,7 +85,7 @@ class CFG:
     LOAD_DATA = False
     FS = 32000
     TARGET_DURATION = 5.0
-    TARGET_SHAPE = (256, 256)
+    TARGET_SHAPE = (224, 224)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs = 20
@@ -111,7 +111,7 @@ class CFG:
 
     def update_debug_settings(self):
         if self.debug:
-            self.debug_n_classes = 10
+            self.debug_n_classes = 5
             self.epochs = 40
             self.selected_folds = [0, 1, 2, 3, 4]
 
@@ -201,7 +201,7 @@ class BirdCLEFDatasetFromNPY(Dataset):
         else:
             # Return a single zero segment if processing fails
             zero_segment = {
-                "spectrogram": np.zeros(self.cfg.TARGET_SHAPE, dtype=np.float32)
+                "spectrogram": torch.tensor(np.zeros((1, 224, 224), dtype=np.float32))
             }
             self.file_segments[file_idx] = [zero_segment]
             if self.mode == "train":
@@ -393,45 +393,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
 
     for step, batch in pbar:
 
-        if isinstance(batch["melspec"], list):
-            batch_outputs = []
-            batch_losses = []
+        inputs = batch["melspec"].to(device)
+        targets = batch["target"].to(device)
 
-            for i in range(len(batch["melspec"])):
-                inputs = batch["melspec"][i].unsqueeze(0).to(device)
-                target = batch["target"][i].unsqueeze(0).to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
 
-                optimizer.zero_grad()
-                output = model(inputs)
-                loss = criterion(output, target)
-                loss.backward()
-
-                batch_outputs.append(output.detach().cpu())
-                batch_losses.append(loss.item())
-
-            optimizer.step()
-            outputs = torch.cat(batch_outputs, dim=0).numpy()
-            loss = np.mean(batch_losses)
-            targets = batch["target"].numpy()
-
+        if isinstance(outputs, tuple):
+            outputs, loss = outputs
         else:
-            inputs = batch["melspec"].to(device)
-            logger.info(f"Inputs shape: {inputs.shape}")
-            targets = batch["target"].to(device)
+            loss = criterion(outputs, targets)
 
-            optimizer.zero_grad()
-            outputs = model(inputs)
+        loss.backward()
+        optimizer.step()
 
-            if isinstance(outputs, tuple):
-                outputs, loss = outputs
-            else:
-                loss = criterion(outputs, targets)
-
-            loss.backward()
-            optimizer.step()
-
-            outputs = outputs.detach().cpu().numpy()
-            targets = targets.detach().cpu().numpy()
+        outputs = outputs.detach().cpu().numpy()
+        targets = targets.detach().cpu().numpy()
 
         if scheduler is not None and isinstance(scheduler, lr_scheduler.OneCycleLR):
             scheduler.step()
@@ -462,39 +439,28 @@ def validate(model, loader, criterion, device):
     all_targets = []
     all_outputs = []
 
+    pbar = tqdm(loader, desc="Validation")
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Validation"):
-            if isinstance(batch["melspec"], list):
-                batch_outputs = []
-                batch_losses = []
+        for batch in pbar:
 
-                for i in range(len(batch["melspec"])):
-                    inputs = batch["melspec"][i].unsqueeze(0).to(device)
-                    target = batch["target"][i].unsqueeze(0).to(device)
+            inputs = batch["melspec"].to(device)
+            targets = batch["target"].to(device)
 
-                    output = model(inputs)
-                    loss = criterion(output, target)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
 
-                    batch_outputs.append(output.detach().cpu())
-                    batch_losses.append(loss.item())
-
-                outputs = torch.cat(batch_outputs, dim=0).numpy()
-                loss = np.mean(batch_losses)
-                targets = batch["target"].numpy()
-
-            else:
-                inputs = batch["melspec"].to(device)
-                targets = batch["target"].to(device)
-
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-
-                outputs = outputs.detach().cpu().numpy()
-                targets = targets.detach().cpu().numpy()
+            outputs = outputs.detach().cpu().numpy()
+            targets = targets.detach().cpu().numpy()
 
             all_outputs.append(outputs)
             all_targets.append(targets)
             losses.append(loss if isinstance(loss, float) else loss.item())
+
+        pbar.set_postfix(
+            {
+                "val_loss": np.mean(losses[-10:]) if losses else 0,
+            }
+        )
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
@@ -642,8 +608,8 @@ def run_training(df, cfg):
                 }
             )
 
-            logger.info(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
-            logger.info(f"Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
+            logger.debug(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
+            logger.debug(f"Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
 
             if val_auc > best_auc:
                 best_auc = val_auc

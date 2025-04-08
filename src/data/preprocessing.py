@@ -67,16 +67,6 @@ def process_audio_file(
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
-        if nsamples < config["SAMPLE_RATE"] * config["SEGMENT_DURATION"]:
-            logger.warning(
-                f"Audio file {row.filename} is too short ({nsamples} samples) for a 5-second segment"
-            )
-            return {
-                "segments": [],
-                "success": False,
-                "error": f"Audio file {row.filename} is too short ({nsamples} samples) for a 5-second segment",
-            }
-
         rsamples = nsamples % config["NSAMPLES"]
         audio_tensor = torch.nn.functional.pad(
             audio_tensor, (0, config["NSAMPLES"] - rsamples), mode=config["PADMODE"]
