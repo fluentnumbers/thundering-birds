@@ -34,6 +34,8 @@ efficientnet-pytorch = "^0.7.1"
 seaborn = "^0.13.2"
 easydict = "^1.13"
 silero-vad = "^5.1.2"
+ffmpeg-python = "^0.2.0"
+pydub = "^0.25.1"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

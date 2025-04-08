@@ -3,19 +3,17 @@ import logging
 import multiprocessing as mp
 import shutil
 import time
-from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import librosa
 import numpy as np
 import pandas as pd
 import torch
 import torchaudio
-from requests import HTTPError
 from silero_vad import get_speech_timestamps, load_silero_vad
 from tqdm import tqdm
 
+from src.data.save_ogg import save_ogg_via_wav
 from src.train_notebook import CFG, set_seed
 from src.utils.logger import setup_logger
 
@@ -48,6 +46,7 @@ class SileroVADRemover:
         self.target_fs = 16000  # Silero VAD works best at 16kHz
         self.orig_fs = config["SAMPLE_RATE"]
         self.rsratio = self.orig_fs // self.target_fs
+        self.min_speech_gap = 1.5  # seconds
 
         # Initialize resampler
         self.resampler = torchaudio.transforms.Resample(
@@ -59,18 +58,20 @@ class SileroVADRemover:
             beta=8.555504641634386,
         ).cpu()  # Force resampler to CPU
 
-    def __call__(self, audio: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+    def __call__(
+        self, audio: torch.Tensor
+    ) -> Tuple[torch.Tensor, bool, List[Dict[str, float]]]:
         """Remove voice from audio if detected.
 
         Args:
             audio: Audio tensor of shape (n_samples,)
 
         Returns:
-            Tuple of (processed_audio, has_voice)
+            Tuple of (processed_audio, has_voice, timestamps)
         """
         if self.model is None:
             logger.warning("Silero VAD model not initialized, returning original audio")
-            return audio, False
+            return audio, False, []
 
         with torch.no_grad():
             # Resample audio to 16kHz for VAD
@@ -82,7 +83,25 @@ class SileroVADRemover:
             )
 
             if not speech_timestamps:
-                return audio, False
+                return audio, False, []
+
+            merged_timestamps = []
+
+            if speech_timestamps:
+                current_segment = speech_timestamps[0]
+
+                for i in range(1, len(speech_timestamps)):
+                    if (
+                        speech_timestamps[i]["start"] - current_segment["end"]
+                        < self.min_speech_gap
+                    ):
+                        current_segment["end"] = speech_timestamps[i]["end"]
+                    else:
+                        merged_timestamps.append(current_segment)
+                        current_segment = speech_timestamps[i]
+
+                merged_timestamps.append(current_segment)
+                speech_timestamps = merged_timestamps
 
             # Convert timestamps to original sample rate
             speech_samples = []
@@ -97,7 +116,7 @@ class SileroVADRemover:
                 # Replace speech with silence
                 processed_audio[start:end] = 0
 
-            return processed_audio, True
+            return processed_audio, True, speech_timestamps
 
 
 def init_process(cfg: CFG) -> None:
@@ -121,63 +140,68 @@ def init_process(cfg: CFG) -> None:
 
 def process_single_file(
     args: Tuple[pd.Series, Path, Path],
-) -> Tuple[str, bool, bool, Optional[str]]:
+) -> Tuple[str, bool, bool, Optional[str], Optional[List[Dict[str, float]]]]:
     """Process a single audio file for voice removal.
 
     Args:
         args: Tuple containing (row, data_folder_path, output_folder_path)
 
     Returns:
-        Tuple of (filename, has_voice, success, error)
+        Tuple of (filename, has_voice, success, error, timestamps)
     """
-    row, data_folder_path, output_folder_path = args
+    row, src_dir, dst_dir = args
     try:
         if _process_vad is None:
             raise RuntimeError("VAD model not initialized in process")
 
-        audio_path = Path(data_folder_path) / row["filename"]
-        output_file_path = output_folder_path / row["filename"]
+        audio_path = Path(src_dir) / row["filename"]
+        output_file_path = dst_dir / row["filename"]
         output_file_path.parent.mkdir(exist_ok=True, parents=True)
-
-        # Skip if output file already exists
-        if output_file_path.exists():
-            return row["filename"], False, True, None
 
         # Load audio with timeout
         try:
             waveform, sample_rate = torchaudio.load(audio_path)
         except Exception as e:
             logger.error(f"Error loading audio file {row['filename']}: {e}")
-            return row["filename"], False, False, f"Error loading audio: {str(e)}"
+            return row["filename"], False, False, f"Error loading audio: {str(e)}", None
 
         # Process audio with timeout
         try:
             audio_tensor = waveform.squeeze(0)  # Remove channel dimension
-            audio, has_voice = _process_vad(audio_tensor)
+            audio, has_voice, timestamps = _process_vad(audio_tensor)
         except Exception as e:
             logger.error(f"Error processing audio {row['filename']}: {e}")
-            return row["filename"], False, False, f"Error processing audio: {str(e)}"
+            return (
+                row["filename"],
+                False,
+                False,
+                f"Error processing audio: {str(e)}",
+                None,
+            )
 
         # Save output with timeout
         try:
             if has_voice:
-                torchaudio.save(
-                    str(output_file_path), audio.unsqueeze(0), _process_vad.orig_fs
-                )
+                audio_np = audio.cpu().numpy().astype(np.float32)
+                save_ogg_via_wav(_process_vad.orig_fs, audio_np, output_file_path)
             else:
                 shutil.copy(str(audio_path), str(output_file_path))
         except Exception as e:
             logger.error(f"Error saving output for {row['filename']}: {e}")
-            return row["filename"], False, False, f"Error saving output: {str(e)}"
+            return row["filename"], False, False, f"Error saving output: {str(e)}", None
 
-        return row["filename"], has_voice, True, None
+        return row["filename"], has_voice, True, None, timestamps
     except Exception as e:
         logger.error(f"Unexpected error processing {row['filename']}: {e}")
-        return row["filename"], False, False, str(e)
+        return row["filename"], False, False, str(e), None
 
 
 def remove_voice_whole_dataset(
-    df: pd.DataFrame, data_folder_path: Path, cfg: CFG, n_workers: Optional[int] = None
+    df: pd.DataFrame,
+    src_dir: Path,
+    dst_dir: Path,
+    cfg: CFG,
+    n_workers: Optional[int] = None,
 ) -> pd.DataFrame:
     """Remove voice from whole dataset using Silero VAD in parallel.
 
@@ -192,17 +216,13 @@ def remove_voice_whole_dataset(
     """
     logger.info("Removing voice from whole dataset using Silero VAD...")
     start_time = time.time()
-
-    # Create output directory with 'no_voice' appendix
-    output_folder_path = Path(str(data_folder_path) + "_no_voice")
-    output_folder_path.mkdir(exist_ok=True, parents=True)
-
+    dst_dir.mkdir(exist_ok=True, parents=True)
     # Check which files already exist in the output directory
     existing_files = set()
-    for file_path in output_folder_path.rglob("*"):
+    for file_path in dst_dir.rglob("*"):
         if file_path.is_file():
             # Get relative path from output_folder_path and normalize separators
-            rel_path = file_path.relative_to(output_folder_path)
+            rel_path = file_path.relative_to(dst_dir)
             # Convert to string and normalize path separators
             normalized_path = str(rel_path).replace("\\", "/")
             existing_files.add(normalized_path)
@@ -227,13 +247,11 @@ def remove_voice_whole_dataset(
 
     # Set number of workers (reduce if memory issues)
     if n_workers is None:
-        n_workers = max(1, mp.cpu_count() - 2)  # Leave 2 cores free
+        n_workers = max(1, mp.cpu_count() - 1)  # Leave 1 core free
     logger.info(f"Using {n_workers} worker processes")
 
     # Prepare arguments for each file
-    process_args = [
-        (row, data_folder_path, output_folder_path) for row in files_to_process
-    ]
+    process_args = [(row, src_dir, dst_dir) for row in files_to_process]
 
     # Initialize DataFrame column
     df["has_voice"] = False
@@ -266,29 +284,32 @@ def remove_voice_whole_dataset(
 
     # Process results
     failed_files = []
-    for filename, has_voice, success, error in results:
+    voice_info = {}
+    for filename, has_voice, success, error, timestamps in results:
         if success:
             df.loc[df["filename"] == filename, "has_voice"] = has_voice
+            voice_info[filename] = {
+                "has_voice": has_voice,
+                "timestamps": timestamps if timestamps else [],
+            }
         else:
             failed_files.append((filename, error))
             logger.error(f"Error processing {filename}: {error}")
 
     end_time = time.time()
     logger.info(f"Processing completed in {end_time - start_time:.1f} seconds")
-    logger.info(f"Processed files saved to {output_folder_path}")
+    logger.info(f"Processed files saved to {dst_dir}")
 
     if failed_files:
         logger.warning(f"Failed to process {len(failed_files)} files")
         # Save failed files information
-        failed_files_path = output_folder_path / "failed_files.json"
+        failed_files_path = dst_dir / "failed_files.json"
         with open(failed_files_path, "w") as f:
             json.dump(dict(failed_files), f, indent=2)
         logger.info(f"Saved failed files information to {failed_files_path}")
 
-    # Save has_voice information to a JSON file
-    voice_info = df.set_index("filename")["has_voice"].to_dict()
-    voice_info_path = output_folder_path / "voice_detection_results.json"
-
+    # Save voice detection results and timestamps to a JSON file
+    voice_info_path = dst_dir / "voice_detection_results.json"
     logger.info(f"Saving voice detection results to {voice_info_path}")
     with open(voice_info_path, "w") as f:
         json.dump(voice_info, f, indent=2)
@@ -303,12 +324,15 @@ if __name__ == "__main__":
     cfg = CFG()
     set_seed(cfg.seed)
     train_df = pd.read_csv(cfg.train_csv)
+    # train_df = train_df[train_df["primary_label"] == "65373"]
+    # train_df = train_df[:100]
 
     REMOVE_VOICE = True
     if REMOVE_VOICE:
         df = remove_voice_whole_dataset(
             train_df,
             cfg.DATA_ROOT / "train_audio",
+            cfg.DATA_ROOT / "train_audio_no_voice",
             cfg,
-            # n_workers=1,
+            # n_workers=11,
         )

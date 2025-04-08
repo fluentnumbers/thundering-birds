@@ -4,8 +4,6 @@ from pathlib import Path
 
 import numpy as np
 
-from src.config import LOGS_DIR
-
 
 def setup_logger(name: str, run_dir: Path = None) -> logging.Logger:
     """Setup logging with both file and console handlers."""
