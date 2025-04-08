@@ -56,6 +56,13 @@ def process_audio_file(
 
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config["SAMPLE_RATE"])
+        if audio_data.size == 0:
+            logger.warning(f"Empty audio data for {row.filename}")
+            return {
+                "segments": [],
+                "success": False,
+                "error": f"Empty audio data for {row.filename}",
+            }
         audio_tensor = torch.tensor(audio_data, dtype=torch.float32, device=device)
 
         # Pad if necessary
@@ -74,6 +81,10 @@ def process_audio_file(
         for segment_idx in range(n_segments):
             start_idx = segment_idx * config["UFOLD_OVERLAP"]
             audio_segment = audio_tensor[start_idx : start_idx + config["NSAMPLES"]]
+            # Skip segments that are mostly silence (50% or more zeros)
+            zero_count = torch.sum(audio_segment == 0).item()
+            if zero_count / audio_segment.numel() >= config["SILENCE_THRESHOLD"]:
+                continue
 
             # Convert to mel spectrogram
             mel_spec = mel_transform(audio_segment)
@@ -91,7 +102,6 @@ def process_audio_file(
             segments.append(
                 {
                     "spectrogram": mel_spec,
-                    # "label": row.target,
                     "file_idx": row.name,
                     "segment_idx": segment_idx,
                     "filename": row.filename,

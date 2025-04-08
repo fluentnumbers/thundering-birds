@@ -39,11 +39,17 @@ warnings.filterwarnings("ignore")
 LOGS_DIR = Path("logs")
 
 
+# Create run directory with timestamp
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_dir = LOGS_DIR / f"training_run_{timestamp}"
+run_dir.mkdir(parents=True, exist_ok=True)
+logger = setup_logger(__name__, run_dir)
+
+
 @dataclass
 class CFG:
 
     preprocessing = EasyDict()
-    preprocessing.REMOVE_VOICE = False
     preprocessing.SAMPLE_RATE = 32000
     preprocessing.PADMODE = "constant"
     preprocessing.N_FFT = 1024
@@ -55,11 +61,14 @@ class CFG:
     preprocessing.NSAMPLES = preprocessing.SEGMENT_DURATION * preprocessing.SAMPLE_RATE
     preprocessing.UFOLD_OVERLAP = preprocessing.NSAMPLES // 2  # 2.5 seconds overlap
     preprocessing.MAKE_RGB = False
+    preprocessing.SILENCE_THRESHOLD = (
+        0.5  # if more than 50% of the segment is silence, skip it
+    )
 
     seed = 42
     apex = False
     print_freq = 100
-    num_workers = 10
+    num_workers = 1
     DATA_ROOT: Path = Path("data/birdclef-2025")
 
     train_datadir = (DATA_ROOT / "train_audio_no_voice").as_posix()
@@ -147,50 +156,47 @@ def audio2melspec(audio_data, cfg):
     return mel_spec_norm
 
 
-def process_audio_file2(audio_path, cfg):
-    """Process a single audio file to get the mel spectrogram"""
-    try:
-        audio_data, _ = librosa.load(audio_path, sr=cfg.FS)
+# def process_audio_file2(audio_path, cfg):
+#     """Process a single audio file to get the mel spectrogram"""
+#     try:
+#         audio_data, _ = librosa.load(audio_path, sr=cfg.FS)
 
-        target_samples = int(cfg.TARGET_DURATION * cfg.FS)
+#         target_samples = int(cfg.TARGET_DURATION * cfg.FS)
 
-        if len(audio_data) < target_samples:
-            n_copy = math.ceil(target_samples / len(audio_data))
-            if n_copy > 1:
-                audio_data = np.concatenate([audio_data] * n_copy)
+#         if len(audio_data) < target_samples:
+#             n_copy = math.ceil(target_samples / len(audio_data))
+#             if n_copy > 1:
+#                 audio_data = np.concatenate([audio_data] * n_copy)
 
-        # Extract center 5 seconds
-        start_idx = max(0, int(len(audio_data) / 2 - target_samples / 2))
-        end_idx = min(len(audio_data), start_idx + target_samples)
-        center_audio = audio_data[start_idx:end_idx]
+#         # Extract center 5 seconds
+#         start_idx = max(0, int(len(audio_data) / 2 - target_samples / 2))
+#         end_idx = min(len(audio_data), start_idx + target_samples)
+#         center_audio = audio_data[start_idx:end_idx]
 
-        if len(center_audio) < target_samples:
-            center_audio = np.pad(
-                center_audio, (0, target_samples - len(center_audio)), mode="constant"
-            )
+#         if len(center_audio) < target_samples:
+#             center_audio = np.pad(
+#                 center_audio, (0, target_samples - len(center_audio)), mode="constant"
+#             )
 
-        mel_spec = audio2melspec(center_audio, cfg)
+#         mel_spec = audio2melspec(center_audio, cfg)
 
-        if mel_spec.shape != cfg.TARGET_SHAPE:
-            mel_spec = cv2.resize(
-                mel_spec, cfg.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR
-            )
+#         if mel_spec.shape != cfg.TARGET_SHAPE:
+#             mel_spec = cv2.resize(
+#                 mel_spec, cfg.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR
+#             )
 
-        return mel_spec.astype(np.float32)
+#         return mel_spec.astype(np.float32)
 
-    except Exception as e:
-        logger.error(f"Error processing {audio_path}: {e}")
-        return None
+#     except Exception as e:
+#         logger.error(f"Error processing {audio_path}: {e}")
+#         return None
 
 
 class BirdCLEFDatasetFromNPY(Dataset):
-    def __init__(self, df, cfg, species_ids, spectrograms=None, mode="train"):
+    def __init__(self, df, cfg, species_ids, mode="train"):
         self.df = df
         self.cfg = cfg
         self.mode = mode
-
-        self.spectrograms = spectrograms
-
         self.species_ids = species_ids
         self.num_classes = len(self.species_ids)
         self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
@@ -203,44 +209,55 @@ class BirdCLEFDatasetFromNPY(Dataset):
                 lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
             )
 
-        sample_names = set(self.df["samplename"])
-        if self.spectrograms:
-            found_samples = sum(1 for name in sample_names if name in self.spectrograms)
-            print(
-                f"Found {found_samples} matching spectrograms for {mode} dataset out of {len(self.df)} samples"
+        # Initialize segment tracking
+        self.segment_indices = []
+        for idx, row in self.df.iterrows():
+            # If generating on-the-fly, we'll need to process the file to know
+            # For now, we'll assume a reasonable number of segments
+            n_segments = 1  # This will be updated when the file is processed
+            self.segment_indices.extend(
+                [(idx, seg_idx) for seg_idx in range(n_segments)]
             )
 
     def __len__(self):
-        return len(self.df)
+        return len(self.segment_indices)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+        file_idx, segment_idx = self.segment_indices[idx]
+        row = self.df.iloc[file_idx]
         samplename = row["samplename"]
         spec = None
 
-        if self.spectrograms and samplename in self.spectrograms:
-            spec = self.spectrograms[samplename]
-        elif not self.cfg.LOAD_DATA:
-            spec = process_audio_file(row["filepath"], self.cfg)
-
-        if spec is None:
+        # Process the file and get all segments
+        result = process_audio_file(row, self.cfg.preprocessing)
+        if result["success"] and result["segments"]:
+            # Update the number of segments for this file
+            n_segments = len(result["segments"])
+            # Update segment indices for this file
+            self.segment_indices = [
+                (f_idx, s_idx)
+                for f_idx, s_idx in self.segment_indices
+                if f_idx != file_idx
+            ] + [(file_idx, s_idx) for s_idx in range(n_segments)]
+            # Get the requested segment
+            spec = result["segments"][segment_idx]["spectrogram"]
+        elif not result["success"]:
             spec = np.zeros(self.cfg.TARGET_SHAPE, dtype=np.float32)
             if self.mode == "train":  # Only print warning during training
-                print(
-                    f"Warning: Spectrogram for {samplename} not found and could not be generated"
+                logger.warning(
+                    f"Warning: Spectrogram for {samplename} segment {segment_idx} not found and could not be generated"
                 )
 
-        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(
-            0
-        )  # Add channel dimension
+        # spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
 
-        if self.mode == "train" and random.random() < self.cfg.aug_prob:
-            spec = self.apply_spec_augmentations(spec)
+        # if self.mode == "train" and random.random() < self.cfg.aug_prob:
+        # spec = self.apply_spec_augmentations(spec)
 
         target = self.encode_label(row["primary_label"])
 
         if "secondary_labels" in row and row["secondary_labels"] not in [
-            [""],
+            "[" "]",
+            "['']",
             None,
             np.nan,
         ]:
@@ -257,6 +274,7 @@ class BirdCLEFDatasetFromNPY(Dataset):
             "melspec": spec,
             "target": torch.tensor(target, dtype=torch.float32),
             "filename": row["filename"],
+            "segment_idx": segment_idx,
         }
 
     def apply_spec_augmentations(self, spec):
@@ -296,7 +314,7 @@ class BirdCLEFDatasetFromNPY(Dataset):
 
 
 def collate_fn(batch):
-    """Custom collate function to handle different sized spectrograms"""
+    """Custom collate function to handle different sized spectrograms and segments"""
     batch = [item for item in batch if item is not None]
     if len(batch) == 0:
         return {}
@@ -314,6 +332,8 @@ def collate_fn(batch):
             shapes = [t.shape for t in result[key]]
             if len(set(str(s) for s in shapes)) == 1:
                 result[key] = torch.stack(result[key])
+        elif key == "segment_idx":
+            result[key] = torch.tensor(result[key])
 
     return result
 
@@ -431,7 +451,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
     all_targets = []
     all_outputs = []
 
-    pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
+    enumerate_loader = enumerate(loader)
+    pbar = tqdm(enumerate_loader, total=len(loader), desc="Training")
 
     for step, batch in pbar:
 
@@ -458,6 +479,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
 
         else:
             inputs = batch["melspec"].to(device)
+            logger.info(f"Inputs shape: {inputs.shape}")
             targets = batch["target"].to(device)
 
             optimizer.zero_grad()
@@ -581,24 +603,14 @@ def run_training(df, cfg):
     cfg.num_classes = len(species_ids)
 
     spectrograms = None
-    if cfg.LOAD_DATA:
-        logger.info("Loading pre-computed mel spectrograms from NPY file...")
-        try:
-            spectrograms = np.load(cfg.spectrogram_npy, allow_pickle=True).item()
-            logger.info(f"Loaded {len(spectrograms)} pre-computed mel spectrograms")
-        except Exception as e:
-            logger.error(f"Error loading pre-computed spectrograms: {e}")
-            logger.info("Will generate spectrograms on-the-fly instead.")
-            cfg.LOAD_DATA = False
 
-    if not cfg.LOAD_DATA:
-        logger.info("Will generate spectrograms on-the-fly during training.")
-        if "filepath" not in df.columns:
-            df["filepath"] = cfg.train_datadir + "/" + df.filename
-        if "samplename" not in df.columns:
-            df["samplename"] = df.filename.map(
-                lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
-            )
+    logger.info("Will generate spectrograms on-the-fly during training.")
+    if "filepath" not in df.columns:
+        df["filepath"] = cfg.train_datadir + "/" + df.filename
+    if "samplename" not in df.columns:
+        df["samplename"] = df.filename.map(
+            lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
+        )
 
     skf = StratifiedKFold(n_splits=cfg.n_fold, shuffle=True, random_state=cfg.seed)
 
@@ -616,12 +628,8 @@ def run_training(df, cfg):
         logger.info(f"Training set: {len(train_df)} audio files")
         logger.info(f"Validation set: {len(val_df)} audio files")
 
-        train_dataset = BirdCLEFDatasetFromNPY(
-            train_df, cfg, species_ids, spectrograms=spectrograms, mode="train"
-        )
-        val_dataset = BirdCLEFDatasetFromNPY(
-            val_df, cfg, species_ids, spectrograms=spectrograms, mode="valid"
-        )
+        train_dataset = BirdCLEFDatasetFromNPY(train_df, cfg, species_ids, mode="train")
+        val_dataset = BirdCLEFDatasetFromNPY(val_df, cfg, species_ids, mode="valid")
 
         train_loader = DataLoader(
             train_dataset,
@@ -757,28 +765,17 @@ def run_training(df, cfg):
 
 if __name__ == "__main__":
     load_dotenv(".env")
-
-    cfg = CFG()
-    set_seed(cfg.seed)
-
-    # Create run directory with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = LOGS_DIR / f"training_run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    logger = setup_logger(__name__, run_dir)
     # Initialize wandb logger with run directory
     wandb_logger = WandbLogger(f"training_run_{timestamp}", run_dir)
+    cfg = CFG()
+    set_seed(cfg.seed)
 
     logger.info("Loading training data...")
     train_df = pd.read_csv(cfg.train_csv)
 
     logger.info("Starting training...")
-    logger.info(f"LOAD_DATA is set to {cfg.LOAD_DATA}")
 
-    if cfg.LOAD_DATA:
-        logger.info("Using pre-computed mel spectrograms from NPY file")
-    else:
-        logger.info("Will generate spectrograms on-the-fly during training")
+    logger.info("Will generate spectrograms on-the-fly during training")
 
     run_training(train_df, cfg)
 
