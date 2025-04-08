@@ -68,13 +68,12 @@ class CFG:
     seed = 42
     apex = False
     print_freq = 100
-    num_workers = 1
+    num_workers = 0
     DATA_ROOT: Path = Path("data/birdclef-2025")
 
     train_datadir = (DATA_ROOT / "train_audio_no_voice").as_posix()
     train_csv = (DATA_ROOT / "train.csv").as_posix()
     test_soundscapes = (DATA_ROOT / "test_soundscapes").as_posix()
-    submission_csv = (DATA_ROOT / "sample_submission.csv").as_posix()
     taxonomy_csv = (DATA_ROOT / "taxonomy.csv").as_posix()
 
     model_name = "efficientnet-b0"
@@ -90,7 +89,7 @@ class CFG:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs = 20
-    batch_size = 128
+    batch_size = 64
     criterion = "BCEWithLogitsLoss"
 
     n_fold = 5
@@ -106,14 +105,14 @@ class CFG:
 
     aug_prob = 0.5
 
-    mixup_alpha = 0.5
+    mixup_alpha = 0
 
     debug = True
 
     def update_debug_settings(self):
         if self.debug:
-            self.debug_n_classes = 3
-            self.epochs = 20
+            self.debug_n_classes = 10
+            self.epochs = 40
             self.selected_folds = [0, 1, 2, 3, 4]
 
 
@@ -156,42 +155,6 @@ def audio2melspec(audio_data, cfg):
     return mel_spec_norm
 
 
-# def process_audio_file2(audio_path, cfg):
-#     """Process a single audio file to get the mel spectrogram"""
-#     try:
-#         audio_data, _ = librosa.load(audio_path, sr=cfg.FS)
-
-#         target_samples = int(cfg.TARGET_DURATION * cfg.FS)
-
-#         if len(audio_data) < target_samples:
-#             n_copy = math.ceil(target_samples / len(audio_data))
-#             if n_copy > 1:
-#                 audio_data = np.concatenate([audio_data] * n_copy)
-
-#         # Extract center 5 seconds
-#         start_idx = max(0, int(len(audio_data) / 2 - target_samples / 2))
-#         end_idx = min(len(audio_data), start_idx + target_samples)
-#         center_audio = audio_data[start_idx:end_idx]
-
-#         if len(center_audio) < target_samples:
-#             center_audio = np.pad(
-#                 center_audio, (0, target_samples - len(center_audio)), mode="constant"
-#             )
-
-#         mel_spec = audio2melspec(center_audio, cfg)
-
-#         if mel_spec.shape != cfg.TARGET_SHAPE:
-#             mel_spec = cv2.resize(
-#                 mel_spec, cfg.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR
-#             )
-
-#         return mel_spec.astype(np.float32)
-
-#     except Exception as e:
-#         logger.error(f"Error processing {audio_path}: {e}")
-#         return None
-
-
 class BirdCLEFDatasetFromNPY(Dataset):
     def __init__(self, df, cfg, species_ids, mode="train"):
         self.df = df
@@ -209,49 +172,51 @@ class BirdCLEFDatasetFromNPY(Dataset):
                 lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
             )
 
-        # Initialize segment tracking
-        self.segment_indices = []
-        for idx, row in self.df.iterrows():
-            # If generating on-the-fly, we'll need to process the file to know
-            # For now, we'll assume a reasonable number of segments
-            n_segments = 1  # This will be updated when the file is processed
-            self.segment_indices.extend(
-                [(idx, seg_idx) for seg_idx in range(n_segments)]
-            )
+        # Initialize file segments tracking
+        self.file_segments = {}  # Maps file_idx to list of segments
+        self.total_segments = 0
+        self.file_indices = []  # List of (file_idx, segment_idx) pairs
+
+        # Pre-process all files to get total segments count
+        for file_idx in range(len(self.df)):
+            segments = self._process_file(file_idx)
+            self.total_segments += len(segments)
+            self.file_indices.extend([(file_idx, i) for i in range(len(segments))])
 
     def __len__(self):
-        return len(self.segment_indices)
+        return self.total_segments
+
+    def _process_file(self, file_idx):
+        """Process a file and cache its segments"""
+        if file_idx in self.file_segments:
+            return self.file_segments[file_idx]
+
+        row = self.df.iloc[file_idx]
+        result = process_audio_file(row, self.cfg.preprocessing)
+
+        if result["success"] and result["segments"]:
+            segments = result["segments"]
+            self.file_segments[file_idx] = segments
+            return segments
+        else:
+            # Return a single zero segment if processing fails
+            zero_segment = {
+                "spectrogram": np.zeros(self.cfg.TARGET_SHAPE, dtype=np.float32)
+            }
+            self.file_segments[file_idx] = [zero_segment]
+            if self.mode == "train":
+                logger.warning(
+                    f"Warning: Failed to process {row['samplename']}, using zero segment"
+                )
+            return [zero_segment]
 
     def __getitem__(self, idx):
-        file_idx, segment_idx = self.segment_indices[idx]
+        # Get the file and segment index from our pre-computed list
+        file_idx, segment_idx = self.file_indices[idx]
+        segments = self.file_segments[file_idx]
+        segment = segments[segment_idx]
+
         row = self.df.iloc[file_idx]
-        samplename = row["samplename"]
-        spec = None
-
-        # Process the file and get all segments
-        result = process_audio_file(row, self.cfg.preprocessing)
-        if result["success"] and result["segments"]:
-            # Update the number of segments for this file
-            n_segments = len(result["segments"])
-            # Update segment indices for this file
-            self.segment_indices = [
-                (f_idx, s_idx)
-                for f_idx, s_idx in self.segment_indices
-                if f_idx != file_idx
-            ] + [(file_idx, s_idx) for s_idx in range(n_segments)]
-            # Get the requested segment
-            spec = result["segments"][segment_idx]["spectrogram"]
-        elif not result["success"]:
-            spec = np.zeros(self.cfg.TARGET_SHAPE, dtype=np.float32)
-            if self.mode == "train":  # Only print warning during training
-                logger.warning(
-                    f"Warning: Spectrogram for {samplename} segment {segment_idx} not found and could not be generated"
-                )
-
-        # spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
-
-        # if self.mode == "train" and random.random() < self.cfg.aug_prob:
-        # spec = self.apply_spec_augmentations(spec)
 
         target = self.encode_label(row["primary_label"])
 
@@ -271,39 +236,11 @@ class BirdCLEFDatasetFromNPY(Dataset):
                     target[self.label_to_idx[label]] = 1.0
 
         return {
-            "melspec": spec,
+            "melspec": segment["spectrogram"],
             "target": torch.tensor(target, dtype=torch.float32),
             "filename": row["filename"],
             "segment_idx": segment_idx,
         }
-
-    def apply_spec_augmentations(self, spec):
-        """Apply augmentations to spectrogram"""
-
-        # Time masking (horizontal stripes)
-        if random.random() < 0.5:
-            num_masks = random.randint(1, 3)
-            for _ in range(num_masks):
-                width = random.randint(5, 20)
-                start = random.randint(0, spec.shape[2] - width)
-                spec[0, :, start : start + width] = 0
-
-        # Frequency masking (vertical stripes)
-        if random.random() < 0.5:
-            num_masks = random.randint(1, 3)
-            for _ in range(num_masks):
-                height = random.randint(5, 20)
-                start = random.randint(0, spec.shape[1] - height)
-                spec[0, start : start + height, :] = 0
-
-        # Random brightness/contrast
-        if random.random() < 0.5:
-            gain = random.uniform(0.8, 1.2)
-            bias = random.uniform(-0.1, 0.1)
-            spec = spec * gain + bias
-            spec = torch.clamp(spec, 0, 1)
-
-        return spec
 
     def encode_label(self, label):
         """Encode label to one-hot vector"""
@@ -601,8 +538,6 @@ def run_training(df, cfg):
         )
     species_ids = df["primary_label"].unique().tolist()
     cfg.num_classes = len(species_ids)
-
-    spectrograms = None
 
     logger.info("Will generate spectrograms on-the-fly during training.")
     if "filepath" not in df.columns:

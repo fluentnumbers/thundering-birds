@@ -67,6 +67,16 @@ def process_audio_file(
 
         # Pad if necessary
         nsamples = audio_tensor.shape[-1]
+        if nsamples < config["SAMPLE_RATE"] * config["SEGMENT_DURATION"]:
+            logger.warning(
+                f"Audio file {row.filename} is too short ({nsamples} samples) for a 5-second segment"
+            )
+            return {
+                "segments": [],
+                "success": False,
+                "error": f"Audio file {row.filename} is too short ({nsamples} samples) for a 5-second segment",
+            }
+
         rsamples = nsamples % config["NSAMPLES"]
         audio_tensor = torch.nn.functional.pad(
             audio_tensor, (0, config["NSAMPLES"] - rsamples), mode=config["PADMODE"]
@@ -84,6 +94,9 @@ def process_audio_file(
             # Skip segments that are mostly silence (50% or more zeros)
             zero_count = torch.sum(audio_segment == 0).item()
             if zero_count / audio_segment.numel() >= config["SILENCE_THRESHOLD"]:
+                logger.warning(
+                    f"Segment {segment_idx} of {row.filename} is mostly silence ({zero_count / audio_segment.numel() * 100:.1f}% zeros)"
+                )
                 continue
 
             # Convert to mel spectrogram
