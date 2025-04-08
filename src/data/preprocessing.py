@@ -84,7 +84,7 @@ def process_audio_file(
             # Skip segments that are mostly silence (50% or more zeros)
             zero_count = torch.sum(audio_segment == 0).item()
             if zero_count / audio_segment.numel() >= config["SILENCE_THRESHOLD"]:
-                logger.warning(
+                logger.debug(
                     f"Segment {segment_idx} of {row.filename} is mostly silence ({zero_count / audio_segment.numel() * 100:.1f}% zeros)"
                 )
                 continue

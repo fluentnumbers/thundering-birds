@@ -75,6 +75,7 @@ class CFG:
     train_csv = (DATA_ROOT / "train.csv").as_posix()
     test_soundscapes = (DATA_ROOT / "test_soundscapes").as_posix()
     taxonomy_csv = (DATA_ROOT / "taxonomy.csv").as_posix()
+    cache_dir = (DATA_ROOT / "cache").as_posix()  # Add cache directory to config
 
     model_name = "efficientnet-b0"
     pretrained = True
@@ -172,6 +173,10 @@ class BirdCLEFDatasetFromNPY(Dataset):
                 lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
             )
 
+        # Create cache directory using config path
+        self.cache_dir = Path(self.cfg.cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
         # Initialize file segments tracking
         self.file_segments = {}  # Maps file_idx to list of segments
         self.total_segments = 0
@@ -183,25 +188,70 @@ class BirdCLEFDatasetFromNPY(Dataset):
             self.total_segments += len(segments)
             self.file_indices.extend([(file_idx, i) for i in range(len(segments))])
 
-    def __len__(self):
-        return self.total_segments
+    def _get_cache_path(self, file_idx):
+        """Get the cache path for a file"""
+        row = self.df.iloc[file_idx]
+        return self.cache_dir / f"{row['samplename']}.pt"
+
+    def _load_from_cache(self, file_idx):
+        """Load segments from cache if available"""
+        cache_path = self._get_cache_path(file_idx)
+        if cache_path.exists():
+            try:
+                return torch.load(cache_path)
+            except Exception as e:
+                logger.warning(f"Failed to load cache for {cache_path}: {e}")
+                return None
+        return None
+
+    def _save_to_cache(self, file_idx, segments):
+        """Save segments to cache"""
+        cache_path = self._get_cache_path(file_idx)
+        try:
+            torch.save(segments, cache_path)
+        except Exception as e:
+            logger.warning(f"Failed to save cache for {cache_path}: {e}")
 
     def _process_file(self, file_idx):
         """Process a file and cache its segments"""
         if file_idx in self.file_segments:
             return self.file_segments[file_idx]
 
+        # Try to load from cache first
+        cached_segments = self._load_from_cache(file_idx)
+        if cached_segments is not None:
+            self.file_segments[file_idx] = cached_segments
+            return cached_segments
+
+        # Process the file if not in cache
         row = self.df.iloc[file_idx]
         result = process_audio_file(row, self.cfg.preprocessing)
 
         if result["success"] and result["segments"]:
             segments = result["segments"]
-            self.file_segments[file_idx] = segments
-            return segments
+            # Convert segments to tensors and save to cache
+            tensor_segments = []
+            for segment in segments:
+                if isinstance(segment["spectrogram"], np.ndarray):
+                    tensor_segments.append(
+                        {
+                            "spectrogram": torch.from_numpy(segment["spectrogram"]),
+                            "filename": segment.get("filename", row["filename"]),
+                            "segment_idx": segment.get("segment_idx", 0),
+                        }
+                    )
+                else:
+                    tensor_segments.append(segment)
+
+            self._save_to_cache(file_idx, tensor_segments)
+            self.file_segments[file_idx] = tensor_segments
+            return tensor_segments
         else:
             # Return a single zero segment if processing fails
             zero_segment = {
-                "spectrogram": torch.tensor(np.zeros((1, 224, 224), dtype=np.float32))
+                "spectrogram": torch.zeros((1, 224, 224), dtype=torch.float32),
+                "filename": row["filename"],
+                "segment_idx": 0,
             }
             self.file_segments[file_idx] = [zero_segment]
             if self.mode == "train":
@@ -209,6 +259,9 @@ class BirdCLEFDatasetFromNPY(Dataset):
                     f"Warning: Failed to process {row['samplename']}, using zero segment"
                 )
             return [zero_segment]
+
+    def __len__(self):
+        return self.total_segments
 
     def __getitem__(self, idx):
         # Get the file and segment index from our pre-computed list
