@@ -119,7 +119,7 @@ def set_seed(seed=42):
 
 def process_file_worker(args):
     """Worker function for processing files in parallel"""
-    file_idx, row, cfg = args
+    filename, row, cfg = args
     try:
         result = process_audio_file(row, cfg.preprocessing)
         if result["success"] and result["segments"]:
@@ -136,7 +136,7 @@ def process_file_worker(args):
                     )
                 else:
                     tensor_segments.append(segment)
-            return file_idx, tensor_segments
+            return filename, tensor_segments
     except Exception as e:
         logger.warning(f"Failed to process {row['samplename']}: {e}")
 
@@ -146,7 +146,7 @@ def process_file_worker(args):
         "filename": row["filename"],
         "segment_idx": 0,
     }
-    return file_idx, [zero_segment]
+    return filename, [zero_segment]
 
 
 class BirdCLEFDataset(Dataset):
@@ -171,48 +171,86 @@ class BirdCLEFDataset(Dataset):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize file segments tracking
-        self.file_segments = {}  # Maps file_idx to list of segments
+        self.file_segments = {}  # Maps filename to list of segments
         self.total_segments = 0
-        self.file_indices = []  # List of (file_idx, segment_idx) pairs
+        self.file_indices = []  # List of (filename, segment_idx) pairs
 
         # Vectorized check for cache existence
-        cache_paths = [
-            self._get_cache_path(file_idx) for file_idx in range(len(self.df))
-        ]
-        cache_exists = [path.exists() for path in cache_paths]
-        logger.info(f"Cache exists for {sum(cache_exists)} files out of {len(self.df)}")
+        cache_paths = {
+            row["filename"]: self._get_cache_path(row["filename"])
+            for _, row in self.df.iterrows()
+        }
+        cache_exists = {
+            filename: path.exists() for filename, path in cache_paths.items()
+        }
+        logger.info(
+            f"Cache exists for {sum(cache_exists.values())} files out of {len(self.df)}"
+        )
 
-        # Split files into cached and to-process
-        time_start = time.time()
+        # Create or load cache status file
+        cache_status_file = self.cache_dir / f"cache_status_full.json"
+        CACHE_LOADED = False
+        if cache_status_file.exists():
+            # Load existing cache status
+            with open(cache_status_file, "r") as f:
+                cache_status = json.load(f)
+
+            # Update file_indices from cache status
+            for _, row in self.df.iterrows():
+                filename = row["filename"]
+                if filename in cache_status and cache_exists[filename]:
+                    num_segments = cache_status[filename]["num_segments"]
+                    self.file_indices.extend(
+                        [(filename, i) for i in range(num_segments)]
+                    )
+                    self.total_segments += num_segments
+            CACHE_LOADED = True
+
         cached_files = []
         files_to_process = []
+        if not CACHE_LOADED:
+            cache_status = {}
+            # Split files into cached and to-process
+            time_start = time.time()
 
-        for file_idx, (row, is_cached) in tqdm(
-            enumerate(zip(self.df.iterrows(), cache_exists)),
-            total=len(self.df),
-            desc="Loading cached files",
-            unit="file",
-        ):
-            if is_cached:
-                try:
-                    # Load just the first segment to get the count
-                    segments = torch.load(cache_paths[file_idx])
-                    self.total_segments += len(segments)
-                    self.file_indices.extend(
-                        [(file_idx, i) for i in range(len(segments))]
-                    )
-                    cached_files.append(file_idx)
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to load cache for {cache_paths[file_idx]}, will reprocess: {e}"
-                    )
-                    files_to_process.append((file_idx, row[1], self.cfg))
-            else:
-                files_to_process.append((file_idx, row[1], self.cfg))
+            for _, row in tqdm(
+                self.df.iterrows(),
+                total=len(self.df),
+                desc="Loading cached files",
+                unit="file",
+            ):
+                filename = row["filename"]
+                if cache_exists[filename]:
+                    try:
+                        # Load just the first segment to get the count
+                        segments = torch.load(cache_paths[filename])
+                        self.total_segments += len(segments)
+                        self.file_indices.extend(
+                            [(filename, i) for i in range(len(segments))]
+                        )
+                        cached_files.append(filename)
+                        cache_status[filename] = {
+                            "num_segments": len(segments),
+                            "last_modified": os.path.getmtime(cache_paths[filename]),
+                            "primary_label": row["primary_label"],
+                        }
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to load cache for {cache_paths[filename]}, will reprocess: {e}"
+                        )
+                        files_to_process.append((filename, row, self.cfg))
+                else:
+                    files_to_process.append((filename, row, self.cfg))
+
+        # Save cache status to JSON file
+        # if cache_status:
+        #     logger.info(f"Saving cache status to {cache_status_file}")
+        #     with open(cache_status_file, "w") as f:
+        #         json.dump(cache_status, f)
 
         if not files_to_process:
             logger.info(
-                f"All files for mode {self.mode} are already cached, no processing needed [{time.time() - time_start:.1f}s]"
+                f"All files for mode {self.mode} are already cached, no processing needed"
             )
             return
 
@@ -220,7 +258,6 @@ class BirdCLEFDataset(Dataset):
             f"Processing {len(files_to_process)} files out of {len(self.df)} total files"
         )
         time_start = time.time()
-        # Process files in parallel using multiprocessing
         with mp.Pool(
             processes=min(self.cfg.preprocessing.NUM_WORKERS, mp.cpu_count())
         ) as pool:
@@ -238,15 +275,15 @@ class BirdCLEFDataset(Dataset):
                 )
 
                 # Save results and update indices
-                for file_idx, segments in results:
+                for filename, segments in results:
                     if segments:  # Only process if we got valid segments
                         # Save to cache
-                        self._save_to_cache(file_idx, segments)
+                        self._save_to_cache(filename, segments)
 
                         # Update total segments and indices
                         self.total_segments += len(segments)
                         self.file_indices.extend(
-                            [(file_idx, i) for i in range(len(segments))]
+                            [(filename, i) for i in range(len(segments))]
                         )
 
                 # Clear memory after each batch
@@ -255,14 +292,13 @@ class BirdCLEFDataset(Dataset):
             f"Processed {len(files_to_process)} files in {time.time() - time_start:.1f}s"
         )
 
-    def _get_cache_path(self, file_idx):
+    def _get_cache_path(self, filename):
         """Get the cache path for a file"""
-        row = self.df.iloc[file_idx]
-        return self.cache_dir / f"{row['samplename']}.pt"
+        return self.cache_dir / f"{Path(filename.replace('/', '-')).with_suffix('.pt')}"
 
-    def _load_from_cache(self, file_idx):
+    def _load_from_cache(self, filename):
         """Load segments from cache if available"""
-        cache_path = self._get_cache_path(file_idx)
+        cache_path = self._get_cache_path(filename)
         if cache_path.exists():
             try:
                 return torch.load(cache_path)
@@ -271,9 +307,9 @@ class BirdCLEFDataset(Dataset):
                 return None
         return None
 
-    def _save_to_cache(self, file_idx, segments):
+    def _save_to_cache(self, filename, segments):
         """Save segments to cache"""
-        cache_path = self._get_cache_path(file_idx)
+        cache_path = self._get_cache_path(filename)
         try:
             torch.save(segments, cache_path)
         except Exception as e:
@@ -283,24 +319,28 @@ class BirdCLEFDataset(Dataset):
         return self.total_segments
 
     def __getitem__(self, idx):
-        file_idx, segment_idx = self.file_indices[idx]
+        # Get the file and segment index from our pre-computed list
+        filename, segment_idx = self.file_indices[idx]
 
-        # Load only the needed segment instead of the whole file
-        cache_path = self._get_cache_path(file_idx)
-        try:
-            segments = torch.load(cache_path)
-            segment = segments[segment_idx]
-            # Don't store in self.file_segments
-        except Exception as e:
-            logger.error(f"Failed to load cache for {cache_path}: {e}")
-            return {
-                "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
-                "target": torch.zeros(self.num_classes, dtype=torch.float32),
-                "filename": self.df.iloc[file_idx]["filename"],
-                "segment_idx": 0,
-            }
+        # Load segments from cache if not in memory
+        if filename not in self.file_segments:
+            cache_path = self._get_cache_path(filename)
+            try:
+                segments = torch.load(cache_path)
+                self.file_segments[filename] = segments
+            except Exception as e:
+                logger.error(f"Failed to load cache for {cache_path}: {e}")
+                # Return zero segment if loading fails
+                return {
+                    "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
+                    "target": torch.zeros(self.num_classes, dtype=torch.float32),
+                    "filename": filename,
+                    "segment_idx": 0,
+                }
 
-        row = self.df.iloc[file_idx]
+        segments = self.file_segments[filename]
+        segment = segments[segment_idx]
+        row = self.df[self.df["filename"] == filename].iloc[0]
 
         target = self.encode_label(row["primary_label"])
 
@@ -322,7 +362,7 @@ class BirdCLEFDataset(Dataset):
         return {
             "melspec": segment["spectrogram"],
             "target": torch.tensor(target, dtype=torch.float32),
-            "filename": row["filename"],
+            "filename": filename,
             "segment_idx": segment_idx,
         }
 
@@ -731,6 +771,7 @@ def run_training(cfg):
         logger.info(f"Training set: {len(train_df)} audio files")
         logger.info(f"Validation set: {len(val_df)} audio files")
 
+        # full_dataset = BirdCLEFDataset(df, cfg, species_ids, mode="full")
         train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
         val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
         # raise ValueError("Stop here")
