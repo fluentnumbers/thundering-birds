@@ -56,17 +56,21 @@ def setup_logger(name: str, run_dir: Path = None) -> logging.Logger:
 class WandbLogger:
     """Wrapper for wandb logging functionality."""
 
-    def __init__(self, run_name: str, run_dir: Path):
+    def __init__(
+        self, run_name: str, run_dir: Path, group: str = None, tags: list = None
+    ):
         self.enabled = False
         try:
             import wandb
 
             self.wandb = wandb
             self.run_dir = run_dir  # Use the provided run_dir directly
-            self.wandb.init(
+            self.run = self.wandb.init(
                 project="bird-sound-classification",
                 name=run_name,
                 dir=str(self.run_dir),
+                group=group,
+                tags=tags,
             )
             self.enabled = True
             logging.info("Initialized wandb logging")

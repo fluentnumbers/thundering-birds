@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import wandb
 from dotenv import load_dotenv
 from easydict import EasyDict
 from sklearn.metrics import f1_score, roc_auc_score
@@ -59,7 +58,7 @@ class CFG:
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
     training.NUM_WORKERS = 1
     training.SAVE_INTERMEDIATE_MODEL = True
-    training.EARLY_STOPPING_METRIC = "val_f1"
+    training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
     training.EARLY_STOPPING_PATIENCE = 10
     training.BATCH_SIZE = 128 if device == "cuda" else 64
@@ -74,7 +73,7 @@ class CFG:
 
     def update_debug_settings(self):
         if self.training.DEBUG:
-            self.training.DEBUG_N_CLASSES = 5
+            self.training.DEBUG_N_CLASSES = 6
             self.training.EPOCHS = 30
             # self.training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
 
@@ -585,8 +584,8 @@ def run_training(cfg):
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Starting training run in {run_dir}")
 
-    # Initialize wandb logger
-    wandb_logger = WandbLogger(f"training_run_{timestamp}", run_dir)
+    # Initialize wandb group for all folds
+    wandb_group = f"train_{timestamp}"
 
     # Load training data
     logger.info("Loading training data...")
@@ -628,6 +627,14 @@ def run_training(cfg):
             continue
 
         logger.info(f"\n{'='*30} Fold {fold} {'='*30}")
+
+        # Initialize wandb run for this fold
+        wandb_logger = WandbLogger(
+            f"fold_{fold}",
+            run_dir,
+            group=wandb_group,
+            tags=[f"fold_{fold}"],
+        )
 
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df = df.iloc[val_idx].reset_index(drop=True)
@@ -718,11 +725,10 @@ def run_training(cfg):
                         scheduler.get_last_lr()[0] if scheduler else cfg.training.LR
                     ),
                     "_step": epoch + 1,
-                    "_group": f"fold_{fold}",
+                    "_group": "all_folds",  # Use a common group for all folds
+                    # "_tags": [f"fold_{fold}"],
                 }
             )
-            # Set run tags for the current fold
-            wandb.run.tags = [f"fold_{fold}"]
 
             # Check for early stopping
             current_metric = val_metrics[cfg.training.EARLY_STOPPING_METRIC]
@@ -791,10 +797,12 @@ def run_training(cfg):
             f"Best metrics for fold {fold}: AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f} at epoch {best_epoch}"
         )
 
-        # Clear memory
+        # Clear memorfoldtraining_run_{timestamp}_y
         del model, optimizer, scheduler, train_loader, val_loader
         torch.cuda.empty_cache()
         gc.collect()
+
+        wandb_logger.finish()
 
     logger.info("Cross-Validation Results:")
     for fold, scores in enumerate(best_scores):
@@ -814,9 +822,6 @@ def run_training(cfg):
     with open(run_dir / "results.json", "w") as f:
         json.dump(results, f, indent=4)
     logger.info(f"Saved results to {run_dir / 'results.json'}")
-
-    # Finish wandb run
-    wandb_logger.finish()
 
 
 if __name__ == "__main__":
