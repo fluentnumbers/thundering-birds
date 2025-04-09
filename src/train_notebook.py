@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import wandb
 from dotenv import load_dotenv
 from easydict import EasyDict
 from sklearn.metrics import f1_score, roc_auc_score
@@ -58,9 +59,9 @@ class CFG:
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
     training.NUM_WORKERS = 1
     training.SAVE_INTERMEDIATE_MODEL = True
-    training.EARLY_STOPPING_PATIENCE = 5
+    training.EARLY_STOPPING_METRIC = "val_f1"
     training.EARLY_STOPPING_MIN_DELTA = 0.01
-    training.EARLY_STOPPING_METRIC = "auc"
+    training.EARLY_STOPPING_PATIENCE = 10
     training.BATCH_SIZE = 128 if device == "cuda" else 64
     training.OPTIMIZER = "AdamW"
     training.LR = 5e-4
@@ -73,9 +74,9 @@ class CFG:
 
     def update_debug_settings(self):
         if self.training.DEBUG:
-            self.training.DEBUG_N_CLASSES = 3
-            self.training.EPOCHS = 3
-            self.training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
+            self.training.DEBUG_N_CLASSES = 5
+            self.training.EPOCHS = 30
+            # self.training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
 
     model = EasyDict()
     model.model_name = "efficientnet-b0"
@@ -562,7 +563,11 @@ def validate(model, loader, criterion, device):
             losses.append(loss if isinstance(loss, float) else loss.item())
 
             # Update progress bar with current batch loss
-            pbar.set_postfix({"val_loss": f"{np.mean(losses[-10:]):.2f}"})
+            pbar.set_postfix(
+                {
+                    "val_loss": f"{np.mean(losses[-10:]):.2f}",
+                }
+            )
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
@@ -667,8 +672,6 @@ def run_training(cfg):
         else:
             scheduler = get_scheduler(optimizer, cfg)
 
-        best_auc = 0
-        best_f1 = 0
         best_epoch = 0
         best_model_state = None
         best_optimizer_state = None
@@ -718,6 +721,8 @@ def run_training(cfg):
                     "_group": f"fold_{fold}",
                 }
             )
+            # Set run tags for the current fold
+            wandb.run.tags = [f"fold_{fold}"]
 
             # Check for early stopping
             current_metric = val_metrics[cfg.training.EARLY_STOPPING_METRIC]
@@ -734,11 +739,18 @@ def run_training(cfg):
                 best_epoch = epoch + 1
 
                 logger.info(
-                    f"New best {cfg.training.EARLY_STOPPING_METRIC}: {best_metric:.4f} at epoch {best_epoch}"
+                    f"New best {cfg.training.EARLY_STOPPING_METRIC}: {best_metric:.3f} at epoch {best_epoch}"
                 )
 
                 # Save model checkpoint when metrics improve
                 checkpoint_path = run_dir / f"model_fold{fold}_epoch{epoch+1}_best.pth"
+
+                # Delete previous checkpoints for this fold
+                for old_checkpoint in run_dir.glob(f"model_fold{fold}_*_best.pth"):
+                    if old_checkpoint != checkpoint_path:
+                        old_checkpoint.unlink()
+                        logger.debug(f"Deleted old checkpoint {old_checkpoint}")
+
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
