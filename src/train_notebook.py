@@ -680,14 +680,15 @@ def run_training(cfg):
         train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
         val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
 
+        # Create DataLoaders with proper worker configuration
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.training.BATCH_SIZE,
             shuffle=True,
-            num_workers=min(4, os.cpu_count()),  # Limit workers to avoid memory issues
-            pin_memory=True,  # Enable pin_memory for faster data transfer to GPU
-            persistent_workers=True,  # Keep workers alive between epochs
-            prefetch_factor=2,  # Prefetch 2 batches per worker
+            num_workers=min(4, os.cpu_count()),
+            pin_memory=True,
+            persistent_workers=False,  # Disable persistent workers
+            prefetch_factor=2,
             collate_fn=collate_fn,
             drop_last=False,
         )
@@ -696,10 +697,10 @@ def run_training(cfg):
             val_dataset,
             batch_size=cfg.training.BATCH_SIZE,
             shuffle=False,
-            num_workers=min(4, os.cpu_count()),  # Limit workers to avoid memory issues
-            pin_memory=True,  # Enable pin_memory for faster data transfer to GPU
-            persistent_workers=True,  # Keep workers alive between epochs
-            prefetch_factor=2,  # Prefetch 2 batches per worker
+            num_workers=min(4, os.cpu_count()),
+            pin_memory=True,
+            persistent_workers=False,  # Disable persistent workers
+            prefetch_factor=2,
             collate_fn=collate_fn,
         )
 
@@ -837,11 +838,13 @@ def run_training(cfg):
             f"Best metrics for fold {fold}: AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f} at epoch {best_epoch}"
         )
 
-        # Clear memorfoldtraining_run_{timestamp}_y
-        del model, optimizer, scheduler, train_loader, val_loader
-        torch.cuda.empty_cache()
+        # Proper cleanup at the end of each fold
+        del train_loader
+        del val_loader
         gc.collect()
+        torch.cuda.empty_cache()
 
+        # Finish wandb run for this fold
         wandb_logger.finish()
 
     logger.info("Cross-Validation Results:")
