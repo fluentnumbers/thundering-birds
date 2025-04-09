@@ -62,7 +62,8 @@ class CFG:
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
     training.EARLY_STOPPING_PATIENCE = 10
-    training.BATCH_SIZE = 128 if device == "cuda" else 64
+    training.BATCH_SIZE = 32 if device == "cuda" else 16
+    training.GRAD_ACCUM_STEPS = 4
     training.OPTIMIZER = "AdamW"
     training.LR = 5e-4
     training.WEIGHT_DECAY = 1e-5
@@ -282,27 +283,23 @@ class BirdCLEFDataset(Dataset):
         return self.total_segments
 
     def __getitem__(self, idx):
-        # Get the file and segment index from our pre-computed list
         file_idx, segment_idx = self.file_indices[idx]
 
-        # Load segments from cache if not in memory
-        if file_idx not in self.file_segments:
-            cache_path = self._get_cache_path(file_idx)
-            try:
-                segments = torch.load(cache_path)
-                self.file_segments[file_idx] = segments
-            except Exception as e:
-                logger.error(f"Failed to load cache for {cache_path}: {e}")
-                # Return zero segment if loading fails
-                return {
-                    "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
-                    "target": torch.zeros(self.num_classes, dtype=torch.float32),
-                    "filename": self.df.iloc[file_idx]["filename"],
-                    "segment_idx": 0,
-                }
+        # Load only the needed segment instead of the whole file
+        cache_path = self._get_cache_path(file_idx)
+        try:
+            segments = torch.load(cache_path)
+            segment = segments[segment_idx]
+            # Don't store in self.file_segments
+        except Exception as e:
+            logger.error(f"Failed to load cache for {cache_path}: {e}")
+            return {
+                "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
+                "target": torch.zeros(self.num_classes, dtype=torch.float32),
+                "filename": self.df.iloc[file_idx]["filename"],
+                "segment_idx": 0,
+            }
 
-        segments = self.file_segments[file_idx]
-        segment = segments[segment_idx]
         row = self.df.iloc[file_idx]
 
         target = self.encode_label(row["primary_label"])
@@ -503,6 +500,12 @@ def calculate_metrics(targets, outputs):
     }
 
 
+def log_memory_usage():
+    if torch.cuda.is_available():
+        logger.info(f"GPU Memory: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+        logger.info(f"GPU Memory Cached: {torch.cuda.memory_reserved()/1024**2:.2f}MB")
+
+
 def train_one_epoch(
     model, loader, optimizer, criterion, device, scheduler=None, scaler=None
 ):
@@ -511,15 +514,16 @@ def train_one_epoch(
     all_targets = []
     all_outputs = []
 
-    # Calculate gradient accumulation steps
-    grad_accum_steps = max(
-        1, 128 // cfg.training.BATCH_SIZE
-    )  # Target effective batch size of 128
+    # Use gradient accumulation steps from config
+    grad_accum_steps = cfg.training.GRAD_ACCUM_STEPS
 
     enumerate_loader = enumerate(loader)
     pbar = tqdm(enumerate_loader, total=len(loader), desc="Training", unit="batches")
 
     optimizer.zero_grad()  # Zero gradients at the start of epoch
+
+    # Log initial memory usage
+    log_memory_usage()
 
     for step, batch in pbar:
         inputs = batch["melspec"].to(
@@ -569,17 +573,38 @@ def train_one_epoch(
         all_targets.append(targets)
         losses.append(loss.item() * grad_accum_steps)  # Scale back the loss for logging
 
+        # Log memory usage every 100 steps
+        if step % 100 == 0:
+            log_memory_usage()
+            # Clear memory more frequently
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
         pbar.set_postfix(
             {
                 "train_loss": np.mean(losses[-10:]) if losses else 0,
                 "lr": optimizer.param_groups[0]["lr"],
+                "grad_accum": f"{step % grad_accum_steps + 1}/{grad_accum_steps}",
             }
         )
+
+    # Handle remaining gradients if any
+    if len(loader) % grad_accum_steps != 0:
+        if device == "cuda" and scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
     metrics = calculate_metrics(all_targets, all_outputs)
     avg_loss = np.mean(losses)
+
+    # Log final memory usage for the epoch
+    log_memory_usage()
 
     return avg_loss, metrics
 
@@ -629,6 +654,9 @@ def run_training(cfg):
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Starting training run in {run_dir}")
 
+    # Log initial memory usage
+    log_memory_usage()
+
     # Initialize wandb group for all folds
     wandb_group = f"train_{cfg.device.upper()}_{timestamp}"
 
@@ -675,6 +703,9 @@ def run_training(cfg):
 
         logger.info(f"\n{'='*30} Fold {fold} {'='*30}")
 
+        # Log memory usage at start of each fold
+        log_memory_usage()
+
         # Initialize wandb run for this fold
         wandb_logger = WandbLogger(
             f"fold_{fold}",
@@ -709,12 +740,12 @@ def run_training(cfg):
             train_dataset,
             batch_size=cfg.training.BATCH_SIZE,
             shuffle=True,
-            num_workers=min(4, os.cpu_count()),
+            num_workers=min(2, os.cpu_count()),
             pin_memory=True,
-            persistent_workers=False,  # Disable persistent workers
+            persistent_workers=False,
             prefetch_factor=2,
             collate_fn=collate_fn,
-            drop_last=False,
+            drop_last=True,
         )
 
         val_loader = DataLoader(
@@ -755,6 +786,9 @@ def run_training(cfg):
         for epoch in range(cfg.training.EPOCHS):
             logger.info(f"Epoch {epoch+1}/{cfg.training.EPOCHS}")
 
+            # Log memory usage at start of each epoch
+            log_memory_usage()
+
             train_loss, train_metrics = train_one_epoch(
                 model,
                 train_loader,
@@ -762,7 +796,7 @@ def run_training(cfg):
                 criterion,
                 cfg.device,
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None,
-                scaler,  # Pass scaler to train_one_epoch
+                scaler,
             )
 
             val_loss, val_metrics = validate(model, val_loader, criterion, cfg.device)
@@ -859,11 +893,17 @@ def run_training(cfg):
             f"Best metrics for fold {fold}: AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f} at epoch {best_epoch}"
         )
 
+        # Log memory usage at end of each fold
+        log_memory_usage()
+
         # Proper cleanup at the end of each fold
         del train_loader
         del val_loader
         gc.collect()
         torch.cuda.empty_cache()
+
+        # Log memory usage after cleanup
+        log_memory_usage()
 
         # Finish wandb run for this fold
         wandb_logger.finish()
