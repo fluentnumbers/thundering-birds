@@ -6,6 +6,7 @@ import json
 import multiprocessing as mp
 import os
 import random
+import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
@@ -44,7 +45,7 @@ class CFG:
 
     dirs = EasyDict()
     dirs.DATA_ROOT = Path("data/birdclef-2025")
-    # dirs.DATA_ROOT Path("/dbfs/RAW/W00001_Data_Unrestricted/Andrejs/birdclef-2025/")
+    # dirs.DATA_ROOT = Path("/dbfs/RAW/W00001_Data_Unrestricted/Andrejs/birdclef-2025/")
     dirs.train_datadir = (dirs.DATA_ROOT / "train_audio_no_voice").as_posix()
     dirs.train_csv = (dirs.DATA_ROOT / "train.csv").as_posix()
     dirs.test_soundscapes = (dirs.DATA_ROOT / "test_soundscapes").as_posix()
@@ -52,7 +53,7 @@ class CFG:
     dirs.cache_dir = (dirs.DATA_ROOT / "cache").as_posix()
 
     training = EasyDict()
-    training.DEBUG = True
+    training.DEBUG = True if device == "cpu" else False
     training.EPOCHS = 20
     training.N_FOLD = 5
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
@@ -61,7 +62,8 @@ class CFG:
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
     training.EARLY_STOPPING_PATIENCE = 10
-    training.BATCH_SIZE = 128 if device == "cuda" else 64
+    training.BATCH_SIZE = 32 if device == "cuda" else 16
+    training.GRAD_ACCUM_STEPS = 4
     training.OPTIMIZER = "AdamW"
     training.LR = 5e-4
     training.WEIGHT_DECAY = 1e-5
@@ -83,6 +85,7 @@ class CFG:
     model.cfar_scaling_factors = (1, 2)
     model.mixup_alpha = 0
     preprocessing = EasyDict()
+    # preprocessing.LOAD_DATA_STRICT = True if device == "cuda" else False
     preprocessing.NUM_WORKERS = 10
     preprocessing.SAMPLE_RATE = 32000
     preprocessing.PADMODE = "constant"
@@ -172,60 +175,71 @@ class BirdCLEFDataset(Dataset):
         self.total_segments = 0
         self.file_indices = []  # List of (file_idx, segment_idx) pairs
 
-        # First, check which files need processing
+        # Vectorized check for cache existence
+        cache_paths = [
+            self._get_cache_path(file_idx) for file_idx in range(len(self.df))
+        ]
+        cache_exists = [path.exists() for path in cache_paths]
+        logger.info(f"Cache exists for {sum(cache_exists)} files out of {len(self.df)}")
+
+        # Split files into cached and to-process
+        time_start = time.time()
+        cached_files = []
         files_to_process = []
-        for file_idx, row in self.df.iterrows():
-            cache_path = self._get_cache_path(file_idx)
-            if not cache_path.exists():
-                files_to_process.append((file_idx, row, self.cfg))
-            else:
-                # Just count segments from cache without loading them
+
+        for file_idx, (row, is_cached) in tqdm(
+            enumerate(zip(self.df.iterrows(), cache_exists)),
+            total=len(self.df),
+            desc="Loading cached files",
+            unit="file",
+        ):
+            if is_cached:
                 try:
                     # Load just the first segment to get the count
-                    segments = torch.load(cache_path)
+                    segments = torch.load(cache_paths[file_idx])
                     self.total_segments += len(segments)
                     self.file_indices.extend(
                         [(file_idx, i) for i in range(len(segments))]
                     )
+                    cached_files.append(file_idx)
                 except Exception as e:
                     logger.warning(
-                        f"Failed to load cache for {cache_path}, will reprocess: {e}"
+                        f"Failed to load cache for {cache_paths[file_idx]}, will reprocess: {e}"
                     )
-                    files_to_process.append((file_idx, row, self.cfg))
+                    files_to_process.append((file_idx, row[1], self.cfg))
+            else:
+                files_to_process.append((file_idx, row[1], self.cfg))
 
         if not files_to_process:
             logger.info(
-                f"All files for mode {self.mode} are already cached, no processing needed"
+                f"All files for mode {self.mode} are already cached, no processing needed [{time.time() - time_start:.1f}s]"
             )
             return
 
         logger.info(
             f"Processing {len(files_to_process)} files out of {len(self.df)} total files"
         )
-
-        # Process files in batches to manage memory
-        file_batch = 100  # Process 100 files at a time
-        total_batches = (len(files_to_process) + file_batch - 1) // file_batch
-
+        time_start = time.time()
+        # Process files in parallel using multiprocessing
         with mp.Pool(
-            processes=np.min([self.cfg.preprocessing.NUM_WORKERS, mp.cpu_count()])
+            processes=min(self.cfg.preprocessing.NUM_WORKERS, mp.cpu_count())
         ) as pool:
-            # Create a progress bar for the overall process
-            with tqdm(
-                total=len(files_to_process),
-                desc="Processing files",
-                unit=f"{file_batch} files",
-            ) as pbar:
-                for batch_idx in range(total_batches):
-                    start_idx = batch_idx * file_batch
-                    end_idx = min((batch_idx + 1) * file_batch, len(files_to_process))
-                    batch_args = files_to_process[start_idx:end_idx]
+            # Process files in batches to manage memory
+            batch_size = 100
+            for i in range(0, len(files_to_process), batch_size):
+                batch = files_to_process[i : i + batch_size]
+                results = list(
+                    tqdm(
+                        pool.imap(process_file_worker, batch),
+                        total=len(batch),
+                        desc=f"Processing batch {i//batch_size + 1}/{(len(files_to_process) + batch_size - 1)//batch_size}",
+                        unit=f"{batch_size} files",
+                    )
+                )
 
-                    # Process current batch
-                    batch_results = list(pool.imap(process_file_worker, batch_args))
-
-                    # Save results and update indices
-                    for file_idx, segments in batch_results:
+                # Save results and update indices
+                for file_idx, segments in results:
+                    if segments:  # Only process if we got valid segments
                         # Save to cache
                         self._save_to_cache(file_idx, segments)
 
@@ -235,11 +249,11 @@ class BirdCLEFDataset(Dataset):
                             [(file_idx, i) for i in range(len(segments))]
                         )
 
-                    # Update progress bar
-                    pbar.update(len(batch_args))
-
-                    # Clear memory after each batch
-                    gc.collect()
+                # Clear memory after each batch
+                gc.collect()
+        logger.info(
+            f"Processed {len(files_to_process)} files in {time.time() - time_start:.1f}s"
+        )
 
     def _get_cache_path(self, file_idx):
         """Get the cache path for a file"""
@@ -269,27 +283,23 @@ class BirdCLEFDataset(Dataset):
         return self.total_segments
 
     def __getitem__(self, idx):
-        # Get the file and segment index from our pre-computed list
         file_idx, segment_idx = self.file_indices[idx]
 
-        # Load segments from cache if not in memory
-        if file_idx not in self.file_segments:
-            cache_path = self._get_cache_path(file_idx)
-            try:
-                segments = torch.load(cache_path)
-                self.file_segments[file_idx] = segments
-            except Exception as e:
-                logger.error(f"Failed to load cache for {cache_path}: {e}")
-                # Return zero segment if loading fails
-                return {
-                    "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
-                    "target": torch.zeros(self.num_classes, dtype=torch.float32),
-                    "filename": self.df.iloc[file_idx]["filename"],
-                    "segment_idx": 0,
-                }
+        # Load only the needed segment instead of the whole file
+        cache_path = self._get_cache_path(file_idx)
+        try:
+            segments = torch.load(cache_path)
+            segment = segments[segment_idx]
+            # Don't store in self.file_segments
+        except Exception as e:
+            logger.error(f"Failed to load cache for {cache_path}: {e}")
+            return {
+                "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
+                "target": torch.zeros(self.num_classes, dtype=torch.float32),
+                "filename": self.df.iloc[file_idx]["filename"],
+                "segment_idx": 0,
+            }
 
-        segments = self.file_segments[file_idx]
-        segment = segments[segment_idx]
         row = self.df.iloc[file_idx]
 
         target = self.encode_label(row["primary_label"])
@@ -490,29 +500,68 @@ def calculate_metrics(targets, outputs):
     }
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
+def log_memory_usage():
+    if torch.cuda.is_available():
+        logger.info(f"GPU Memory: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+        logger.info(f"GPU Memory Cached: {torch.cuda.memory_reserved()/1024**2:.2f}MB")
+
+
+def train_one_epoch(
+    model, loader, optimizer, criterion, device, scheduler=None, scaler=None
+):
     model.train()
     losses = []
     all_targets = []
     all_outputs = []
 
+    # Use gradient accumulation steps from config
+    grad_accum_steps = cfg.training.GRAD_ACCUM_STEPS
+
     enumerate_loader = enumerate(loader)
     pbar = tqdm(enumerate_loader, total=len(loader), desc="Training", unit="batches")
 
+    optimizer.zero_grad()  # Zero gradients at the start of epoch
+
+    # Log initial memory usage
+    log_memory_usage()
+
     for step, batch in pbar:
-        inputs = batch["melspec"].to(device)
-        targets = batch["target"].to(device)
+        inputs = batch["melspec"].to(
+            device, non_blocking=True
+        )  # Use non-blocking transfers
+        targets = batch["target"].to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        outputs = model(inputs)
-
-        if isinstance(outputs, tuple):
-            outputs, loss = outputs
+        # Forward pass with mixed precision if using GPU
+        if device == "cuda" and scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                if isinstance(outputs, tuple):
+                    outputs, loss = outputs
+                else:
+                    loss = criterion(outputs, targets)
+                loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
         else:
-            loss = criterion(outputs, targets)
+            outputs = model(inputs)
+            if isinstance(outputs, tuple):
+                outputs, loss = outputs
+            else:
+                loss = criterion(outputs, targets)
+            loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
 
-        loss.backward()
-        optimizer.step()
+        # Backward pass with mixed precision if using GPU
+        if device == "cuda" and scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Step optimizer only after accumulating gradients
+        if (step + 1) % grad_accum_steps == 0:
+            if device == "cuda" and scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
 
         outputs = outputs.detach().cpu().numpy()
         targets = targets.detach().cpu().numpy()
@@ -522,19 +571,40 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
 
         all_outputs.append(outputs)
         all_targets.append(targets)
-        losses.append(loss if isinstance(loss, float) else loss.item())
+        losses.append(loss.item() * grad_accum_steps)  # Scale back the loss for logging
+
+        # Log memory usage every 100 steps
+        if step % 100 == 0:
+            log_memory_usage()
+            # Clear memory more frequently
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
         pbar.set_postfix(
             {
                 "train_loss": np.mean(losses[-10:]) if losses else 0,
                 "lr": optimizer.param_groups[0]["lr"],
+                "grad_accum": f"{step % grad_accum_steps + 1}/{grad_accum_steps}",
             }
         )
+
+    # Handle remaining gradients if any
+    if len(loader) % grad_accum_steps != 0:
+        if device == "cuda" and scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
     metrics = calculate_metrics(all_targets, all_outputs)
     avg_loss = np.mean(losses)
+
+    # Log final memory usage for the epoch
+    log_memory_usage()
 
     return avg_loss, metrics
 
@@ -584,8 +654,11 @@ def run_training(cfg):
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Starting training run in {run_dir}")
 
+    # Log initial memory usage
+    log_memory_usage()
+
     # Initialize wandb group for all folds
-    wandb_group = f"train_{timestamp}"
+    wandb_group = f"train_{cfg.device.upper()}_{timestamp}"
 
     # Load training data
     logger.info("Loading training data...")
@@ -606,7 +679,6 @@ def run_training(cfg):
     species_ids = df["primary_label"].unique().tolist()
     cfg.num_classes = len(species_ids)
 
-    logger.info("Will generate spectrograms on-the-fly during training.")
     if "filepath" not in df.columns:
         df["filepath"] = cfg.dirs.train_datadir + "/" + df.filename
     if "samplename" not in df.columns:
@@ -622,11 +694,17 @@ def run_training(cfg):
 
     best_scores = []
 
+    # Initialize gradient scaler for mixed precision training if using GPU
+    scaler = torch.cuda.amp.GradScaler() if cfg.device == "cuda" else None
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
 
         logger.info(f"\n{'='*30} Fold {fold} {'='*30}")
+
+        # Log memory usage at start of each fold
+        log_memory_usage()
 
         # Initialize wandb run for this fold
         wandb_logger = WandbLogger(
@@ -634,6 +712,17 @@ def run_training(cfg):
             run_dir,
             group=wandb_group,
             tags=[f"fold_{fold}"],
+            config={
+                "batch_size": cfg.training.BATCH_SIZE,
+                "learning_rate": cfg.training.LR,
+                "epochs": cfg.training.EPOCHS,
+                "model": cfg.model.model_name,
+                "optimizer": cfg.training.OPTIMIZER,
+                "scheduler": cfg.training.SCHEDULER,
+                "criterion": cfg.training.CRITERION,
+                "early_stopping_metric": cfg.training.EARLY_STOPPING_METRIC,
+                "early_stopping_patience": cfg.training.EARLY_STOPPING_PATIENCE,
+            },
         )
 
         train_df = df.iloc[train_idx].reset_index(drop=True)
@@ -644,23 +733,29 @@ def run_training(cfg):
 
         train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
         val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
+        # raise ValueError("Stop here")
 
+        # Create DataLoaders with proper worker configuration
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.training.BATCH_SIZE,
             shuffle=True,
-            num_workers=cfg.training.NUM_WORKERS,
+            num_workers=min(2, os.cpu_count()),
             pin_memory=True,
+            persistent_workers=False,
+            prefetch_factor=2,
             collate_fn=collate_fn,
-            drop_last=False,
+            drop_last=True,
         )
 
         val_loader = DataLoader(
             val_dataset,
             batch_size=cfg.training.BATCH_SIZE,
             shuffle=False,
-            num_workers=cfg.training.NUM_WORKERS,
+            num_workers=min(4, os.cpu_count()),
             pin_memory=True,
+            persistent_workers=False,  # Disable persistent workers
+            prefetch_factor=2,
             collate_fn=collate_fn,
         )
 
@@ -691,6 +786,9 @@ def run_training(cfg):
         for epoch in range(cfg.training.EPOCHS):
             logger.info(f"Epoch {epoch+1}/{cfg.training.EPOCHS}")
 
+            # Log memory usage at start of each epoch
+            log_memory_usage()
+
             train_loss, train_metrics = train_one_epoch(
                 model,
                 train_loader,
@@ -698,6 +796,7 @@ def run_training(cfg):
                 criterion,
                 cfg.device,
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None,
+                scaler,
             )
 
             val_loss, val_metrics = validate(model, val_loader, criterion, cfg.device)
@@ -724,9 +823,6 @@ def run_training(cfg):
                     "learning_rate": (
                         scheduler.get_last_lr()[0] if scheduler else cfg.training.LR
                     ),
-                    "_step": epoch + 1,
-                    "_group": "all_folds",  # Use a common group for all folds
-                    # "_tags": [f"fold_{fold}"],
                 }
             )
 
@@ -797,11 +893,19 @@ def run_training(cfg):
             f"Best metrics for fold {fold}: AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f} at epoch {best_epoch}"
         )
 
-        # Clear memorfoldtraining_run_{timestamp}_y
-        del model, optimizer, scheduler, train_loader, val_loader
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Log memory usage at end of each fold
+        log_memory_usage()
 
+        # Proper cleanup at the end of each fold
+        del train_loader
+        del val_loader
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Log memory usage after cleanup
+        log_memory_usage()
+
+        # Finish wandb run for this fold
         wandb_logger.finish()
 
     logger.info("Cross-Validation Results:")
