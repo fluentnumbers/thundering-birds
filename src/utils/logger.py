@@ -9,6 +9,7 @@ def setup_logger(name: str, run_dir: Path = None) -> logging.Logger:
     """Setup logging with both file and console handlers."""
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
+    logger.propagate = False  # Prevent message propagation to parent loggers
 
     # Only add handlers if they haven't been added already
     if not logger.handlers:
@@ -25,7 +26,7 @@ def setup_logger(name: str, run_dir: Path = None) -> logging.Logger:
             logger.info(f"Logging to {log_filepath}")
 
         # Define format
-        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        log_format = "%(levelname)s - %(message)s"
         formatter = logging.Formatter(log_format)
         console_handler.setFormatter(formatter)
         if run_dir is not None:

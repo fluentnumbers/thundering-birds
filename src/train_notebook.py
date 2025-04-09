@@ -3,23 +3,16 @@
 
 import gc
 import json
-import logging
-import math
 import multiprocessing as mp
 import os
 import random
-import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import cv2
-import librosa
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,16 +33,55 @@ warnings.filterwarnings("ignore")
 LOGS_DIR = Path("logs")
 # LOGS_DIR = Path("/dbfs/RAW/W00001_Data_Unrestricted/Andrejs/birdclef-2025/logs/")
 
-# Create run directory with timestamp
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-run_dir = LOGS_DIR / f"training_run_{timestamp}"
-run_dir.mkdir(parents=True, exist_ok=True)
-logger = setup_logger(__name__, run_dir)
+# Create global logger
+logger = setup_logger(__name__)
 
 
 @dataclass
 class CFG:
+    seed = 42
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    dirs = EasyDict()
+    dirs.DATA_ROOT = Path("data/birdclef-2025")
+    # dirs.DATA_ROOT Path("/dbfs/RAW/W00001_Data_Unrestricted/Andrejs/birdclef-2025/")
+    dirs.train_datadir = (dirs.DATA_ROOT / "train_audio_no_voice").as_posix()
+    dirs.train_csv = (dirs.DATA_ROOT / "train.csv").as_posix()
+    dirs.test_soundscapes = (dirs.DATA_ROOT / "test_soundscapes").as_posix()
+    dirs.taxonomy_csv = (dirs.DATA_ROOT / "taxonomy.csv").as_posix()
+    dirs.cache_dir = (dirs.DATA_ROOT / "cache").as_posix()
+
+    training = EasyDict()
+    training.DEBUG = True
+    training.EPOCHS = 20
+    training.N_FOLD = 5
+    training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
+    training.NUM_WORKERS = 1
+    training.SAVE_INTERMEDIATE_MODEL = True
+    training.EARLY_STOPPING_PATIENCE = 5
+    training.EARLY_STOPPING_MIN_DELTA = 0.01
+    training.EARLY_STOPPING_METRIC = "auc"
+    training.BATCH_SIZE = 128 if device == "cuda" else 64
+    training.OPTIMIZER = "AdamW"
+    training.LR = 5e-4
+    training.WEIGHT_DECAY = 1e-5
+    training.SCHEDULER = "CosineAnnealingLR"
+    training.CRITERION = "BCEWithLogitsLoss"
+    training.MIN_LR = 1e-6
+    training.T_MAX = training.EPOCHS
+    training.AUG_PROB = 0.5
+
+    def update_debug_settings(self):
+        if self.training.DEBUG:
+            self.training.DEBUG_N_CLASSES = 3
+            self.training.EPOCHS = 3
+            self.training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
+
+    model = EasyDict()
+    model.model_name = "efficientnet-b0"
+    model.kernel_size = (3, 3)
+    model.cfar_scaling_factors = (1, 2)
+    model.mixup_alpha = 0
     preprocessing = EasyDict()
     preprocessing.NUM_WORKERS = 10
     preprocessing.SAMPLE_RATE = 32000
@@ -66,50 +98,6 @@ class CFG:
     preprocessing.SILENCE_THRESHOLD = (
         0.8  # if more than 50% of the segment is silence, skip it
     )
-
-    training = EasyDict()
-    training.NUM_WORKERS = 1
-    training.SAVE_INTERMEDIATE_MODEL = True
-    training.EARLY_STOPPING_PATIENCE = 5
-    training.EARLY_STOPPING_MIN_DELTA = 0.01
-    training.EARLY_STOPPING_METRIC = "auc"
-    training.EPOCHS = 20
-    training.BATCH_SIZE = 64
-    training.OPTIMIZER = "AdamW"
-    training.LR = 5e-4
-    training.WEIGHT_DECAY = 1e-5
-    training.SCHEDULER = "CosineAnnealingLR"
-    training.CRITERION = "BCEWithLogitsLoss"
-    training.MIN_LR = 1e-6
-    training.T_MAX = training.EPOCHS
-    training.AUG_PROB = 0.5
-    training.DEBUG = True
-    training.N_FOLD = 5
-    training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
-
-    dirs = EasyDict()
-    dirs.DATA_ROOT = Path("data/birdclef-2025")
-    # dirs.DATA_ROOT Path("/dbfs/RAW/W00001_Data_Unrestricted/Andrejs/birdclef-2025/")
-    dirs.train_datadir = (dirs.DATA_ROOT / "train_audio_no_voice").as_posix()
-    dirs.train_csv = (dirs.DATA_ROOT / "train.csv").as_posix()
-    dirs.test_soundscapes = (dirs.DATA_ROOT / "test_soundscapes").as_posix()
-    dirs.taxonomy_csv = (dirs.DATA_ROOT / "taxonomy.csv").as_posix()
-    dirs.cache_dir = (dirs.DATA_ROOT / "cache").as_posix()
-
-    seed = 42
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model = EasyDict()
-    model.model_name = "efficientnet-b0"
-    model.kernel_size = (3, 3)
-    model.cfar_scaling_factors = (1, 2)
-    model.mixup_alpha = 0
-
-    def update_debug_settings(self):
-        if self.training.DEBUG:
-            self.training.DEBUG_N_CLASSES = 3
-            self.training.EPOCHS = 5
-            self.training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
 
 
 def set_seed(seed=42):
@@ -158,7 +146,7 @@ def process_file_worker(args):
     return file_idx, [zero_segment]
 
 
-class BirdCLEFDatasetFromNPY(Dataset):
+class BirdCLEFDataset(Dataset):
     def __init__(self, df, cfg, species_ids, mode="train"):
         self.df = df
         self.cfg = cfg
@@ -206,7 +194,9 @@ class BirdCLEFDatasetFromNPY(Dataset):
                     files_to_process.append((file_idx, row, self.cfg))
 
         if not files_to_process:
-            logger.info("All files are already cached, no processing needed")
+            logger.info(
+                f"All files for mode {self.mode} are already cached, no processing needed"
+            )
             return
 
         logger.info(
@@ -214,17 +204,21 @@ class BirdCLEFDatasetFromNPY(Dataset):
         )
 
         # Process files in batches to manage memory
-        batch_size = 100  # Process 100 files at a time
-        total_batches = (len(files_to_process) + batch_size - 1) // batch_size
+        file_batch = 100  # Process 100 files at a time
+        total_batches = (len(files_to_process) + file_batch - 1) // file_batch
 
         with mp.Pool(
             processes=np.min([self.cfg.preprocessing.NUM_WORKERS, mp.cpu_count()])
         ) as pool:
             # Create a progress bar for the overall process
-            with tqdm(total=len(files_to_process), desc="Processing files") as pbar:
+            with tqdm(
+                total=len(files_to_process),
+                desc="Processing files",
+                unit=f"{file_batch} files",
+            ) as pbar:
                 for batch_idx in range(total_batches):
-                    start_idx = batch_idx * batch_size
-                    end_idx = min((batch_idx + 1) * batch_size, len(files_to_process))
+                    start_idx = batch_idx * file_batch
+                    end_idx = min((batch_idx + 1) * file_batch, len(files_to_process))
                     batch_args = files_to_process[start_idx:end_idx]
 
                     # Process current batch
@@ -503,7 +497,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
     all_outputs = []
 
     enumerate_loader = enumerate(loader)
-    pbar = tqdm(enumerate_loader, total=len(loader), desc="Training")
+    pbar = tqdm(enumerate_loader, total=len(loader), desc="Training", unit="batches")
 
     for step, batch in pbar:
         inputs = batch["melspec"].to(device)
@@ -551,7 +545,7 @@ def validate(model, loader, criterion, device):
     all_targets = []
     all_outputs = []
 
-    pbar = tqdm(loader, desc="Validation")
+    pbar = tqdm(loader, desc="Validation", unit="batches")
     with torch.no_grad():
         for batch in pbar:
             inputs = batch["melspec"].to(device)
@@ -567,11 +561,8 @@ def validate(model, loader, criterion, device):
             all_targets.append(targets)
             losses.append(loss if isinstance(loss, float) else loss.item())
 
-        pbar.set_postfix(
-            {
-                "val_loss": np.mean(losses[-10:]) if losses else 0,
-            }
-        )
+            # Update progress bar with current batch loss
+            pbar.set_postfix({"val_loss": f"{np.mean(losses[-10:]):.2f}"})
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
@@ -581,8 +572,20 @@ def validate(model, loader, criterion, device):
     return avg_loss, metrics
 
 
-def run_training(df, cfg):
+def run_training(cfg):
     """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
+    # Create run directory with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = LOGS_DIR / f"training_run_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Starting training run in {run_dir}")
+
+    # Initialize wandb logger
+    wandb_logger = WandbLogger(f"training_run_{timestamp}", run_dir)
+
+    # Load training data
+    logger.info("Loading training data...")
+    df = pd.read_csv(cfg.dirs.train_csv)
 
     if cfg.training.DEBUG:
         cfg.update_debug_settings()
@@ -619,7 +622,7 @@ def run_training(df, cfg):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
 
-        logger.info(f'\n{"="*30} Fold {fold} {"="*30}')
+        logger.info(f"\n{'='*30} Fold {fold} {'='*30}")
 
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df = df.iloc[val_idx].reset_index(drop=True)
@@ -627,8 +630,8 @@ def run_training(df, cfg):
         logger.info(f"Training set: {len(train_df)} audio files")
         logger.info(f"Validation set: {len(val_df)} audio files")
 
-        train_dataset = BirdCLEFDatasetFromNPY(train_df, cfg, species_ids, mode="train")
-        val_dataset = BirdCLEFDatasetFromNPY(val_df, cfg, species_ids, mode="valid")
+        train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
+        val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
 
         train_loader = DataLoader(
             train_dataset,
@@ -676,7 +679,7 @@ def run_training(df, cfg):
         best_metric = 0
 
         for epoch in range(cfg.training.EPOCHS):
-            logger.info(f"\nEpoch {epoch+1}/{cfg.training.EPOCHS}")
+            logger.info(f"Epoch {epoch+1}/{cfg.training.EPOCHS}")
 
             train_loss, train_metrics = train_one_epoch(
                 model,
@@ -716,13 +719,6 @@ def run_training(df, cfg):
                 }
             )
 
-            logger.debug(
-                f"Train Loss: {train_loss:.4f}, Train AUC: {train_metrics['auc']:.4f}, Train F1: {train_metrics['f1']:.4f}"
-            )
-            logger.debug(
-                f"Val Loss: {val_loss:.4f}, Val AUC: {val_metrics['auc']:.4f}, Val F1: {val_metrics['f1']:.4f}"
-            )
-
             # Check for early stopping
             current_metric = val_metrics[cfg.training.EARLY_STOPPING_METRIC]
             if current_metric > best_metric + cfg.training.EARLY_STOPPING_MIN_DELTA:
@@ -741,28 +737,25 @@ def run_training(df, cfg):
                     f"New best {cfg.training.EARLY_STOPPING_METRIC}: {best_metric:.4f} at epoch {best_epoch}"
                 )
 
-                # Save intermediate model if enabled
-                if cfg.training.SAVE_INTERMEDIATE_MODEL:
-                    checkpoint_path = (
-                        run_dir / f"model_fold{fold}_epoch{epoch+1}_best.pth"
-                    )
-                    torch.save(
-                        {
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": (
-                                scheduler.state_dict() if scheduler else None
-                            ),
-                            "epoch": epoch,
-                            "val_auc": val_metrics["auc"],
-                            "val_f1": val_metrics["f1"],
-                            "train_auc": train_metrics["auc"],
-                            "train_f1": train_metrics["f1"],
-                            "cfg": cfg,
-                        },
-                        checkpoint_path,
-                    )
-                    logger.info(f"Saved best model checkpoint to {checkpoint_path}")
+                # Save model checkpoint when metrics improve
+                checkpoint_path = run_dir / f"model_fold{fold}_epoch{epoch+1}_best.pth"
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": (
+                            scheduler.state_dict() if scheduler else None
+                        ),
+                        "epoch": epoch,
+                        "val_auc": val_metrics["auc"],
+                        "val_f1": val_metrics["f1"],
+                        "train_auc": train_metrics["auc"],
+                        "train_f1": train_metrics["f1"],
+                        "cfg": cfg,
+                    },
+                    checkpoint_path,
+                )
+                logger.debug(f"Saved best model checkpoint to {checkpoint_path}")
             else:
                 no_improvement_epochs += 1
                 logger.info(
@@ -783,7 +776,7 @@ def run_training(df, cfg):
             {"auc": val_metrics["auc"], "f1": val_metrics["f1"], "epoch": best_epoch}
         )
         logger.info(
-            f"\nBest metrics for fold {fold}: AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f} at epoch {best_epoch}"
+            f"Best metrics for fold {fold}: AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f} at epoch {best_epoch}"
         )
 
         # Clear memory
@@ -791,15 +784,11 @@ def run_training(df, cfg):
         torch.cuda.empty_cache()
         gc.collect()
 
-    logger.info("\n" + "=" * 60)
     logger.info("Cross-Validation Results:")
     for fold, scores in enumerate(best_scores):
-        logger.info(
-            f"Fold {cfg.training.SELECTED_FOLDS[fold]}: AUC: {scores['auc']:.4f}, F1: {scores['f1']:.4f}"
-        )
+        logger.info(f"Fold {fold}: AUC: {scores['auc']:.4f}, F1: {scores['f1']:.4f}")
     logger.info(f"Mean AUC: {np.mean([s['auc'] for s in best_scores]):.4f}")
     logger.info(f"Mean F1: {np.mean([s['f1'] for s in best_scores]):.4f}")
-    logger.info("=" * 60)
 
     # Save final results
     results = {
@@ -821,18 +810,9 @@ def run_training(df, cfg):
 if __name__ == "__main__":
     load_dotenv(".env")
 
-    # Initialize wandb logger with run directory
-    wandb_logger = WandbLogger(f"training_run_{timestamp}", run_dir)
     cfg = CFG()
     set_seed(cfg.seed)
 
-    logger.info("Loading training data...")
-    train_df = pd.read_csv(cfg.dirs.train_csv)
-
-    logger.info("Starting training...")
-
-    logger.info("Will generate spectrograms on-the-fly during training")
-
-    run_training(train_df, cfg)
+    run_training(cfg)
 
     logger.info("Training complete!")

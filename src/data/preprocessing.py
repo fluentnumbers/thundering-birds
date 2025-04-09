@@ -10,11 +10,56 @@ import librosa
 import numpy as np
 import pandas as pd
 import torch
+import torchaudio
 from tqdm import tqdm
 
-from src.data.dataset import MelSpectrogramTransform
-
 logger = logging.getLogger(__name__)
+
+
+class MelSpectrogramTransform:
+    """Transform audio to mel spectrogram with configurable parameters."""
+
+    def __init__(self, config):
+        """Initialize the transform with configuration parameters.
+
+        Args:
+            config: Dictionary containing configuration parameters
+        """
+        self.to_melspectogram = torchaudio.transforms.MelSpectrogram(
+            sample_rate=config["SAMPLE_RATE"],
+            n_fft=config["N_FFT"],
+            hop_length=config["HOP_LENGTH"],
+            n_mels=config["N_MELS"],
+            f_min=config["FMIN"],
+            f_max=config["FMAX"],
+        )
+        self.to_db = torchaudio.transforms.AmplitudeToDB()
+        self.etol = 1e-8
+        logger.debug("Initialized MelSpectrogramTransform")
+
+    def __call__(self, audio_sample: torch.Tensor) -> torch.Tensor:
+        """Convert audio to mel spectrogram.
+
+        Args:
+            audio_sample: Audio tensor of shape (n_samples,)
+
+        Returns:
+            Mel spectrogram tensor of shape (n_mels, time)
+        """
+        if torch.isnan(audio_sample).any():
+            mean_value = torch.nanmean(audio_sample)
+            audio_sample = torch.nan_to_num(audio_sample, nan=mean_value)
+            logger.warning(
+                f"Found NaN values in audio sample, replaced with mean: {mean_value}"
+            )
+
+        mel_spec = self.to_melspectogram(audio_sample)
+        mel_spec = self.to_db(mel_spec)
+        mel_spec = (mel_spec - mel_spec.min()) / (
+            mel_spec.max() - mel_spec.min() + self.etol
+        )
+
+        return mel_spec.clone().detach()
 
 
 def load_metadata(config) -> pd.DataFrame:
@@ -119,187 +164,3 @@ def process_audio_file(
         }
     except Exception as e:
         return {"segments": [], "success": False, "error": str(e)}
-
-
-def save_batch(batch_data: Dict, output_path: Path, batch_idx: int) -> Dict:
-    """Save a batch of spectrograms to disk.
-
-    Args:
-        batch_data: Dictionary containing batch information
-        output_path: Directory to save the batch
-        batch_idx: Index of the batch
-
-    Returns:
-        Dictionary containing metadata about saved samples
-    """
-    batch_file = output_path / f"batch_{batch_idx}.pickle"
-    torch.save(batch_data, batch_file)
-
-    metadata = []
-    for idx, (file_idx, segment_idx) in enumerate(batch_data["indices"]):
-        metadata.append(
-            {
-                "batch_file": str(batch_file),
-                "batch_idx": batch_idx,
-                "sample_idx": idx,
-                "file_idx": file_idx,
-                "segment_idx": segment_idx,
-                "label": batch_data["labels"][idx].item(),
-                "filename": batch_data["filenames"][idx],
-                "primary_label": batch_data["class_names"][idx],
-            }
-        )
-    return metadata
-
-
-def preprocess_and_save_dataset(
-    metadata_df: pd.DataFrame,
-    config,
-    output_dir: Path,
-    batch_size: int,
-    n_workers: int = None,
-) -> Tuple[Path, pd.DataFrame]:
-    """Preprocess audio files in parallel and save spectrograms to disk in batches.
-    Uses a streaming approach to save batches as they become ready to prevent memory issues.
-
-    Args:
-        metadata_df: DataFrame containing metadata
-        config: Configuration object
-        output_dir: Directory to save processed spectrograms
-        batch_size: Number of spectrograms in each batch
-        n_workers: Number of worker processes (defaults to CPU count - 1)
-
-    Returns:
-        Tuple of (output_dir, processed_metadata_df)
-    """
-    if n_workers is None:
-        n_workers = max(1, mp.cpu_count() - 1)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Log if voice removal is enabled
-    if config.REMOVE_VOICE:
-        logger.info(
-            "Voice removal enabled - will detect and remove voice from recordings"
-        )
-
-    # Create a pool of workers
-    pool = mp.Pool(n_workers)
-
-    # Create a simplified config for preprocessing that doesn't include distributed training objects
-    preprocess_config = {
-        "SAMPLE_RATE": config.SAMPLE_RATE,
-        "NSAMPLES": config.NSAMPLES,
-        "PADMODE": config.PADMODE,
-        "UFOLD_OVERLAP": config.UFOLD_OVERLAP,
-        "MAKE_RGB": config.MAKE_RGB,
-        "REMOVE_VOICE": config.REMOVE_VOICE,
-        "N_MELS": config.N_MELS,
-        "HOP_LENGTH": config.HOP_LENGTH,
-        "N_FFT": config.N_FFT,
-        "FMIN": config.FMIN,
-        "FMAX": config.FMAX,
-    }
-
-    process_func = partial(
-        process_audio_file,
-        config=preprocess_config,
-    )
-
-    # Initialize counters and storage
-    current_batch = []
-    current_batch_idx = 0
-    processed_with_voice = 0
-    failed_files = []
-    all_metadata = []
-
-    try:
-        # Process files in groups to control memory usage
-        num_files_per_group = 100  # Process 10 files at a time
-        for group_st_idx in tqdm(
-            range(0, len(metadata_df), num_files_per_group),
-            desc=f"Processing audio files in groups of {num_files_per_group}",
-            unit="group",
-        ):
-            group_end_idx = min(group_st_idx + num_files_per_group, len(metadata_df))
-            group_df = metadata_df.iloc[group_st_idx:group_end_idx]
-
-            # Process current chunk
-            chunk_results = []
-            for result in pool.imap(
-                process_func, [row for _, row in group_df.iterrows()]
-            ):
-                if result["success"]:
-                    chunk_results.extend(result["segments"])
-                    if result["has_voice"]:
-                        processed_with_voice += 1
-                else:
-                    failed_files.append(result["error"])
-
-            # Sort segments by file_idx and segment_idx for reproducibility
-            chunk_results.sort(key=lambda x: (x["file_idx"], x["segment_idx"]))
-
-            # Add to current batch and save if full
-            for segment in chunk_results:
-                current_batch.append(segment)
-                if len(current_batch) >= batch_size:
-                    # Prepare batch data
-                    batch_data = {
-                        "spectrograms": torch.stack(
-                            [s["spectrogram"] for s in current_batch]
-                        ),
-                        "labels": torch.tensor([s["label"] for s in current_batch]),
-                        "indices": [
-                            (s["file_idx"], s["segment_idx"]) for s in current_batch
-                        ],
-                        "filenames": [s["filename"] for s in current_batch],
-                        "class_names": [s["primary_label"] for s in current_batch],
-                    }
-
-                    # Save batch and collect metadata
-                    batch_metadata = save_batch(
-                        batch_data, output_dir, current_batch_idx
-                    )
-                    all_metadata.extend(batch_metadata)
-
-                    # Clear current batch and increment counter
-                    current_batch = []
-                    current_batch_idx += 1
-
-            # Clear chunk results to free memory
-            chunk_results = None
-
-    except Exception as e:
-        logger.error(f"Error during parallel processing: {e}")
-        pool.terminate()
-        raise
-    finally:
-        pool.close()
-        pool.join()
-
-    # Save any remaining segments as the final batch
-    if current_batch:
-        batch_data = {
-            "spectrograms": torch.stack([s["spectrogram"] for s in current_batch]),
-            "labels": torch.tensor([s["label"] for s in current_batch]),
-            "indices": [(s["file_idx"], s["segment_idx"]) for s in current_batch],
-            "filenames": [s["filename"] for s in current_batch],
-            "class_names": [s["primary_label"] for s in current_batch],
-        }
-        batch_metadata = save_batch(batch_data, output_dir, current_batch_idx)
-        all_metadata.extend(batch_metadata)
-
-    # Log statistics
-    if config.REMOVE_VOICE:
-        logger.info(
-            f"Found and removed voice from {processed_with_voice} recordings "
-            f"({processed_with_voice/len(metadata_df)*100:.1f}%)"
-        )
-
-    if failed_files:
-        logger.warning(f"Failed to process {len(failed_files)} files")
-        for error in failed_files[:5]:  # Log first 5 errors
-            logger.warning(f"Error: {error}")
-
-    processed_metadata_df = pd.DataFrame(all_metadata)
-    return output_dir, processed_metadata_df
