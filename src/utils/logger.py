@@ -57,7 +57,12 @@ class WandbLogger:
     """Wrapper for wandb logging functionality."""
 
     def __init__(
-        self, run_name: str, run_dir: Path, group: str = None, tags: list = None
+        self,
+        run_name: str,
+        run_dir: Path,
+        group: str = None,
+        tags: list = None,
+        config: dict = None,
     ):
         self.enabled = False
         try:
@@ -71,6 +76,7 @@ class WandbLogger:
                 dir=str(self.run_dir),
                 group=group,
                 tags=tags,
+                config=config,
             )
             self.enabled = True
             logging.info("Initialized wandb logging")

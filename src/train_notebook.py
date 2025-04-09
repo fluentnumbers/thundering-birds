@@ -6,6 +6,7 @@ import json
 import multiprocessing as mp
 import os
 import random
+import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,7 +53,7 @@ class CFG:
     dirs.cache_dir = (dirs.DATA_ROOT / "cache").as_posix()
 
     training = EasyDict()
-    training.DEBUG = True
+    training.DEBUG = True if device == "cpu" else False
     training.EPOCHS = 20
     training.N_FOLD = 5
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
@@ -83,6 +84,7 @@ class CFG:
     model.cfar_scaling_factors = (1, 2)
     model.mixup_alpha = 0
     preprocessing = EasyDict()
+    # preprocessing.LOAD_DATA_STRICT = True if device == "cuda" else False
     preprocessing.NUM_WORKERS = 10
     preprocessing.SAMPLE_RATE = 32000
     preprocessing.PADMODE = "constant"
@@ -172,60 +174,71 @@ class BirdCLEFDataset(Dataset):
         self.total_segments = 0
         self.file_indices = []  # List of (file_idx, segment_idx) pairs
 
-        # First, check which files need processing
+        # Vectorized check for cache existence
+        cache_paths = [
+            self._get_cache_path(file_idx) for file_idx in range(len(self.df))
+        ]
+        cache_exists = [path.exists() for path in cache_paths]
+        logger.info(f"Cache exists for {sum(cache_exists)} files out of {len(self.df)}")
+
+        # Split files into cached and to-process
+        time_start = time.time()
+        cached_files = []
         files_to_process = []
-        for file_idx, row in self.df.iterrows():
-            cache_path = self._get_cache_path(file_idx)
-            if not cache_path.exists():
-                files_to_process.append((file_idx, row, self.cfg))
-            else:
-                # Just count segments from cache without loading them
+
+        for file_idx, (row, is_cached) in tqdm(
+            enumerate(zip(self.df.iterrows(), cache_exists)),
+            total=len(self.df),
+            desc="Loading cached files",
+            unit="file",
+        ):
+            if is_cached:
                 try:
                     # Load just the first segment to get the count
-                    segments = torch.load(cache_path)
+                    segments = torch.load(cache_paths[file_idx])
                     self.total_segments += len(segments)
                     self.file_indices.extend(
                         [(file_idx, i) for i in range(len(segments))]
                     )
+                    cached_files.append(file_idx)
                 except Exception as e:
                     logger.warning(
-                        f"Failed to load cache for {cache_path}, will reprocess: {e}"
+                        f"Failed to load cache for {cache_paths[file_idx]}, will reprocess: {e}"
                     )
-                    files_to_process.append((file_idx, row, self.cfg))
+                    files_to_process.append((file_idx, row[1], self.cfg))
+            else:
+                files_to_process.append((file_idx, row[1], self.cfg))
 
         if not files_to_process:
             logger.info(
-                f"All files for mode {self.mode} are already cached, no processing needed"
+                f"All files for mode {self.mode} are already cached, no processing needed [{time.time() - time_start:.1f}s]"
             )
             return
 
         logger.info(
             f"Processing {len(files_to_process)} files out of {len(self.df)} total files"
         )
-
-        # Process files in batches to manage memory
-        file_batch = 100  # Process 100 files at a time
-        total_batches = (len(files_to_process) + file_batch - 1) // file_batch
-
+        time_start = time.time()
+        # Process files in parallel using multiprocessing
         with mp.Pool(
-            processes=np.min([self.cfg.preprocessing.NUM_WORKERS, mp.cpu_count()])
+            processes=min(self.cfg.preprocessing.NUM_WORKERS, mp.cpu_count())
         ) as pool:
-            # Create a progress bar for the overall process
-            with tqdm(
-                total=len(files_to_process),
-                desc="Processing files",
-                unit=f"{file_batch} files",
-            ) as pbar:
-                for batch_idx in range(total_batches):
-                    start_idx = batch_idx * file_batch
-                    end_idx = min((batch_idx + 1) * file_batch, len(files_to_process))
-                    batch_args = files_to_process[start_idx:end_idx]
+            # Process files in batches to manage memory
+            batch_size = 100
+            for i in range(0, len(files_to_process), batch_size):
+                batch = files_to_process[i : i + batch_size]
+                results = list(
+                    tqdm(
+                        pool.imap(process_file_worker, batch),
+                        total=len(batch),
+                        desc=f"Processing batch {i//batch_size + 1}/{(len(files_to_process) + batch_size - 1)//batch_size}",
+                        unit=f"{batch_size} files",
+                    )
+                )
 
-                    # Process current batch
-                    batch_results = list(pool.imap(process_file_worker, batch_args))
-
-                    # Save results and update indices
-                    for file_idx, segments in batch_results:
+                # Save results and update indices
+                for file_idx, segments in results:
+                    if segments:  # Only process if we got valid segments
                         # Save to cache
                         self._save_to_cache(file_idx, segments)
 
@@ -235,11 +248,11 @@ class BirdCLEFDataset(Dataset):
                             [(file_idx, i) for i in range(len(segments))]
                         )
 
-                    # Update progress bar
-                    pbar.update(len(batch_args))
-
-                    # Clear memory after each batch
-                    gc.collect()
+                # Clear memory after each batch
+                gc.collect()
+        logger.info(
+            f"Processed {len(files_to_process)} files in {time.time() - time_start:.1f}s"
+        )
 
     def _get_cache_path(self, file_idx):
         """Get the cache path for a file"""
@@ -617,7 +630,7 @@ def run_training(cfg):
     logger.info(f"Starting training run in {run_dir}")
 
     # Initialize wandb group for all folds
-    wandb_group = f"train_{timestamp}"
+    wandb_group = f"train_{cfg.device.upper()}_{timestamp}"
 
     # Load training data
     logger.info("Loading training data...")
@@ -638,7 +651,6 @@ def run_training(cfg):
     species_ids = df["primary_label"].unique().tolist()
     cfg.num_classes = len(species_ids)
 
-    logger.info("Will generate spectrograms on-the-fly during training.")
     if "filepath" not in df.columns:
         df["filepath"] = cfg.dirs.train_datadir + "/" + df.filename
     if "samplename" not in df.columns:
@@ -669,6 +681,17 @@ def run_training(cfg):
             run_dir,
             group=wandb_group,
             tags=[f"fold_{fold}"],
+            config={
+                "batch_size": cfg.training.BATCH_SIZE,
+                "learning_rate": cfg.training.LR,
+                "epochs": cfg.training.EPOCHS,
+                "model": cfg.model.model_name,
+                "optimizer": cfg.training.OPTIMIZER,
+                "scheduler": cfg.training.SCHEDULER,
+                "criterion": cfg.training.CRITERION,
+                "early_stopping_metric": cfg.training.EARLY_STOPPING_METRIC,
+                "early_stopping_patience": cfg.training.EARLY_STOPPING_PATIENCE,
+            },
         )
 
         train_df = df.iloc[train_idx].reset_index(drop=True)
@@ -679,6 +702,7 @@ def run_training(cfg):
 
         train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
         val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
+        # raise ValueError("Stop here")
 
         # Create DataLoaders with proper worker configuration
         train_loader = DataLoader(
@@ -765,9 +789,6 @@ def run_training(cfg):
                     "learning_rate": (
                         scheduler.get_last_lr()[0] if scheduler else cfg.training.LR
                     ),
-                    "_step": epoch + 1,
-                    "_group": "all_folds",  # Use a common group for all folds
-                    # "_tags": [f"fold_{fold}"],
                 }
             )
 
