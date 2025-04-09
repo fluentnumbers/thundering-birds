@@ -69,7 +69,7 @@ class CFG:
     seed = 42
     apex = False
     print_freq = 100
-    num_workers = 12
+    num_workers = 10
     DATA_ROOT: Path = Path("data/birdclef-2025")
 
     train_datadir = (DATA_ROOT / "train_audio_no_voice").as_posix()
@@ -109,7 +109,7 @@ class CFG:
 
     mixup_alpha = 0
 
-    debug = True
+    debug = False
 
     def update_debug_settings(self):
         if self.debug:
@@ -215,11 +215,6 @@ class BirdCLEFDatasetFromNPY(Dataset):
         self.total_segments = 0
         self.file_indices = []  # List of (file_idx, segment_idx) pairs
 
-        # Process files in parallel
-        self._process_all_files()
-
-    def _process_all_files(self):
-        """Process all files in parallel and cache results"""
         # First, check which files need processing
         files_to_process = []
         for file_idx, row in self.df.iterrows():
@@ -227,10 +222,10 @@ class BirdCLEFDatasetFromNPY(Dataset):
             if not cache_path.exists():
                 files_to_process.append((file_idx, row, self.cfg))
             else:
-                # Load from cache and update indices
+                # Just count segments from cache without loading them
                 try:
+                    # Load just the first segment to get the count
                     segments = torch.load(cache_path)
-                    self.file_segments[file_idx] = segments
                     self.total_segments += len(segments)
                     self.file_indices.extend(
                         [(file_idx, i) for i in range(len(segments))]
@@ -268,11 +263,6 @@ class BirdCLEFDatasetFromNPY(Dataset):
                     for file_idx, segments in batch_results:
                         # Save to cache
                         self._save_to_cache(file_idx, segments)
-
-                        # Update in-memory segments (only keep the most recent batch)
-                        if file_idx in self.file_segments:
-                            del self.file_segments[file_idx]
-                        self.file_segments[file_idx] = segments
 
                         # Update total segments and indices
                         self.total_segments += len(segments)
@@ -316,9 +306,25 @@ class BirdCLEFDatasetFromNPY(Dataset):
     def __getitem__(self, idx):
         # Get the file and segment index from our pre-computed list
         file_idx, segment_idx = self.file_indices[idx]
+
+        # Load segments from cache if not in memory
+        if file_idx not in self.file_segments:
+            cache_path = self._get_cache_path(file_idx)
+            try:
+                segments = torch.load(cache_path)
+                self.file_segments[file_idx] = segments
+            except Exception as e:
+                logger.error(f"Failed to load cache for {cache_path}: {e}")
+                # Return zero segment if loading fails
+                return {
+                    "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
+                    "target": torch.zeros(self.num_classes, dtype=torch.float32),
+                    "filename": self.df.iloc[file_idx]["filename"],
+                    "segment_idx": 0,
+                }
+
         segments = self.file_segments[file_idx]
         segment = segments[segment_idx]
-
         row = self.df.iloc[file_idx]
 
         target = self.encode_label(row["primary_label"])
