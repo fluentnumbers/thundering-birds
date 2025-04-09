@@ -44,7 +44,7 @@ class CFG:
 
     dirs = EasyDict()
     dirs.DATA_ROOT = Path("data/birdclef-2025")
-    # dirs.DATA_ROOT Path("/dbfs/RAW/W00001_Data_Unrestricted/Andrejs/birdclef-2025/")
+    # dirs.DATA_ROOT = Path("/dbfs/RAW/W00001_Data_Unrestricted/Andrejs/birdclef-2025/")
     dirs.train_datadir = (dirs.DATA_ROOT / "train_audio_no_voice").as_posix()
     dirs.train_csv = (dirs.DATA_ROOT / "train.csv").as_posix()
     dirs.test_soundscapes = (dirs.DATA_ROOT / "test_soundscapes").as_posix()
@@ -490,29 +490,61 @@ def calculate_metrics(targets, outputs):
     }
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
+def train_one_epoch(
+    model, loader, optimizer, criterion, device, scheduler=None, scaler=None
+):
     model.train()
     losses = []
     all_targets = []
     all_outputs = []
 
+    # Calculate gradient accumulation steps
+    grad_accum_steps = max(
+        1, 128 // cfg.training.BATCH_SIZE
+    )  # Target effective batch size of 128
+
     enumerate_loader = enumerate(loader)
     pbar = tqdm(enumerate_loader, total=len(loader), desc="Training", unit="batches")
 
+    optimizer.zero_grad()  # Zero gradients at the start of epoch
+
     for step, batch in pbar:
-        inputs = batch["melspec"].to(device)
-        targets = batch["target"].to(device)
+        inputs = batch["melspec"].to(
+            device, non_blocking=True
+        )  # Use non-blocking transfers
+        targets = batch["target"].to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        outputs = model(inputs)
-
-        if isinstance(outputs, tuple):
-            outputs, loss = outputs
+        # Forward pass with mixed precision if using GPU
+        if device == "cuda" and scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                if isinstance(outputs, tuple):
+                    outputs, loss = outputs
+                else:
+                    loss = criterion(outputs, targets)
+                loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
         else:
-            loss = criterion(outputs, targets)
+            outputs = model(inputs)
+            if isinstance(outputs, tuple):
+                outputs, loss = outputs
+            else:
+                loss = criterion(outputs, targets)
+            loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
 
-        loss.backward()
-        optimizer.step()
+        # Backward pass with mixed precision if using GPU
+        if device == "cuda" and scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Step optimizer only after accumulating gradients
+        if (step + 1) % grad_accum_steps == 0:
+            if device == "cuda" and scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
 
         outputs = outputs.detach().cpu().numpy()
         targets = targets.detach().cpu().numpy()
@@ -522,7 +554,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
 
         all_outputs.append(outputs)
         all_targets.append(targets)
-        losses.append(loss if isinstance(loss, float) else loss.item())
+        losses.append(loss.item() * grad_accum_steps)  # Scale back the loss for logging
 
         pbar.set_postfix(
             {
@@ -622,6 +654,9 @@ def run_training(cfg):
 
     best_scores = []
 
+    # Initialize gradient scaler for mixed precision training if using GPU
+    scaler = torch.cuda.amp.GradScaler() if cfg.device == "cuda" else None
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
@@ -649,8 +684,10 @@ def run_training(cfg):
             train_dataset,
             batch_size=cfg.training.BATCH_SIZE,
             shuffle=True,
-            num_workers=cfg.training.NUM_WORKERS,
-            pin_memory=True,
+            num_workers=min(4, os.cpu_count()),  # Limit workers to avoid memory issues
+            pin_memory=True,  # Enable pin_memory for faster data transfer to GPU
+            persistent_workers=True,  # Keep workers alive between epochs
+            prefetch_factor=2,  # Prefetch 2 batches per worker
             collate_fn=collate_fn,
             drop_last=False,
         )
@@ -659,8 +696,10 @@ def run_training(cfg):
             val_dataset,
             batch_size=cfg.training.BATCH_SIZE,
             shuffle=False,
-            num_workers=cfg.training.NUM_WORKERS,
-            pin_memory=True,
+            num_workers=min(4, os.cpu_count()),  # Limit workers to avoid memory issues
+            pin_memory=True,  # Enable pin_memory for faster data transfer to GPU
+            persistent_workers=True,  # Keep workers alive between epochs
+            prefetch_factor=2,  # Prefetch 2 batches per worker
             collate_fn=collate_fn,
         )
 
@@ -698,6 +737,7 @@ def run_training(cfg):
                 criterion,
                 cfg.device,
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None,
+                scaler,  # Pass scaler to train_one_epoch
             )
 
             val_loss, val_metrics = validate(model, val_loader, criterion, cfg.device)
