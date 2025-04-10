@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import psutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -158,6 +159,14 @@ class BirdCLEFDataset(Dataset):
         self.num_classes = len(self.species_ids)
         self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
 
+        # Memory management settings
+        self.max_memory_gb = 4.0  # Maximum memory to use for caching segments
+        self.current_memory_usage = mp.Value("d", 0.0)  # Shared memory counter
+        self.files_in_memory = mp.Manager().dict()  # Shared dictionary
+        self.segments_loaded_this_epoch = (
+            mp.Manager().list()
+        )  # Shared list (used as set)
+
         if "filepath" not in self.df.columns:
             self.df["filepath"] = self.cfg.dirs.train_datadir + "/" + self.df.filename
 
@@ -171,7 +180,6 @@ class BirdCLEFDataset(Dataset):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize file segments tracking
-        self.file_segments = {}  # Maps filename to list of segments
         self.total_segments = 0
         self.file_indices = []  # List of (filename, segment_idx) pairs
 
@@ -315,6 +323,67 @@ class BirdCLEFDataset(Dataset):
         except Exception as e:
             logger.warning(f"Failed to save cache for {cache_path}: {e}")
 
+    def _estimate_segment_memory(self, segments):
+        """Estimate memory usage of segments in bytes"""
+        total_bytes = 0
+        for segment in segments:
+            if isinstance(segment, dict) and "spectrogram" in segment:
+                total_bytes += (
+                    segment["spectrogram"].element_size()
+                    * segment["spectrogram"].nelement()
+                )
+        return total_bytes
+
+    def _load_segments_to_memory(self, filename):
+        """Load segments into memory if possible"""
+        if filename in self.files_in_memory:
+            return self.files_in_memory[filename][0]
+
+        segments = self._load_from_cache(filename)
+        if segments is None:
+            return None
+
+        # Estimate memory usage
+        segment_size = self._estimate_segment_memory(segments)
+
+        # Check if we can fit this in memory
+        with self.current_memory_usage.get_lock():
+            if (
+                self.current_memory_usage.value + segment_size
+                <= self.max_memory_gb * 1024**3
+            ):
+                self.files_in_memory[filename] = (segments, segment_size)
+                self.current_memory_usage.value += segment_size
+                if filename not in self.segments_loaded_this_epoch:
+                    self.segments_loaded_this_epoch.append(filename)
+
+                # Log memory usage and segment count
+                # logger.info(
+                # f"Memory usage: {self.current_memory_usage.value/1024**3:.2f}GB / {self.max_memory_gb}GB, "
+                # f"Files in memory: {len(self.files_in_memory)}, "
+                # f"Files loaded this epoch: {len(self.segments_loaded_this_epoch)}"
+                # )
+                return segments
+            else:
+                # If we can't fit it, just return the segments without storing
+                # logger.info(
+                # f"Memory limit reached: {self.current_memory_usage.value/1024**3:.2f}GB / {self.max_memory_gb}GB, "
+                # f"Files in memory: {len(self.files_in_memory)}, "
+                # f"Files loaded this epoch: {len(self.segments_loaded_this_epoch)}"
+                # )
+                return segments
+
+    def cleanup_after_epoch(self):
+        """Clean up memory after each epoch"""
+        # Clear all segments from memory
+        self.files_in_memory.clear()
+        with self.current_memory_usage.get_lock():
+            self.current_memory_usage.value = 0
+        self.segments_loaded_this_epoch[:] = []  # Clear the list
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def __len__(self):
         return self.total_segments
 
@@ -322,23 +391,17 @@ class BirdCLEFDataset(Dataset):
         # Get the file and segment index from our pre-computed list
         filename, segment_idx = self.file_indices[idx]
 
-        # Load segments from cache if not in memory
-        if filename not in self.file_segments:
-            cache_path = self._get_cache_path(filename)
-            try:
-                segments = torch.load(cache_path)
-                self.file_segments[filename] = segments
-            except Exception as e:
-                logger.error(f"Failed to load cache for {cache_path}: {e}")
-                # Return zero segment if loading fails
-                return {
-                    "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
-                    "target": torch.zeros(self.num_classes, dtype=torch.float32),
-                    "filename": filename,
-                    "segment_idx": 0,
-                }
+        # Try to get segments from memory or load them
+        segments = self._load_segments_to_memory(filename)
+        if segments is None:
+            logger.error(f"Failed to load segments for {filename}")
+            return {
+                "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
+                "target": torch.zeros(self.num_classes, dtype=torch.float32),
+                "filename": filename,
+                "segment_idx": 0,
+            }
 
-        segments = self.file_segments[filename]
         segment = segments[segment_idx]
         row = self.df[self.df["filename"] == filename].iloc[0]
 
@@ -541,9 +604,29 @@ def calculate_metrics(targets, outputs):
 
 
 def log_memory_usage():
+    # Log system RAM memory
+    ram = psutil.virtual_memory()
+    logger.info(
+        f"System RAM: {ram.used/1024**3:.0f}GB / "
+        f"{ram.total/1024**3:.0f}GB / "
+        f"{ram.available/1024**3:.0f}GB "
+        f"(Used / Total / Free)"
+    )
+
+    # Log GPU memory if available
     if torch.cuda.is_available():
-        logger.info(f"GPU Memory: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
-        logger.info(f"GPU Memory Cached: {torch.cuda.memory_reserved()/1024**2:.2f}MB")
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        total = torch.cuda.get_device_properties(0).total_memory
+        free = total - allocated
+
+        logger.info(
+            f"GPU Memory: {allocated/1024**2:.0f}MB / "
+            f"{reserved/1024**2:.0f}MB / "
+            f"{total/1024**2:.0f}MB / "
+            f"{free/1024**2:.0f}MB "
+            f"(Allocated / Cached / Total / Free)"
+        )
 
 
 def train_one_epoch(
@@ -553,12 +636,13 @@ def train_one_epoch(
     losses = []
     all_targets = []
     all_outputs = []
+    log_memory_every_n_batches = 50
 
     # Use gradient accumulation steps from config
     grad_accum_steps = cfg.training.GRAD_ACCUM_STEPS
 
     enumerate_loader = enumerate(loader)
-    pbar = tqdm(enumerate_loader, total=len(loader), desc="Training", unit="batches")
+    pbar = tqdm(enumerate_loader, total=len(loader), desc="Training", unit="batch")
 
     optimizer.zero_grad()  # Zero gradients at the start of epoch
 
@@ -613,9 +697,18 @@ def train_one_epoch(
         all_targets.append(targets)
         losses.append(loss.item() * grad_accum_steps)  # Scale back the loss for logging
 
-        # Log memory usage every 100 steps
-        if step % 100 == 0:
+        # Log memory usage and dataset stats every 10 batches
+        if step % min(len(loader), log_memory_every_n_batches) == 0:
+            # Log GPU memory if available
             log_memory_usage()
+            # Log dataset memory usage and segment stats
+            dataset = loader.dataset
+            logger.info(
+                f"Memory usage: {dataset.current_memory_usage.value/1024**3:.2f}GB / {dataset.max_memory_gb}GB, "
+                f"Files in memory: {len(dataset.files_in_memory)}, "
+                f"Files loaded this epoch: {len(dataset.segments_loaded_this_epoch)}"
+            )
+
             # Clear memory more frequently
             gc.collect()
             if device == "cuda":
@@ -643,6 +736,9 @@ def train_one_epoch(
     metrics = calculate_metrics(all_targets, all_outputs)
     avg_loss = np.mean(losses)
 
+    # Clean up dataset memory after epoch
+    loader.dataset.cleanup_after_epoch()
+
     # Log final memory usage for the epoch
     log_memory_usage()
 
@@ -654,10 +750,12 @@ def validate(model, loader, criterion, device):
     losses = []
     all_targets = []
     all_outputs = []
+    log_memory_every_n_batches = 50
 
-    pbar = tqdm(loader, desc="Validation", unit="batches")
+    enumerate_loader = enumerate(loader)
+    pbar = tqdm(enumerate_loader, desc="Validation", unit="batch", total=len(loader))
     with torch.no_grad():
-        for batch in pbar:
+        for step, batch in pbar:
             inputs = batch["melspec"].to(device)
             targets = batch["target"].to(device)
 
@@ -677,6 +775,16 @@ def validate(model, loader, criterion, device):
                     "val_loss": f"{np.mean(losses[-10:]):.2f}",
                 }
             )
+
+            # Log memory usage and dataset stats every 10 batches
+            if step % min(len(loader), log_memory_every_n_batches) == 0:
+                log_memory_usage()
+                dataset = loader.dataset
+                logger.info(
+                    f"Memory usage: {dataset.current_memory_usage.value/1024**3:.2f}GB / {dataset.max_memory_gb}GB, "
+                    f"Files in memory: {len(dataset.files_in_memory)}, "
+                    f"Files loaded this epoch: {len(dataset.segments_loaded_this_epoch)}"
+                )
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
