@@ -31,6 +31,9 @@ from src.data.preprocessing import process_audio_file
 from src.models.efficientnet_attention import EfficientNetWithAttention
 from src.utils.logger import WandbLogger, setup_logger
 
+# Add at the beginning of your script, before any PyTorch imports
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
+
 warnings.filterwarnings("ignore")
 LOGS_DIR = Path("logs")
 # LOGS_DIR = Path("/dbfs/RAW/W00001_Data_Unrestricted/Andrejs/birdclef-2025/logs/")
@@ -65,7 +68,7 @@ class CFG:
     training.SAVE_INTERMEDIATE_MODEL = True
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
-    training.EARLY_STOPPING_PATIENCE = 10
+    training.EARLY_STOPPING_PATIENCE = 7
     training.BATCH_SIZE = 1024 if device == "cuda" else 16
     training.GRAD_ACCUM_STEPS = 1
     training.OPTIMIZER = "AdamW"
@@ -349,7 +352,6 @@ class BirdCLEFDataset(Dataset):
         # Estimate memory usage
         segment_size = self._estimate_segment_memory(segments)
 
-        # Check if we can fit this in memory
         with self.current_memory_usage.get_lock():
             if (
                 self.current_memory_usage.value + segment_size
@@ -622,13 +624,17 @@ def log_memory_usage():
         reserved = torch.cuda.memory_reserved()
         total = torch.cuda.get_device_properties(0).total_memory
         free = total - allocated
-
+        stats = torch.cuda.memory_stats()
+        fragmentation = stats["allocated_bytes.all.current"] / (
+            stats["reserved_bytes.all.current"] + 1
+        )
         logger.info(
             f"GPU Memory: {allocated/1024**2:.0f}MB / "
             f"{reserved/1024**2:.0f}MB / "
             f"{total/1024**2:.0f}MB / "
             f"{free/1024**2:.0f}MB "
-            f"(Allocated / Cached / Total / Free)"
+            f"(Allocated / Cached / Total / Free) /"
+            f"Fragmentation: {fragmentation:.2%}"
         )
 
 
@@ -653,9 +659,7 @@ def train_one_epoch(
     log_memory_usage()
 
     for step, batch in pbar:
-        inputs = batch["melspec"].to(
-            device, non_blocking=True
-        )  # Use non-blocking transfers
+        inputs = batch["melspec"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
 
         # Forward pass with mixed precision if using GPU
@@ -688,7 +692,7 @@ def train_one_epoch(
                 scaler.update()
             else:
                 optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
         outputs = outputs.detach().cpu().numpy()
         targets = targets.detach().cpu().numpy()
