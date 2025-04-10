@@ -56,6 +56,9 @@ class CFG:
     training = EasyDict()
     training.DEBUG = True if device == "cpu" else False
     training.EPOCHS = 20
+    training.MAX_CACHE_MEMORY_GB = 15.0 if device == "cuda" else 5.0
+    training.PREFETCH_FACTOR = 10 if device == "cuda" else 2
+    training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = 1
     training.N_FOLD = 5
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
     training.NUM_WORKERS = 1
@@ -63,8 +66,8 @@ class CFG:
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
     training.EARLY_STOPPING_PATIENCE = 10
-    training.BATCH_SIZE = 32 if device == "cuda" else 16
-    training.GRAD_ACCUM_STEPS = 4
+    training.BATCH_SIZE = 1024 if device == "cuda" else 16
+    training.GRAD_ACCUM_STEPS = 1
     training.OPTIMIZER = "AdamW"
     training.LR = 5e-4
     training.WEIGHT_DECAY = 1e-5
@@ -160,7 +163,7 @@ class BirdCLEFDataset(Dataset):
         self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
 
         # Memory management settings
-        self.max_memory_gb = 4.0  # Maximum memory to use for caching segments
+        self.max_memory_gb = cfg.training.MAX_CACHE_MEMORY_GB
         self.current_memory_usage = mp.Value("d", 0.0)  # Shared memory counter
         self.files_in_memory = mp.Manager().dict()  # Shared dictionary
         self.segments_loaded_this_epoch = (
@@ -630,13 +633,13 @@ def log_memory_usage():
 
 
 def train_one_epoch(
-    model, loader, optimizer, criterion, device, scheduler=None, scaler=None
+    model, loader, optimizer, criterion, device, scheduler=None, scaler=None, cfg=None
 ):
     model.train()
     losses = []
     all_targets = []
     all_outputs = []
-    log_memory_every_n_batches = 50
+    log_memory_every_n_batches = cfg.training.LOG_MEMORY_USAGE_EVERY_N_BATCHES
 
     # Use gradient accumulation steps from config
     grad_accum_steps = cfg.training.GRAD_ACCUM_STEPS
@@ -745,12 +748,12 @@ def train_one_epoch(
     return avg_loss, metrics
 
 
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, cfg):
     model.eval()
     losses = []
     all_targets = []
     all_outputs = []
-    log_memory_every_n_batches = 50
+    log_memory_every_n_batches = cfg.training.LOG_MEMORY_USAGE_EVERY_N_BATCHES
 
     enumerate_loader = enumerate(loader)
     pbar = tqdm(enumerate_loader, desc="Validation", unit="batch", total=len(loader))
@@ -843,7 +846,7 @@ def run_training(cfg):
     best_scores = []
 
     # Initialize gradient scaler for mixed precision training if using GPU
-    scaler = torch.cuda.amp.GradScaler() if cfg.device == "cuda" else None
+    scaler = torch.amp.GradScaler() if cfg.device == "cuda" else None
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
         if fold not in cfg.training.SELECTED_FOLDS:
@@ -892,7 +895,7 @@ def run_training(cfg):
             num_workers=min(2, os.cpu_count()),
             pin_memory=True,
             persistent_workers=False,
-            prefetch_factor=2,
+            prefetch_factor=cfg.training.PREFETCH_FACTOR,
             collate_fn=collate_fn,
             drop_last=True,
         )
@@ -946,9 +949,12 @@ def run_training(cfg):
                 cfg.device,
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None,
                 scaler,
+                cfg,
             )
 
-            val_loss, val_metrics = validate(model, val_loader, criterion, cfg.device)
+            val_loss, val_metrics = validate(
+                model, val_loader, criterion, cfg.device, cfg
+            )
 
             if scheduler is not None and not isinstance(
                 scheduler, lr_scheduler.OneCycleLR
