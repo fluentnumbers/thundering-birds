@@ -308,7 +308,14 @@ class BirdCLEFDataset(Dataset):
 
     def _get_cache_path(self, filename):
         """Get the cache path for a file"""
-        return self.cache_dir / f"{Path(filename.replace('/', '-')).with_suffix('.pt')}"
+        # Extract class name from filename (part before first dash)
+        class_name = filename.split("/")[0]
+        # Create path with class subdirectory
+        return (
+            self.cache_dir
+            / class_name
+            / f"{Path(filename.replace('/', '-')).with_suffix('.pt')}"
+        )
 
     def _load_from_cache(self, filename):
         """Load segments from cache if available"""
@@ -324,6 +331,8 @@ class BirdCLEFDataset(Dataset):
     def _save_to_cache(self, filename, segments):
         """Save segments to cache"""
         cache_path = self._get_cache_path(filename)
+        # Create parent directory if it doesn't exist
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             torch.save(segments, cache_path)
         except Exception as e:
