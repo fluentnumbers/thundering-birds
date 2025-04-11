@@ -103,14 +103,18 @@ def get_criterion(cfg):
     return criterion
 
 
-def calculate_metrics(targets, outputs):
+def calculate_metrics(targets, outputs, thresholds=None):
     """Calculate AUC and F1 scores for all classes"""
     num_classes = targets.shape[1]
     aucs = []
     f1s = []
 
     probs = 1 / (1 + np.exp(-outputs))
-    preds = (probs > 0.5).astype(int)
+    if thresholds is None:
+        thresholds = np.array([0.5] * num_classes)
+
+    # Use class-specific thresholds
+    preds = (probs > thresholds[:, None].T).astype(int)
 
     for i in range(num_classes):
         if np.sum(targets[:, i]) > 0:
