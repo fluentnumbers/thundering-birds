@@ -1,6 +1,7 @@
 import logging
 import multiprocessing as mp
 import os
+import time
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -62,34 +63,22 @@ class MelSpectrogramTransform:
         return mel_spec.clone().detach()
 
 
-def load_metadata(config) -> pd.DataFrame:
-    """Load and prepare metadata."""
-    metadata_df = pd.read_csv(config.METADATA_PATH)
-
-    # Add full filepath
-    metadata_df["filepath"] = metadata_df["filename"].apply(
-        lambda x: os.path.join(config.TRAIN_AUDIO_PATH, x)
-    )
-
-    return metadata_df
-
-
 def process_audio_file(
     row: pd.Series,
     config: Dict,
+    verbose: bool = False,
 ) -> Dict:
     """Process a single audio file and return its segments.
 
     Args:
         row: DataFrame row containing file information
         config: Dictionary containing configuration parameters
-
-        config: Configuration object
-        use_voice_removal: Whether to use voice removal
+        verbose: Whether to log timing information
 
     Returns:
         Dictionary containing processed segments and metadata
     """
+    start_time = time.time()
     try:
         # Force CPU device for preprocessing
         device = torch.device("cpu")
@@ -101,13 +90,6 @@ def process_audio_file(
 
         # Load audio
         audio_data, _ = librosa.load(row.filepath, sr=config["SAMPLE_RATE"])
-        if audio_data.size == 0:
-            logger.warning(f"Empty audio data for {row.filename}")
-            return {
-                "segments": [],
-                "success": False,
-                "error": f"Empty audio data for {row.filename}",
-            }
         audio_tensor = torch.tensor(audio_data, dtype=torch.float32, device=device)
 
         # Pad if necessary
@@ -126,13 +108,50 @@ def process_audio_file(
         for segment_idx in range(n_segments):
             start_idx = segment_idx * config["UFOLD_OVERLAP"]
             audio_segment = audio_tensor[start_idx : start_idx + config["NSAMPLES"]]
-            # Skip segments that are mostly silence (50% or more zeros)
+
+            # Check for silence and apply circular padding if needed
             zero_count = torch.sum(audio_segment == 0).item()
-            if zero_count / audio_segment.numel() >= config["SILENCE_THRESHOLD"]:
+            silence_pct = zero_count / audio_segment.numel() * 100
+            is_padded = False
+
+            if silence_pct > 0:
                 logger.debug(
-                    f"Segment {segment_idx} of {row.filename} is mostly silence ({zero_count / audio_segment.numel() * 100:.1f}% zeros)"
+                    f"Segment {segment_idx} of {row.filename} contains {silence_pct * 100:.1f}% silence, applying circular padding"
                 )
-                continue
+                # Apply circular padding to the non-silent parts
+                non_silent_mask = audio_segment != 0
+                if torch.any(non_silent_mask):
+                    non_silent_parts = audio_segment[non_silent_mask]
+                    # Calculate how many times we need to repeat to fill the segment
+                    repeat_factor = int(
+                        np.ceil(len(audio_segment) / len(non_silent_parts))
+                    )
+                    # Create circularly padded audio
+                    padded_audio = torch.tile(non_silent_parts, (repeat_factor,))[
+                        : len(audio_segment)
+                    ]
+                    audio_segment = padded_audio
+                    is_padded = True
+
+            min_val = torch.min(audio_segment)
+            max_val = torch.max(audio_segment)
+            normalized_audio = (audio_segment - min_val) / (
+                max_val - min_val
+            ) * 2 - 1  # Scale to [-1, 1]
+
+            # Calculate signal power (mean squared amplitude)
+            signal_power = torch.mean(normalized_audio**2)
+
+            # Calculate noise power (variance of the signal)
+            noise_power = torch.var(normalized_audio)
+
+            # Calculate SNR in dB (avoid division by zero)
+            if noise_power == 0:
+                snr_db = float("inf")
+            else:
+                snr_db = 10 * torch.log10(signal_power / noise_power)
+                if torch.isnan(snr_db) or torch.isinf(snr_db):
+                    snr_db = float("-inf")
 
             # Convert to mel spectrogram
             mel_spec = mel_transform(audio_segment)
@@ -154,13 +173,38 @@ def process_audio_file(
                     "segment_idx": segment_idx,
                     "filename": row.filename,
                     "primary_label": row.primary_label,
+                    "signal_power": signal_power.item(),
+                    "noise_power": noise_power.item(),
+                    "snr_db": snr_db if isinstance(snr_db, float) else snr_db.item(),
+                    "rating": row.rating,
+                    "silence_pct": silence_pct,
+                    "is_padded": is_padded,
                 }
+            )
+
+        end_time = time.time()
+        processing_time = end_time - start_time  # in seconds
+        if verbose:
+            logger.info(
+                f"Processed {row.filename} in {processing_time:.2f} seconds ({n_segments} segments)"
             )
 
         return {
             "segments": segments,
             "success": True,
             "error": None,
+            "processing_time": processing_time,
         }
     except Exception as e:
-        return {"segments": [], "success": False, "error": str(e)}
+        end_time = time.time()
+        processing_time = end_time - start_time
+        if verbose:
+            logger.info(
+                f"Failed to process {row.filename} in {processing_time:.2f} seconds: {e}"
+            )
+        return {
+            "segments": [],
+            "success": False,
+            "error": str(e),
+            "processing_time": processing_time,
+        }

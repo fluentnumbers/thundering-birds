@@ -25,228 +25,58 @@ class BirdCLEFDataset(Dataset):
         self.num_classes = len(self.species_ids)
         self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
 
-        # Memory management settings
-        self.max_memory_gb = cfg.training.MAX_CACHE_MEMORY_GB
-        self.current_memory_usage = mp.Value("d", 0.0)  # Shared memory counter
-        self.files_in_memory = mp.Manager().dict()  # Shared dictionary
-        self.segments_loaded_this_epoch = (
-            mp.Manager().list()
-        )  # Shared list (used as set)
-
-        if "filepath" not in self.df.columns:
-            self.df["filepath"] = self.cfg.dirs.train_datadir + "/" + self.df.filename
-
-        if "samplename" not in self.df.columns:
-            self.df["samplename"] = self.df.filename.map(
-                lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
-            )
-
-        # Create cache directory using config path
         self.cache_dir = Path(self.cfg.dirs.cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if not self.cache_dir.exists() or self.cache_dir.empty():
+            logger.error(f"Cache directory {self.cache_dir} does not exist")
+            raise FileNotFoundError(f"Cache directory {self.cache_dir} does not exist")
+        else:
+            self.metadata_df = pd.read_csv(self.cache_dir / "metadata.csv")
 
-        # Initialize file segments tracking
-        self.total_segments = 0
-        self.file_indices = []  # List of (filename, segment_idx) pairs
+            # Filter out rows with 100% silence
+            self.metadata_df = self.metadata_df[self.metadata_df["silence_pct"] < 100]
+            # Filter out rows with low ratings (0.5, 1.0, 1.5)
+            self.metadata_df = self.metadata_df[
+                ~self.metadata_df["rating"].isin([0.5, 1.0, 1.5])
+            ]
+            # Filter out rows with low signal power
+            self.metadata_df = self.metadata_df[self.metadata_df["signal_power"] > 0.01]
+            # Filter out rows with low SNR
+            self.metadata_df = self.metadata_df[self.metadata_df["snr_db"] > 0]
 
-        # Vectorized check for cache existence
-        cache_paths = {
-            row["filename"]: self._get_cache_path(row["filename"])
-            for _, row in self.df.iterrows()
-        }
-        cache_exists = {
-            filename: path.exists() for filename, path in cache_paths.items()
-        }
-        logger.info(
-            f"Cache exists for {sum(cache_exists.values())} files out of {len(self.df)}"
-        )
-
-        # Create or load cache status file
-        cache_status_file = self.cache_dir / f"cache_status_full.json"
-        CACHE_LOADED = False
-        if cache_status_file.exists():
-            # Load existing cache status
-            with open(cache_status_file, "r") as f:
-                cache_status = json.load(f)
-
-            # Update file_indices from cache status
-            for _, row in self.df.iterrows():
-                filename = row["filename"]
-                if filename in cache_status and cache_exists[filename]:
-                    num_segments = cache_status[filename]["num_segments"]
-                    self.file_indices.extend(
-                        [(filename, i) for i in range(num_segments)]
-                    )
-                    self.total_segments += num_segments
-            CACHE_LOADED = True
-
-        cached_files = []
-        files_to_process = []
-        if not CACHE_LOADED:
-            cache_status = {}
-            # Split files into cached and to-process
-            time_start = time.time()
-
-            for _, row in tqdm(
-                self.df.iterrows(),
-                total=len(self.df),
-                desc="Loading cached files",
-                unit="file",
-            ):
-                filename = row["filename"]
-                if cache_exists[filename]:
-                    try:
-                        # Load just the first segment to get the count
-                        segments = torch.load(cache_paths[filename])
-                        self.total_segments += len(segments)
-                        self.file_indices.extend(
-                            [(filename, i) for i in range(len(segments))]
-                        )
-                        cached_files.append(filename)
-                        cache_status[filename] = {
-                            "num_segments": len(segments),
-                            "last_modified": os.path.getmtime(cache_paths[filename]),
-                            "primary_label": row["primary_label"],
-                        }
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to load cache for {cache_paths[filename]}, will reprocess: {e}"
-                        )
-                        files_to_process.append((filename, row, self.cfg))
-                else:
-                    files_to_process.append((filename, row, self.cfg))
-
-        if not files_to_process:
-            logger.info(
-                f"All files for mode {self.mode} are already cached, no processing needed"
+            self.metadata_df = self.metadata_df.reset_index(drop=True)
+            self.metadata_df["index"] = range(len(self.metadata_df))
+            self.metadata_df["cache_path"] = Path(
+                self.cache_dir / self.metadata_df["segment_file"]
             )
-            return
+            self.metadata_lookup_files = {}
 
-        logger.info(
-            f"Processing {len(files_to_process)} files out of {len(self.df)} total files"
-        )
-        time_start = time.time()
-        with mp.Pool(
-            processes=min(self.cfg.preprocessing.NUM_WORKERS, mp.cpu_count())
-        ) as pool:
-            # Process files in batches to manage memory
-            batch_size = 100
-            for i in range(0, len(files_to_process), batch_size):
-                batch = files_to_process[i : i + batch_size]
-                results = list(
-                    tqdm(
-                        pool.imap(process_file_worker, batch),
-                        total=len(batch),
-                        desc=f"Processing batch {i//batch_size + 1}/{(len(files_to_process) + batch_size - 1)//batch_size}",
-                        unit=f"{batch_size} files",
-                    )
-                )
-
-                # Save results and update indices
-                for filename, segments in results:
-                    if segments:  # Only process if we got valid segments
-                        # Save to cache
-                        self._save_to_cache(filename, segments)
-
-                        # Update total segments and indices
-                        self.total_segments += len(segments)
-                        self.file_indices.extend(
-                            [(filename, i) for i in range(len(segments))]
-                        )
-
-                # Clear memory after each batch
-                gc.collect()
-        logger.info(
-            f"Processed {len(files_to_process)} files in {time.time() - time_start:.1f}s"
-        )
-
-    def _get_cache_path(self, filename):
-        """Get the cache path for a file"""
-        # Extract class name from filename (part before first dash)
-        class_name = filename.split("/")[0]
-        # Create path with class subdirectory
-        return (
-            self.cache_dir
-            / class_name
-            / f"{Path(filename.replace('/', '-')).with_suffix('.pt')}"
-        )
-
-    def _load_from_cache(self, filename):
-        """Load segments from cache if available"""
-        cache_path = self._get_cache_path(filename)
-        if cache_path.exists():
-            try:
-                return torch.load(cache_path)
-            except Exception as e:
-                logger.warning(f"Failed to load cache for {cache_path}: {e}")
-                return None
-        return None
-
-    def _save_to_cache(self, filename, segments):
-        """Save segments to cache"""
-        cache_path = self._get_cache_path(filename)
-        # Create parent directory if it doesn't exist
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            torch.save(segments, cache_path)
-        except Exception as e:
-            logger.warning(f"Failed to save cache for {cache_path}: {e}")
-
-    def _estimate_segment_memory(self, segments):
-        """Estimate memory usage of segments in bytes"""
-        total_bytes = 0
-        for segment in segments:
-            if isinstance(segment, dict) and "spectrogram" in segment:
-                total_bytes += (
-                    segment["spectrogram"].element_size()
-                    * segment["spectrogram"].nelement()
-                )
-        return total_bytes
-
-    def _load_segments_to_memory(self, filename):
-        """Load segments into memory if possible"""
-        if filename in self.files_in_memory:
-            return self.files_in_memory[filename][0]
-
-        segments = self._load_from_cache(filename)
-        if segments is None:
-            return None
-
-        # Estimate memory usage
-        segment_size = self._estimate_segment_memory(segments)
-
-        with self.current_memory_usage.get_lock():
-            if (
-                self.current_memory_usage.value + segment_size
-                <= self.max_memory_gb * 1024**3
-            ):
-                self.files_in_memory[filename] = (segments, segment_size)
-                self.current_memory_usage.value += segment_size
-                if filename not in self.segments_loaded_this_epoch:
-                    self.segments_loaded_this_epoch.append(filename)
-                return segments
-            else:
-                return segments
-
-    def cleanup_after_epoch(self):
-        """Clean up memory after each epoch"""
-        # Clear all segments from memory
-        self.files_in_memory.clear()
-        with self.current_memory_usage.get_lock():
-            self.current_memory_usage.value = 0
-        self.segments_loaded_this_epoch[:] = []  # Clear the list
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            unique_files = self.metadata_df["audio_file"].unique()
+            for f in unique_files:
+                file_df = self.metadata_df[self.metadata_df["audio_file"] == f]
+                self.metadata_lookup_files[f] = {
+                    "n_segments": len(file_df),
+                    "indices": file_df["index"].tolist(),
+                    "cache_paths": file_df["cache_path"].tolist(),
+                }
+            self.metadata_lookup_classes = {}
+            unique_classes = self.metadata_df["primary_label"].unique()
+            for c in unique_classes:
+                class_df = self.metadata_df[self.metadata_df["primary_label"] == c]
+                self.metadata_lookup_classes[c] = {
+                    "n_segments": len(class_df),
+                    "n_files": len(class_df["audio_file"].unique()),
+                    "indices": class_df["index"].tolist(),
+                    "files": class_df["audio_file"].unique().tolist(),
+                    "cache_paths": class_df["cache_path"].tolist(),
+                }
+        self.total_segments = len(self.metadata_df)
 
     def __len__(self):
         return self.total_segments
 
     def __getitem__(self, idx):
-        # Get the file and segment index from our pre-computed list
         filename, segment_idx = self.file_indices[idx]
 
-        # Try to get segments from memory or load them
         segments = self._load_segments_to_memory(filename)
         if segments is None:
             logger.error(f"Failed to load segments for {filename}")
@@ -307,6 +137,12 @@ def process_file_worker(args):
                             "spectrogram": torch.from_numpy(segment["spectrogram"]),
                             "filename": segment.get("filename", row["filename"]),
                             "segment_idx": segment.get("segment_idx", 0),
+                            "rating": segment.get("rating", float("nan")),
+                            "signal_power": segment.get("signal_power", float("nan")),
+                            "noise_power": segment.get("noise_power", float("nan")),
+                            "snr_db": segment.get("snr_db", float("nan")),
+                            "silence_pct": segment.get("silence_pct", 0),
+                            "is_padded": segment.get("is_padded", False),
                         }
                     )
                 else:
@@ -320,6 +156,12 @@ def process_file_worker(args):
         "spectrogram": torch.zeros((1, 224, 224), dtype=torch.float32),
         "filename": row["filename"],
         "segment_idx": 0,
+        "rating": float("nan"),
+        "signal_power": float("nan"),
+        "noise_power": float("nan"),
+        "snr_db": float("nan"),
+        "silence_pct": 0,
+        "is_padded": False,
     }
     return filename, [zero_segment]
 

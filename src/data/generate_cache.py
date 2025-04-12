@@ -56,14 +56,14 @@ def init_process(cfg: CFG) -> None:
 
 def process_single_file(
     args: Tuple[pd.Series, Path, Path],
-) -> Tuple[str, bool, Optional[str]]:
-    """Process a single audio file to generate spectrograms.
+) -> Tuple[str, bool, Optional[str], List[Dict]]:
+    """Process a single audio file to generate spectrograms and metadata.
 
     Args:
         args: Tuple containing (row, data_folder_path, output_folder_path)
 
     Returns:
-        Tuple of (filename, success, error)
+        Tuple of (filename, success, error, metadata)
     """
     row, src_folder, dst_folder = args
     try:
@@ -75,28 +75,93 @@ def process_single_file(
         result = process_audio_file(row, _process_config)
 
         if not result["success"]:
-            return row["filename"], False, result["error"]
+            # Create metadata entry for failed file
+            metadata = [
+                {
+                    "audio_file": str(row["filename"]),
+                    "segment_file": None,
+                    "segment_idx": -1,
+                    "primary_label": row.get("primary_label", None),
+                    "signal_power": None,
+                    "noise_power": None,
+                    "snr_db": None,
+                    "rating": row.get("rating", None),
+                    "silence_pct": None,
+                    "is_padded": None,
+                    "processing_time": result["processing_time"],
+                    "success": False,
+                    "error": result["error"],
+                    "n_segments": 0,
+                }
+            ]
+            return row["filename"], False, result["error"], metadata
 
         # Create output directory that mirrors source structure
         relative_path = Path(row["filename"]).parent
         output_dir = dst_folder / relative_path
         output_dir.mkdir(exist_ok=True, parents=True)
 
-        # Save each segment and don't keep them in memory
+        # Calculate average processing time per segment
+        n_segments = len(result["segments"])
+        avg_processing_time = (
+            result["processing_time"] / n_segments if n_segments > 0 else 0
+        )
+
+        # Process each segment and collect metadata
+        metadata = []
         for segment in result["segments"]:
             # Create output path for the segment in the same structure
             segment_path = (
                 output_dir
-                / f"{Path(row['filename']).stem}_segment_{segment['segment_idx']}_label_{segment['primary_label']}.pt"
+                / f"{segment['primary_label']}_{Path(row['filename']).stem}_segment_{segment['segment_idx']}.pt"
             )
 
             # Save the spectrogram tensor
             torch.save(segment["spectrogram"], segment_path)
 
-        return row["filename"], True, None
+            # Create metadata entry
+            metadata.append(
+                {
+                    "audio_file": str(row["filename"]),
+                    "segment_file": str(segment_path.relative_to(dst_folder)),
+                    "segment_idx": segment["segment_idx"],
+                    "primary_label": segment["primary_label"],
+                    "signal_power": segment["signal_power"],
+                    "noise_power": segment["noise_power"],
+                    "snr_db": segment["snr_db"],
+                    "rating": segment["rating"],
+                    "silence_pct": segment["silence_pct"],
+                    "is_padded": segment["is_padded"],
+                    "processing_time": avg_processing_time,
+                    "success": True,
+                    "error": None,
+                    "n_segments": n_segments,
+                }
+            )
+
+        return row["filename"], True, None, metadata
     except Exception as e:
         logger.error(f"Error processing {row['filename']}: {e}")
-        return row["filename"], False, str(e)
+        # Create metadata entry for failed file
+        metadata = [
+            {
+                "audio_file": str(row["filename"]),
+                "segment_file": None,
+                "segment_idx": -1,
+                "primary_label": row.get("primary_label", None),
+                "signal_power": None,
+                "noise_power": None,
+                "snr_db": None,
+                "rating": row.get("rating", None),
+                "silence_pct": None,
+                "is_padded": None,
+                "processing_time": None,
+                "success": False,
+                "error": str(e),
+                "n_segments": 0,
+            }
+        ]
+        return row["filename"], False, str(e), metadata
 
 
 def generate_spectrograms_whole_dataset(
@@ -105,8 +170,8 @@ def generate_spectrograms_whole_dataset(
     dst_folder: Path,
     cfg: CFG,
     n_workers: Optional[int] = None,
-) -> Tuple[bool, List[Tuple[str, str]]]:
-    """Generate spectrograms from audio files in parallel.
+) -> Tuple[bool, List[Tuple[str, str]], pd.DataFrame]:
+    """Generate spectrograms from audio files in parallel and create metadata.
 
     Args:
         df: DataFrame containing file information
@@ -116,7 +181,7 @@ def generate_spectrograms_whole_dataset(
         n_workers: Number of worker processes (defaults to CPU count - 1)
 
     Returns:
-        Tuple of (success, failed_files)
+        Tuple of (success, failed_files, metadata_df)
     """
     logger.info("Generating mel spectrograms from audio files...")
     start_time = time.time()
@@ -132,8 +197,9 @@ def generate_spectrograms_whole_dataset(
     # Prepare arguments for each file
     process_args = [(row, src_folder, dst_folder) for _, row in df.iterrows()]
 
-    # Track failed files
+    # Track failed files and collect metadata
     failed_files = []
+    all_metadata = []
 
     # Process files in parallel with process initialization
     try:
@@ -154,10 +220,20 @@ def generate_spectrograms_whole_dataset(
         logger.error(f"Error in parallel processing: {e}")
         raise
 
-    # Process results to track failed files
-    for filename, success, error in results:
+    # Process results to track failed files and collect metadata
+    for filename, success, error, metadata in results:
         if not success:
             failed_files.append((filename, error))
+        else:
+            all_metadata.extend(metadata)
+
+    # Create metadata DataFrame
+    metadata_df = pd.DataFrame(all_metadata)
+
+    # Save metadata to CSV
+    metadata_path = dst_folder / "metadata.csv"
+    metadata_df.to_csv(metadata_path, index=False)
+    logger.info(f"Saved metadata to {metadata_path}")
 
     # Save failed files information
     if failed_files:
@@ -185,24 +261,24 @@ def generate_spectrograms_whole_dataset(
     end_time = time.time()
     logger.info(f"Processing completed in {end_time - start_time:.1f} seconds")
 
-    return True
+    return True, failed_files, metadata_df
 
 
 if __name__ == "__main__":
     cfg = CFG()
+    cfg.update_machine_settings(machine="local")
     set_seed(cfg.seed)
-    train_df = pd.read_csv(cfg.train_csv)
-    # train_df = train_df.head(3)
+    train_df = pd.read_csv(cfg.dirs.train_csv)
+    # train_df = train_df.head(1000)  # Uncomment for testing with a small subset
 
-    src_folder = cfg.DATA_ROOT / "train_audio_no_voice"
-    dst_folder = cfg.DATA_ROOT / "train_audio_no_voice_spectrograms"
-    GENERATE_SPECTROGRAMS = True
-    if GENERATE_SPECTROGRAMS:
-        success = generate_spectrograms_whole_dataset(
-            train_df,
-            src_folder,
-            dst_folder,
-            cfg,
-            # n_workers=1  # mp.cpu_count(),
-        )
-        logger.info(f"Success: {success}")
+    src_folder = cfg.dirs.DATA_ROOT / "train_audio_no_voice"
+    dst_folder = cfg.dirs.DATA_ROOT / "train_audio_no_voice_spectrograms"
+    success, failed_files, metadata_df = generate_spectrograms_whole_dataset(
+        train_df,
+        src_folder,
+        dst_folder,
+        cfg,
+        n_workers=12,  # Uncomment to use single worker for debugging
+    )
+    logger.info(f"Success: {success}")
+    logger.info(f"Metadata shape: {metadata_df.shape}")

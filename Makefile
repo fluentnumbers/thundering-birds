@@ -1,4 +1,4 @@
-.PHONY: download_kaggle_dataset clean_data setup install clean_logs
+.PHONY: download_kaggle_dataset clean_data setup install clean_logs train
 
 # Default target
 all: setup install download_kaggle_dataset
@@ -41,3 +41,9 @@ help:
 
 freeze:
 	poetry export --without-hashes --format=requirements.txt > requirements.txt
+
+train:
+	python src/train_notebook.py
+
+visualize_metadata:
+	python src/analysis/visualize_metadata.py

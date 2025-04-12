@@ -114,7 +114,9 @@ class CFG:
         ).as_posix()
         self.dirs.train_csv = (self.dirs.DATA_ROOT / "train.csv").as_posix()
         self.dirs.taxonomy_csv = (self.dirs.DATA_ROOT / "taxonomy.csv").as_posix()
-        self.dirs.cache_dir = (self.dirs.DATA_ROOT / "cache").as_posix()
+        self.dirs.cache_dir = (
+            self.dirs.DATA_ROOT / "train_audio_no_voice_spectrograms"
+        ).as_posix()
         self.dirs.submission_csv = (
             self.dirs.DATA_ROOT / "sample_submission.csv"
         ).as_posix()
