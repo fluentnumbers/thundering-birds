@@ -40,12 +40,12 @@ class CFG:
     training = EasyDict()
     training.DEBUG = True if device == "cpu" else False
     training.EPOCHS = 20
-    training.MAX_CACHE_MEMORY_GB = 0 if device == "cuda" else 5.0
-    training.PREFETCH_FACTOR = 10 if device == "cuda" else 2
+    training.PREFETCH_FACTOR = None
     training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = None
     training.N_FOLD = 5
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
-    training.NUM_WORKERS = 4
+    training.NUM_WORKERS = 0
+    training.SAMPLES_PER_EPOCH = 10000
     training.SAVE_INTERMEDIATE_MODEL = True
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
@@ -62,9 +62,10 @@ class CFG:
 
     def update_debug_settings(self):
         if self.training.DEBUG:
-            self.training.DEBUG_N_CLASSES = 3
-            self.training.EPOCHS = 30
-            # self.training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
+            self.training.DEBUG_N_CLASSES = 4
+            self.training.EPOCHS = 2
+            self.training.SAMPLES_PER_EPOCH = 500
+            # self.training.SELECTED_FOLDS = [4]
 
     model = EasyDict()
     model.model_name = "efficientnet-b0"

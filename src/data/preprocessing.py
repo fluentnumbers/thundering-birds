@@ -173,6 +173,7 @@ def process_audio_file(
                     "segment_idx": segment_idx,
                     "filename": row.filename,
                     "primary_label": row.primary_label,
+                    "secondary_labels": row.secondary_labels,
                     "signal_power": signal_power.item(),
                     "noise_power": noise_power.item(),
                     "snr_db": snr_db if isinstance(snr_db, float) else snr_db.item(),
