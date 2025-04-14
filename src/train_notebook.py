@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from dotenv import load_dotenv
 from sklearn.metrics import f1_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -27,6 +27,7 @@ from tqdm.auto import tqdm
 from src.config import CFG, set_seed
 from src.data.dataset import BirdCLEFDataset, collate_fn, load_segments_info
 from src.models.birdclef_model import BirdCLEFModel
+from src.training.losses import AsymmetricLossMultiLabel
 from src.utils.logger import WandbLogger, setup_logger
 
 # Add at the beginning of your script, before any PyTorch imports
@@ -98,6 +99,15 @@ def get_criterion(cfg):
 
     if cfg.training.CRITERION == "BCEWithLogitsLoss":
         criterion = nn.BCEWithLogitsLoss()
+    elif cfg.training.CRITERION == "AsymmetricLossMultiLabel":
+        criterion = AsymmetricLossMultiLabel(
+            gamma_neg=4,
+            gamma_pos=1,
+            clip=0.05,
+            eps=1e-8,
+            disable_torch_grad_focal_loss=False,
+            reduction="mean",
+        )
     else:
         raise NotImplementedError(f"Criterion {cfg.training.CRITERION} not implemented")
 
@@ -362,6 +372,40 @@ def validate(model, loader, criterion, device, cfg):
     return avg_loss, metrics
 
 
+def get_folds(df, cfg):
+    # Groups are audio files (recordings)
+    groups = df["filename"]  # Each recording is a group
+    # Labels for stratification
+    labels = df["primary_label"]
+
+    # Initialize the splitter
+    skf = StratifiedGroupKFold(
+        n_splits=cfg.training.N_FOLD, shuffle=True, random_state=cfg.seed
+    )
+
+    # Get fold indices
+    folds = []
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df, labels, groups)):
+        # Verify no data leakage
+        train_files = set(df.iloc[train_idx]["filename"])
+        val_files = set(df.iloc[val_idx]["filename"])
+        assert (
+            len(train_files & val_files) == 0
+        ), f"Data leakage detected in fold {fold}"
+
+        # Verify class distribution
+        train_dist = df.iloc[train_idx]["primary_label"].value_counts(normalize=True)
+        val_dist = df.iloc[val_idx]["primary_label"].value_counts(normalize=True)
+
+        logger.info(f"\nFold {fold}:")
+        logger.info(f"Train: {len(train_idx)} segments from {len(train_files)} files")
+        logger.info(f"Val: {len(val_idx)} segments from {len(val_files)} files")
+
+        folds.append((train_idx, val_idx))
+
+    return folds
+
+
 def run_training(cfg):
     """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
     # Create run directory with timestamp
@@ -371,7 +415,7 @@ def run_training(cfg):
     logger.info(f"Starting training run in {run_dir}")
 
     # Initialize wandb group for all folds
-    wandb_group = f"train_{cfg.device.upper()}_{timestamp}"
+    wandb_group = f"train_{'DEBUG' if cfg.training.DEBUG else ''}_{cfg.device.upper()}_{timestamp}"
 
     # Load training data
     logger.info("Loading training data...")
@@ -405,19 +449,13 @@ def run_training(cfg):
             lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
         )
 
-    skf = StratifiedKFold(
-        n_splits=cfg.training.N_FOLD,
-        shuffle=True,
-        random_state=cfg.seed,
-    )
-
-    verify_class_distribution(df, skf, logger)
+    folds = get_folds(df, cfg)
     best_scores = []
 
     # Initialize gradient scaler for mixed precision training if using GPU
     scaler = torch.amp.GradScaler() if cfg.device == "cuda" else None
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
+    for fold, (train_idx, val_idx) in enumerate(folds):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
 
@@ -427,7 +465,12 @@ def run_training(cfg):
             f"fold_{fold}",
             run_dir,
             group=wandb_group,
-            tags=[f"fold_{fold}"],
+            tags=[
+                f"fold_{fold}",
+                f"n_classes_{cfg.num_classes}",
+                f"{'DEBUG' if cfg.training.DEBUG else ''}",
+                f"{cfg.device.upper()}",
+            ],
             config={
                 "batch_size": cfg.training.BATCH_SIZE,
                 "learning_rate": cfg.training.LR,

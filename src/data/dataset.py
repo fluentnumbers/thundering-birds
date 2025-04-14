@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import random
 import threading
 import time
 from pathlib import Path
@@ -58,6 +59,7 @@ class BirdCLEFDataset(Dataset):
         self.label_to_idx = {label: idx for idx, label in enumerate(self.class_ids)}
         self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
         self.classes_present_in_df = self.df["primary_label"].unique().tolist()
+        self.sample_weights_by_rating = (df["rating"].values + 1) / 6
 
         # Initialize sample usage tracking
         self.sample_usage = {}  # Regular dictionary
@@ -162,6 +164,12 @@ class BirdCLEFDataset(Dataset):
             logger.warning(f"Failed to load segment from {cache_path}: {e}")
             spectrogram = torch.zeros((1, 224, 224), dtype=torch.float32)
 
+        if (
+            self.mode == "train"
+            and random.random() < self.cfg.training.AUGMENTATION_PROB
+        ):
+            spectrogram = self.apply_spec_augmentations(spectrogram)
+
         # Create target vector
         target = torch.zeros(self.num_classes, dtype=torch.float32)
         target[class_idx] = 1.0
@@ -172,6 +180,34 @@ class BirdCLEFDataset(Dataset):
             "class_label": class_label,
             "segment_idx": segment_idx,
         }
+
+    def apply_spec_augmentations(self, spec):
+        """Apply augmentations to spectrogram"""
+
+        # Time masking (horizontal stripes)
+        if random.random() < 0.5:
+            num_masks = random.randint(1, 3)
+            for _ in range(num_masks):
+                width = random.randint(5, 20)
+                start = random.randint(0, spec.shape[2] - width)
+                spec[0, :, start : start + width] = 0
+
+        # Frequency masking (vertical stripes)
+        if random.random() < 0.5:
+            num_masks = random.randint(1, 3)
+            for _ in range(num_masks):
+                height = random.randint(5, 20)
+                start = random.randint(0, spec.shape[1] - height)
+                spec[0, start : start + height, :] = 0
+
+        # Random brightness/contrast
+        if random.random() < 0.5:
+            gain = random.uniform(0.8, 1.2)
+            bias = random.uniform(-0.1, 0.1)
+            spec = spec * gain + bias
+            spec = torch.clamp(spec, 0, 1)
+
+        return spec
 
     def set_epoch(self, epoch):
         """Set random seed for this epoch and reset usage tracking"""

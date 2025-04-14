@@ -41,6 +41,7 @@ class CFG:
     training.DEBUG = True if device == "cpu" else False
     training.EPOCHS = 20
     training.PREFETCH_FACTOR = None
+    training.AUGMENTATION_PROB = 0
     training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = None
     training.N_FOLD = 5
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
@@ -56,14 +57,16 @@ class CFG:
     training.LR = 5e-4
     training.WEIGHT_DECAY = 1e-5
     training.SCHEDULER = "CosineAnnealingLR"
-    training.CRITERION = "BCEWithLogitsLoss"
+    training.CRITERION = (
+        "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss
+    )
     training.MIN_LR = 1e-6
     training.T_MAX = training.EPOCHS
 
     def update_debug_settings(self):
         if self.training.DEBUG:
             self.training.DEBUG_N_CLASSES = 4
-            self.training.EPOCHS = 2
+            self.training.EPOCHS = 20
             self.training.SAMPLES_PER_EPOCH = 500
             # self.training.SELECTED_FOLDS = [4]
 
