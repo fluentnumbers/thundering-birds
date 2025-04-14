@@ -13,7 +13,6 @@ import torchaudio
 from tqdm import tqdm
 
 from src.data.preprocessing import process_audio_file
-from src.data.voice_removal import SileroVADRemover
 from src.train_notebook import CFG, set_seed
 from src.utils.logger import setup_logger
 

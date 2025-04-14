@@ -19,6 +19,8 @@ logger.setLevel(logging.DEBUG)
 # Get FFmpeg path from ffdl installation
 FFMPEG_PATH = Path(user_data_dir("ffmpeg-downloader")) / "ffmpeg" / "bin" / "ffmpeg.exe"
 FFMPEG_PATH = Path(rf"C:\Users\andre\scoop\apps\ffmpeg\current\bin\ffmpeg.exe")
+# FFMPEG_PATH = Path("/usr/bin/ffmpeg")
+
 if not FFMPEG_PATH.exists():
     raise RuntimeError(
         f"FFmpeg not found at {FFMPEG_PATH}. Please run 'ffdl install' first."
