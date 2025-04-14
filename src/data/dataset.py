@@ -42,9 +42,9 @@ def load_segments_info(cfg):
         raise ValueError(f"Expected 206 unique classes, but found {unique_classes}")
 
     # Log statistics about the filtered dataset
-    logger.info(
-        f"After filtering segmetns metadata: {len(df_cache)} segments from {df_cache['audio_file'].nunique()} files and {df_cache['primary_label'].nunique()} classes"
-    )
+    # logger.info(
+    # f"After filtering segments metadata: {len(df_cache)} segments from {df_cache['audio_file'].nunique()} files and {df_cache['primary_label'].nunique()} classes"
+    # )
 
     return df_cache
 
@@ -64,6 +64,7 @@ class BirdCLEFDataset(Dataset):
         # Initialize sample usage tracking
         self.sample_usage = {}  # Regular dictionary
         self.current_epoch = 0
+        self.sample_usage[0] = {}  # Initialize dictionary for epoch 0
 
         self.cache_dir = Path(self.cfg.dirs.cache_dir)
         # loading prefiltered metadata about cached segments
@@ -147,6 +148,8 @@ class BirdCLEFDataset(Dataset):
 
         # Track sample usage
         sample_key = f"{class_label}_{segment_idx}"
+        if self.current_epoch not in self.sample_usage:
+            self.sample_usage[self.current_epoch] = {}
         if sample_key not in self.sample_usage[self.current_epoch]:
             self.sample_usage[self.current_epoch][sample_key] = 0
         self.sample_usage[self.current_epoch][sample_key] += 1
@@ -264,9 +267,15 @@ class BirdCLEFDataset(Dataset):
 
     def log_usage_stats(self, epoch=None):
         """Log detailed usage statistics for an epoch"""
+        if epoch is not None and epoch not in self.sample_usage:
+            logger.warning(
+                f"Epoch {epoch} has not been initialized yet. Call set_epoch({epoch}) first."
+            )
+            return
+
         stats = self.get_usage_stats(epoch)
         if stats is None:
-            logger.warning(f"No usage statistics available for epoch {epoch}")
+            logger.warning(f"No samples have been processed for epoch {epoch} yet")
             return
 
         logger.info(f"\n{'='*50}")
