@@ -1,11 +1,13 @@
 import gc
 import json
-import multiprocessing as mp
 import os
+import random
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
@@ -16,280 +18,295 @@ from src.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+def load_segments_info(cfg):
+    """Load and filter metadata for audio segments.
+
+    Args:
+        cfg: Configuration object with paths and settings
+
+    Returns:
+        DataFrame containing filtered metadata for audio segments
+    """
+    df_cache = pd.read_csv(Path(cfg.dirs.cache_dir) / "metadata.csv")
+    # Convert snr_db to numeric, coercing errors to NaN
+    df_cache["snr_db"] = pd.to_numeric(df_cache["snr_db"], errors="coerce")
+
+    df_cache = df_cache[df_cache["silence_pct"] < 100]
+    df_cache = df_cache[~df_cache["rating"].isin([0.5, 1.0, 1.5])]
+    df_cache = df_cache[df_cache["signal_power"] > 0.01]
+    df_cache = df_cache[df_cache["snr_db"] > 0]
+
+    # Assert that we have the expected number of classes (206)
+    unique_classes = df_cache["primary_label"].nunique()
+    if unique_classes != 206:
+        raise ValueError(f"Expected 206 unique classes, but found {unique_classes}")
+
+    # Log statistics about the filtered dataset
+    # logger.info(
+    # f"After filtering segments metadata: {len(df_cache)} segments from {df_cache['audio_file'].nunique()} files and {df_cache['primary_label'].nunique()} classes"
+    # )
+
+    return df_cache
+
+
 class BirdCLEFDataset(Dataset):
     def __init__(self, df, cfg, species_ids, mode="train"):
         self.df = df
         self.cfg = cfg
         self.mode = mode
-        self.species_ids = species_ids
-        self.num_classes = len(self.species_ids)
-        self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
+        self.class_ids = species_ids
+        self.num_classes = len(self.class_ids)
+        self.label_to_idx = {label: idx for idx, label in enumerate(self.class_ids)}
+        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
+        self.classes_present_in_df = self.df["primary_label"].unique().tolist()
+        self.sample_weights_by_rating = (df["rating"].values + 1) / 6
 
-        # Memory management settings
-        self.max_memory_gb = cfg.training.MAX_CACHE_MEMORY_GB
-        self.current_memory_usage = mp.Value("d", 0.0)  # Shared memory counter
-        self.files_in_memory = mp.Manager().dict()  # Shared dictionary
-        self.segments_loaded_this_epoch = (
-            mp.Manager().list()
-        )  # Shared list (used as set)
+        # Initialize sample usage tracking
+        self.sample_usage = {}  # Regular dictionary
+        self.current_epoch = 0
+        self.sample_usage[0] = {}  # Initialize dictionary for epoch 0
 
-        if "filepath" not in self.df.columns:
-            self.df["filepath"] = self.cfg.dirs.train_datadir + "/" + self.df.filename
-
-        if "samplename" not in self.df.columns:
-            self.df["samplename"] = self.df.filename.map(
-                lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
-            )
-
-        # Create cache directory using config path
         self.cache_dir = Path(self.cfg.dirs.cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # loading prefiltered metadata about cached segments
+        self.metadata_df = load_segments_info(self.cfg)
 
-        # Initialize file segments tracking
-        self.total_segments = 0
-        self.file_indices = []  # List of (filename, segment_idx) pairs
+        # df maybe train or test set,  so, first keep only files that are present in the metadata (not completely filtered out due to low SNR, etc.)
+        self.df = self.df[self.df["filename"].isin(self.metadata_df["audio_file"])]
+        self.df = self.df.reset_index(drop=True)
 
-        # Vectorized check for cache existence
-        cache_paths = {
-            row["filename"]: self._get_cache_path(row["filename"])
-            for _, row in self.df.iterrows()
-        }
-        cache_exists = {
-            filename: path.exists() for filename, path in cache_paths.items()
-        }
-        logger.info(
-            f"Cache exists for {sum(cache_exists.values())} files out of {len(self.df)}"
+        # now remove metadata rows, which represent files which are not in the df
+        self.metadata_df = self.metadata_df[
+            self.metadata_df["audio_file"].isin(self.df["filename"].unique())
+        ]
+        self.metadata_df = self.metadata_df.reset_index(drop=True)
+        self.metadata_df["index"] = range(len(self.metadata_df))
+
+        self.metadata_df["cache_path"] = self.metadata_df["segment_file"].map(
+            lambda x: Path(self.cache_dir / x)
         )
 
-        # Create or load cache status file
-        cache_status_file = self.cache_dir / f"cache_status_full.json"
-        CACHE_LOADED = False
-        if cache_status_file.exists():
-            # Load existing cache status
-            with open(cache_status_file, "r") as f:
-                cache_status = json.load(f)
+        self.metadata_lookup_files = {}
+        self.metadata_lookup_classes = {}
 
-            # Update file_indices from cache status
-            for _, row in self.df.iterrows():
-                filename = row["filename"]
-                if filename in cache_status and cache_exists[filename]:
-                    num_segments = cache_status[filename]["num_segments"]
-                    self.file_indices.extend(
-                        [(filename, i) for i in range(num_segments)]
-                    )
-                    self.total_segments += num_segments
-            CACHE_LOADED = True
-
-        cached_files = []
-        files_to_process = []
-        if not CACHE_LOADED:
-            cache_status = {}
-            # Split files into cached and to-process
-            time_start = time.time()
-
-            for _, row in tqdm(
-                self.df.iterrows(),
-                total=len(self.df),
-                desc="Loading cached files",
-                unit="file",
-            ):
-                filename = row["filename"]
-                if cache_exists[filename]:
-                    try:
-                        # Load just the first segment to get the count
-                        segments = torch.load(cache_paths[filename])
-                        self.total_segments += len(segments)
-                        self.file_indices.extend(
-                            [(filename, i) for i in range(len(segments))]
-                        )
-                        cached_files.append(filename)
-                        cache_status[filename] = {
-                            "num_segments": len(segments),
-                            "last_modified": os.path.getmtime(cache_paths[filename]),
-                            "primary_label": row["primary_label"],
-                        }
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to load cache for {cache_paths[filename]}, will reprocess: {e}"
-                        )
-                        files_to_process.append((filename, row, self.cfg))
-                else:
-                    files_to_process.append((filename, row, self.cfg))
-
-        if not files_to_process:
-            logger.info(
-                f"All files for mode {self.mode} are already cached, no processing needed"
-            )
-            return
-
-        logger.info(
-            f"Processing {len(files_to_process)} files out of {len(self.df)} total files"
-        )
-        time_start = time.time()
-        with mp.Pool(
-            processes=min(self.cfg.preprocessing.NUM_WORKERS, mp.cpu_count())
-        ) as pool:
-            # Process files in batches to manage memory
-            batch_size = 100
-            for i in range(0, len(files_to_process), batch_size):
-                batch = files_to_process[i : i + batch_size]
-                results = list(
-                    tqdm(
-                        pool.imap(process_file_worker, batch),
-                        total=len(batch),
-                        desc=f"Processing batch {i//batch_size + 1}/{(len(files_to_process) + batch_size - 1)//batch_size}",
-                        unit=f"{batch_size} files",
-                    )
-                )
-
-                # Save results and update indices
-                for filename, segments in results:
-                    if segments:  # Only process if we got valid segments
-                        # Save to cache
-                        self._save_to_cache(filename, segments)
-
-                        # Update total segments and indices
-                        self.total_segments += len(segments)
-                        self.file_indices.extend(
-                            [(filename, i) for i in range(len(segments))]
-                        )
-
-                # Clear memory after each batch
-                gc.collect()
-        logger.info(
-            f"Processed {len(files_to_process)} files in {time.time() - time_start:.1f}s"
-        )
-
-    def _get_cache_path(self, filename):
-        """Get the cache path for a file"""
-        # Extract class name from filename (part before first dash)
-        class_name = filename.split("/")[0]
-        # Create path with class subdirectory
-        return (
-            self.cache_dir
-            / class_name
-            / f"{Path(filename.replace('/', '-')).with_suffix('.pt')}"
-        )
-
-    def _load_from_cache(self, filename):
-        """Load segments from cache if available"""
-        cache_path = self._get_cache_path(filename)
-        if cache_path.exists():
-            try:
-                return torch.load(cache_path)
-            except Exception as e:
-                logger.warning(f"Failed to load cache for {cache_path}: {e}")
-                return None
-        return None
-
-    def _save_to_cache(self, filename, segments):
-        """Save segments to cache"""
-        cache_path = self._get_cache_path(filename)
-        # Create parent directory if it doesn't exist
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            torch.save(segments, cache_path)
-        except Exception as e:
-            logger.warning(f"Failed to save cache for {cache_path}: {e}")
-
-    def _estimate_segment_memory(self, segments):
-        """Estimate memory usage of segments in bytes"""
-        total_bytes = 0
-        for segment in segments:
-            if isinstance(segment, dict) and "spectrogram" in segment:
-                total_bytes += (
-                    segment["spectrogram"].element_size()
-                    * segment["spectrogram"].nelement()
-                )
-        return total_bytes
-
-    def _load_segments_to_memory(self, filename):
-        """Load segments into memory if possible"""
-        if filename in self.files_in_memory:
-            return self.files_in_memory[filename][0]
-
-        segments = self._load_from_cache(filename)
-        if segments is None:
-            return None
-
-        # Estimate memory usage
-        segment_size = self._estimate_segment_memory(segments)
-
-        with self.current_memory_usage.get_lock():
-            if (
-                self.current_memory_usage.value + segment_size
-                <= self.max_memory_gb * 1024**3
-            ):
-                self.files_in_memory[filename] = (segments, segment_size)
-                self.current_memory_usage.value += segment_size
-                if filename not in self.segments_loaded_this_epoch:
-                    self.segments_loaded_this_epoch.append(filename)
-                return segments
-            else:
-                return segments
-
-    def cleanup_after_epoch(self):
-        """Clean up memory after each epoch"""
-        # Clear all segments from memory
-        self.files_in_memory.clear()
-        with self.current_memory_usage.get_lock():
-            self.current_memory_usage.value = 0
-        self.segments_loaded_this_epoch[:] = []  # Clear the list
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def __len__(self):
-        return self.total_segments
-
-    def __getitem__(self, idx):
-        # Get the file and segment index from our pre-computed list
-        filename, segment_idx = self.file_indices[idx]
-
-        # Try to get segments from memory or load them
-        segments = self._load_segments_to_memory(filename)
-        if segments is None:
-            logger.error(f"Failed to load segments for {filename}")
-            return {
-                "melspec": torch.zeros((1, 224, 224), dtype=torch.float32),
-                "target": torch.zeros(self.num_classes, dtype=torch.float32),
-                "filename": filename,
-                "segment_idx": 0,
+        # Build lookup for files
+        unique_files = self.metadata_df["audio_file"].unique()
+        for f in unique_files:
+            file_df = self.metadata_df[self.metadata_df["audio_file"] == f]
+            self.metadata_lookup_files[f] = {
+                "n_segments": len(file_df),
+                "indices": file_df["index"].tolist(),
+                "cache_paths": file_df["cache_path"].tolist(),
             }
 
-        segment = segments[segment_idx]
-        row = self.df[self.df["filename"] == filename].iloc[0]
+        # Build lookup for classes
+        for c in self.class_ids:
+            class_df = self.metadata_df[self.metadata_df["primary_label"] == c]
+            self.metadata_lookup_classes[c] = {
+                "n_segments": len(class_df),
+                "n_files": len(class_df["audio_file"].unique()),
+                "indices": class_df["index"].tolist(),
+                "files": class_df["audio_file"].unique().tolist(),
+                "cache_paths": class_df["cache_path"].tolist(),
+            }
 
-        target = self.encode_label(row["primary_label"])
+        # Set fixed number of samples per epoch
+        self.samples_per_epoch = cfg.training.SAMPLES_PER_EPOCH
+        if self.samples_per_epoch is None or self.samples_per_epoch > len(
+            self.metadata_df
+        ):
+            self.samples_per_epoch = len(self.metadata_df)
 
-        if "secondary_labels" in row and row["secondary_labels"] not in [
-            "[" "]",
-            "['']",
-            None,
-            np.nan,
-        ]:
-            if isinstance(row["secondary_labels"], str):
-                secondary_labels = eval(row["secondary_labels"])
-            else:
-                secondary_labels = row["secondary_labels"]
+        # Initialize random state for reproducibility
+        self.rng = np.random.RandomState(cfg.seed)
 
-            for label in secondary_labels:
-                if label in self.label_to_idx:
-                    target[self.label_to_idx[label]] = 1.0
+        # Pre-compute class weights for sampling
+        self.class_weights = np.ones(len(self.class_ids)) / len(self.class_ids)
+        # Create a mask for classes not present in the current dataset
+        mask = ~np.isin(self.class_ids, self.classes_present_in_df)
+        self.class_weights[mask] = 0
+        # Normalize weights to sum to 1
+        if self.class_weights.sum() > 0:
+            self.class_weights = self.class_weights / self.class_weights.sum()
+        else:
+            raise ValueError("No valid classes found in the dataset")
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __getitem__(self, idx):
+        # First sample a class uniformly
+        class_idx = self.rng.choice(len(self.class_ids), p=self.class_weights)
+        class_label = self.class_ids[class_idx]
+
+        # Get all segments for this class
+        class_info = self.metadata_lookup_classes[class_label]
+        n_segments = class_info["n_segments"]
+
+        # Sample a random segment from this class
+        segment_idx = self.rng.randint(0, n_segments)
+        cache_path = class_info["cache_paths"][segment_idx]
+
+        # Track sample usage
+        sample_key = f"{class_label}_{segment_idx}"
+        if self.current_epoch not in self.sample_usage:
+            self.sample_usage[self.current_epoch] = {}
+        if sample_key not in self.sample_usage[self.current_epoch]:
+            self.sample_usage[self.current_epoch][sample_key] = 0
+        self.sample_usage[self.current_epoch][sample_key] += 1
+
+        # Log if sample is used more than once
+        if self.sample_usage[self.current_epoch][sample_key] > 1:
+            logger.debug(
+                f"Sample {sample_key} used {self.sample_usage[self.current_epoch][sample_key]} times in epoch {self.current_epoch}"
+            )
+
+        # Load the segment
+        try:
+            spectrogram = torch.load(cache_path)
+        except Exception as e:
+            logger.warning(f"Failed to load segment from {cache_path}: {e}")
+            spectrogram = torch.zeros((1, 224, 224), dtype=torch.float32)
+
+        if (
+            self.mode == "train"
+            and random.random() < self.cfg.training.AUGMENTATION_PROB
+        ):
+            spectrogram = self.apply_spec_augmentations(spectrogram)
+
+        # Create target vector
+        target = torch.zeros(self.num_classes, dtype=torch.float32)
+        target[class_idx] = 1.0
 
         return {
-            "melspec": segment["spectrogram"],
-            "target": torch.tensor(target, dtype=torch.float32),
-            "filename": filename,
+            "melspec": spectrogram,
+            "target": target,
+            "class_label": class_label,
             "segment_idx": segment_idx,
         }
 
-    def encode_label(self, label):
-        """Encode label to one-hot vector"""
-        target = np.zeros(self.num_classes)
-        if label in self.label_to_idx:
-            target[self.label_to_idx[label]] = 1.0
-        return target
+    def apply_spec_augmentations(self, spec):
+        """Apply augmentations to spectrogram"""
+
+        # Time masking (horizontal stripes)
+        if random.random() < 0.5:
+            num_masks = random.randint(1, 3)
+            for _ in range(num_masks):
+                width = random.randint(5, 20)
+                start = random.randint(0, spec.shape[2] - width)
+                spec[0, :, start : start + width] = 0
+
+        # Frequency masking (vertical stripes)
+        if random.random() < 0.5:
+            num_masks = random.randint(1, 3)
+            for _ in range(num_masks):
+                height = random.randint(5, 20)
+                start = random.randint(0, spec.shape[1] - height)
+                spec[0, start : start + height, :] = 0
+
+        # Random brightness/contrast
+        if random.random() < 0.5:
+            gain = random.uniform(0.8, 1.2)
+            bias = random.uniform(-0.1, 0.1)
+            spec = spec * gain + bias
+            spec = torch.clamp(spec, 0, 1)
+
+        return spec
+
+    def set_epoch(self, epoch):
+        """Set random seed for this epoch and reset usage tracking"""
+        self.current_epoch = epoch
+        self.rng = np.random.RandomState(self.cfg.seed + epoch)
+        self.sample_usage[epoch] = {}  # Reset usage tracking for new epoch
+
+    def get_usage_stats(self, epoch=None):
+        """Get statistics about sample usage for a specific epoch or all epochs"""
+        if epoch is not None:
+            usage = dict(self.sample_usage.get(epoch, {}))  # Convert to regular dict
+            if not usage:
+                return None
+
+            # Initialize per-class statistics
+            class_stats = {}
+            for class_label in self.class_ids:
+                class_samples = {
+                    k: v for k, v in usage.items() if k.startswith(f"{class_label}_")
+                }
+                class_stats[class_label] = {
+                    "total_samples": len(class_samples),
+                    "unique_samples": len(set(class_samples.keys())),
+                    "max_usage": max(class_samples.values()) if class_samples else 0,
+                    "min_usage": min(class_samples.values()) if class_samples else 0,
+                    "avg_usage": (
+                        sum(class_samples.values()) / len(class_samples)
+                        if class_samples
+                        else 0
+                    ),
+                    "samples_used_once": sum(
+                        1 for v in class_samples.values() if v == 1
+                    ),
+                    "samples_used_multiple": sum(
+                        1 for v in class_samples.values() if v > 1
+                    ),
+                }
+
+            # Overall statistics
+            overall_stats = {
+                "total_samples": len(usage),
+                "unique_samples": len(set(usage.keys())),
+                "max_usage": max(usage.values()),
+                "min_usage": min(usage.values()),
+                "avg_usage": sum(usage.values()) / len(usage),
+                "samples_used_once": sum(1 for v in usage.values() if v == 1),
+                "samples_used_multiple": sum(1 for v in usage.values() if v > 1),
+                "class_stats": class_stats,
+            }
+
+            return overall_stats
+        else:
+            return {e: self.get_usage_stats(e) for e in self.sample_usage.keys()}
+
+    def log_usage_stats(self, epoch=None):
+        """Log detailed usage statistics for an epoch"""
+        if epoch is not None and epoch not in self.sample_usage:
+            logger.warning(
+                f"Epoch {epoch} has not been initialized yet. Call set_epoch({epoch}) first."
+            )
+            return
+
+        stats = self.get_usage_stats(epoch)
+        if stats is None:
+            logger.warning(f"No samples have been processed for epoch {epoch} yet")
+            return
+
+        logger.info(f"\n{'='*50}")
+        logger.info(
+            f"Usage Statistics for Epoch {epoch if epoch is not None else 'All'}"
+        )
+        logger.info(f"{'='*50}")
+
+        # Log overall statistics
+        logger.info("\nOverall Statistics:")
+        logger.info(f"Total samples used: {stats['total_samples']}")
+        logger.info(f"Unique samples: {stats['unique_samples']}")
+        logger.info(f"Max usage per sample: {stats['max_usage']}")
+        logger.info(f"Min usage per sample: {stats['min_usage']}")
+        logger.info(f"Avg usage per sample: {stats['avg_usage']:.2f}")
+        logger.info(f"Samples used once: {stats['samples_used_once']}")
+        logger.info(f"Samples used multiple times: {stats['samples_used_multiple']}")
+
+        # Log per-class statistics
+        logger.info("\nPer-Class Statistics:")
+        for class_label, class_stat in stats["class_stats"].items():
+            logger.info(f"\nClass: {class_label}")
+            logger.info(f"  Total samples: {class_stat['total_samples']}")
+            logger.info(f"  Unique samples: {class_stat['unique_samples']}")
+            logger.info(f"  Max usage: {class_stat['max_usage']}")
+            logger.info(f"  Min usage: {class_stat['min_usage']}")
+            logger.info(f"  Avg usage: {class_stat['avg_usage']:.2f}")
+            logger.info(f"  Used once: {class_stat['samples_used_once']}")
+            logger.info(f"  Used multiple: {class_stat['samples_used_multiple']}")
+
+        logger.info(f"{'='*50}\n")
 
 
 def process_file_worker(args):
@@ -307,6 +324,12 @@ def process_file_worker(args):
                             "spectrogram": torch.from_numpy(segment["spectrogram"]),
                             "filename": segment.get("filename", row["filename"]),
                             "segment_idx": segment.get("segment_idx", 0),
+                            "rating": segment.get("rating", float("nan")),
+                            "signal_power": segment.get("signal_power", float("nan")),
+                            "noise_power": segment.get("noise_power", float("nan")),
+                            "snr_db": segment.get("snr_db", float("nan")),
+                            "silence_pct": segment.get("silence_pct", 0),
+                            "is_padded": segment.get("is_padded", False),
                         }
                     )
                 else:
@@ -320,6 +343,12 @@ def process_file_worker(args):
         "spectrogram": torch.zeros((1, 224, 224), dtype=torch.float32),
         "filename": row["filename"],
         "segment_idx": 0,
+        "rating": float("nan"),
+        "signal_power": float("nan"),
+        "noise_power": float("nan"),
+        "snr_db": float("nan"),
+        "silence_pct": 0,
+        "is_padded": False,
     }
     return filename, [zero_segment]
 

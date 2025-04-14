@@ -40,12 +40,13 @@ class CFG:
     training = EasyDict()
     training.DEBUG = True if device == "cpu" else False
     training.EPOCHS = 20
-    training.MAX_CACHE_MEMORY_GB = 0 if device == "cuda" else 5.0
-    training.PREFETCH_FACTOR = 10 if device == "cuda" else 2
+    training.PREFETCH_FACTOR = None
+    training.AUGMENTATION_PROB = 0
     training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = None
     training.N_FOLD = 5
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
-    training.NUM_WORKERS = 4
+    training.NUM_WORKERS = 0
+    training.SAMPLES_PER_EPOCH = 10000
     training.SAVE_INTERMEDIATE_MODEL = True
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
@@ -56,15 +57,18 @@ class CFG:
     training.LR = 5e-4
     training.WEIGHT_DECAY = 1e-5
     training.SCHEDULER = "CosineAnnealingLR"
-    training.CRITERION = "BCEWithLogitsLoss"
+    training.CRITERION = (
+        "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss
+    )
     training.MIN_LR = 1e-6
     training.T_MAX = training.EPOCHS
 
     def update_debug_settings(self):
         if self.training.DEBUG:
-            self.training.DEBUG_N_CLASSES = 3
-            self.training.EPOCHS = 30
-            # self.training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
+            self.training.DEBUG_N_CLASSES = 4
+            self.training.EPOCHS = 20
+            self.training.SAMPLES_PER_EPOCH = 500
+            # self.training.SELECTED_FOLDS = [4]
 
     model = EasyDict()
     model.model_name = "efficientnet-b0"
@@ -114,7 +118,9 @@ class CFG:
         ).as_posix()
         self.dirs.train_csv = (self.dirs.DATA_ROOT / "train.csv").as_posix()
         self.dirs.taxonomy_csv = (self.dirs.DATA_ROOT / "taxonomy.csv").as_posix()
-        self.dirs.cache_dir = (self.dirs.DATA_ROOT / "cache").as_posix()
+        self.dirs.cache_dir = (
+            self.dirs.DATA_ROOT / "train_audio_no_voice_spectrograms"
+        ).as_posix()
         self.dirs.submission_csv = (
             self.dirs.DATA_ROOT / "sample_submission.csv"
         ).as_posix()

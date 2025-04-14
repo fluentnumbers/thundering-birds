@@ -5,6 +5,7 @@ import gc
 import json
 import multiprocessing as mp
 import os
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -16,16 +17,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import wandb
 from dotenv import load_dotenv
 from sklearn.metrics import f1_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.config import CFG, set_seed
-from src.data.dataset import BirdCLEFDataset, collate_fn
+from src.data.dataset import BirdCLEFDataset, collate_fn, load_segments_info
 from src.models.birdclef_model import BirdCLEFModel
+from src.training.losses import AsymmetricLossMultiLabel
+from src.training.metrics import (
+    analyze_class_performance,
+    calculate_class_metrics,
+    plot_class_metrics,
+    plot_confusion_matrix,
+)
 from src.utils.logger import WandbLogger, setup_logger
 
 # Add at the beginning of your script, before any PyTorch imports
@@ -97,6 +106,15 @@ def get_criterion(cfg):
 
     if cfg.training.CRITERION == "BCEWithLogitsLoss":
         criterion = nn.BCEWithLogitsLoss()
+    elif cfg.training.CRITERION == "AsymmetricLossMultiLabel":
+        criterion = AsymmetricLossMultiLabel(
+            gamma_neg=4,
+            gamma_pos=1,
+            clip=0.05,
+            eps=1e-8,
+            disable_torch_grad_focal_loss=False,
+            reduction="mean",
+        )
     else:
         raise NotImplementedError(f"Criterion {cfg.training.CRITERION} not implemented")
 
@@ -161,14 +179,60 @@ def log_memory_usage():
         )
 
 
+def verify_class_distribution(df, skf, logger):
+    """
+    Verify that all classes are present in both train and validation sets for each fold.
+
+    Args:
+        df: DataFrame containing the dataset
+        skf: StratifiedKFold object with the split configuration
+        logger: Logger object for output
+
+    Returns:
+        bool: True if all folds have the same classes in train and validation sets
+    """
+    all_folds_balanced = True
+    logger.info(
+        f"Total number of classes in dataset: {len(df['primary_label'].unique())}"
+    )
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
+        train_classes = set(df.iloc[train_idx]["primary_label"].unique())
+        val_classes = set(df.iloc[val_idx]["primary_label"].unique())
+
+        if train_classes != val_classes:
+            all_folds_balanced = False
+            missing_in_train = val_classes - train_classes
+            missing_in_val = train_classes - val_classes
+
+            logger.warning(f"Fold {fold_idx} has class distribution mismatch!")
+            if missing_in_train:
+                logger.warning(f"Classes missing in training set: {missing_in_train}")
+            if missing_in_val:
+                logger.warning(f"Classes missing in validation set: {missing_in_val}")
+    return all_folds_balanced
+
+
 def train_one_epoch(
-    model, loader, optimizer, criterion, device, scheduler=None, scaler=None, cfg=None
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device,
+    scheduler=None,
+    scaler=None,
+    cfg=None,
+    species_ids=None,
 ):
     model.train()
     losses = []
     all_targets = []
     all_outputs = []
-    log_memory_every_n_batches = cfg.training.LOG_MEMORY_USAGE_EVERY_N_BATCHES
+
+    # Initialize timing variables
+    data_loading_time = 0
+    training_time = 0
+    batch_times = []
 
     # Use gradient accumulation steps from config
     grad_accum_steps = cfg.training.GRAD_ACCUM_STEPS
@@ -178,12 +242,16 @@ def train_one_epoch(
 
     optimizer.zero_grad()  # Zero gradients at the start of epoch
 
-    # Log initial memory usage
-    log_memory_usage()
-
     for step, batch in pbar:
+        batch_start = time.time()
+
+        # Data loading
         inputs = batch["melspec"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
+        data_loading_time += time.time() - batch_start
+
+        # Training step
+        train_start = time.time()
 
         # Forward pass with mixed precision if using GPU
         if device == "cuda" and scaler is not None:
@@ -217,6 +285,9 @@ def train_one_epoch(
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+        training_time += time.time() - train_start
+        batch_times.append(time.time() - batch_start)
+
         outputs = outputs.detach().cpu().numpy()
         targets = targets.detach().cpu().numpy()
 
@@ -227,31 +298,19 @@ def train_one_epoch(
         all_targets.append(targets)
         losses.append(loss.item() * grad_accum_steps)  # Scale back the loss for logging
 
-        # Log memory usage and dataset stats every 10 batches
-        if (
-            log_memory_every_n_batches is not None
-            and step % min(len(loader), log_memory_every_n_batches) == 0
-        ):
-            # Log GPU memory if available
-            log_memory_usage()
-            # Log dataset memory usage and segment stats
-            dataset = loader.dataset
-            logger.info(
-                f"Memory usage: {dataset.current_memory_usage.value/1024**3:.2f}GB / {dataset.max_memory_gb}GB, "
-                f"Files in memory: {len(dataset.files_in_memory)}, "
-                f"Files loaded this epoch: {len(dataset.segments_loaded_this_epoch)}"
-            )
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
-            # Clear memory more frequently
-            gc.collect()
-            if device == "cuda":
-                torch.cuda.empty_cache()
-
+        # Update progress bar with timing info
         pbar.set_postfix(
             {
                 "train_loss": np.mean(losses[-10:]) if losses else 0,
                 "lr": optimizer.param_groups[0]["lr"],
                 "grad_accum": f"{step % grad_accum_steps + 1}/{grad_accum_steps}",
+                "data_time": f"{data_loading_time/(step+1):.3f}s",
+                "train_time": f"{training_time/(step+1):.3f}s",
+                "batch_time": f"{np.mean(batch_times[-10:]):.3f}s",
             }
         )
 
@@ -266,24 +325,28 @@ def train_one_epoch(
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
-    metrics = calculate_metrics(all_targets, all_outputs)
+
+    # Use enhanced metrics calculation
+    metrics = calculate_class_metrics(
+        all_targets, all_outputs, labels=species_ids, thresholds=None
+    )
+
+    # Calculate class distribution for analysis
+    class_distribution = {
+        label: np.sum(all_targets[:, i]) for i, label in enumerate(species_ids)
+    }
+    analysis = analyze_class_performance(metrics, species_ids, class_distribution)
+
     avg_loss = np.mean(losses)
 
-    # Clean up dataset memory after epoch
-    loader.dataset.cleanup_after_epoch()
-
-    # Log final memory usage for the epoch
-    log_memory_usage()
-
-    return avg_loss, metrics
+    return avg_loss, metrics, analysis
 
 
-def validate(model, loader, criterion, device, cfg):
+def validate(model, loader, criterion, device, cfg, species_ids=None):
     model.eval()
     losses = []
     all_targets = []
     all_outputs = []
-    log_memory_every_n_batches = cfg.training.LOG_MEMORY_USAGE_EVERY_N_BATCHES
 
     enumerate_loader = enumerate(loader)
     pbar = tqdm(enumerate_loader, desc="Validation", unit="batch", total=len(loader))
@@ -309,25 +372,57 @@ def validate(model, loader, criterion, device, cfg):
                 }
             )
 
-            # Log memory usage and dataset stats every 10 batches
-            if (
-                log_memory_every_n_batches is not None
-                and step % min(len(loader), log_memory_every_n_batches) == 0
-            ):
-                log_memory_usage()
-                dataset = loader.dataset
-                logger.info(
-                    f"Memory usage: {dataset.current_memory_usage.value/1024**3:.2f}GB / {dataset.max_memory_gb}GB, "
-                    f"Files in memory: {len(dataset.files_in_memory)}, "
-                    f"Files loaded this epoch: {len(dataset.segments_loaded_this_epoch)}"
-                )
-
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
-    metrics = calculate_metrics(all_targets, all_outputs)
+
+    # Use enhanced metrics calculation
+    metrics = calculate_class_metrics(
+        all_targets, all_outputs, labels=species_ids, thresholds=None
+    )
+
+    # Calculate class distribution for analysis
+    class_distribution = {
+        label: np.sum(all_targets[:, i]) for i, label in enumerate(species_ids)
+    }
+    analysis = analyze_class_performance(metrics, species_ids, class_distribution)
+
     avg_loss = np.mean(losses)
 
-    return avg_loss, metrics
+    return avg_loss, metrics, analysis
+
+
+def get_folds(df, cfg):
+    # Groups are audio files (recordings)
+    groups = df["filename"]  # Each recording is a group
+    # Labels for stratification
+    labels = df["primary_label"]
+
+    # Initialize the splitter
+    skf = StratifiedGroupKFold(
+        n_splits=cfg.training.N_FOLD, shuffle=True, random_state=cfg.seed
+    )
+
+    # Get fold indices
+    folds = []
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df, labels, groups)):
+        # Verify no data leakage
+        train_files = set(df.iloc[train_idx]["filename"])
+        val_files = set(df.iloc[val_idx]["filename"])
+        assert (
+            len(train_files & val_files) == 0
+        ), f"Data leakage detected in fold {fold}"
+
+        # Verify class distribution
+        train_dist = df.iloc[train_idx]["primary_label"].value_counts(normalize=True)
+        val_dist = df.iloc[val_idx]["primary_label"].value_counts(normalize=True)
+
+        logger.info(f"\nFold {fold}:")
+        logger.info(f"Train: {len(train_idx)} segments from {len(train_files)} files")
+        logger.info(f"Val: {len(val_idx)} segments from {len(val_files)} files")
+
+        folds.append((train_idx, val_idx))
+
+    return folds
 
 
 def run_training(cfg):
@@ -338,15 +433,13 @@ def run_training(cfg):
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Starting training run in {run_dir}")
 
-    # Log initial memory usage
-    log_memory_usage()
-
     # Initialize wandb group for all folds
-    wandb_group = f"train_{cfg.device.upper()}_{timestamp}"
+    wandb_group = f"train_{'DEBUG' if cfg.training.DEBUG else ''}_{cfg.device.upper()}_{timestamp}"
 
     # Load training data
     logger.info("Loading training data...")
     df = pd.read_csv(cfg.dirs.train_csv)
+    df_cache = load_segments_info(cfg)
 
     if cfg.training.DEBUG:
         cfg.update_debug_settings()
@@ -360,6 +453,11 @@ def run_training(cfg):
         logger.info(
             f"Filtered training data to {len(df)} audio files from {cfg.training.DEBUG_N_CLASSES} classes"
         )
+
+    df_cache = df_cache[df_cache["primary_label"].isin(df["primary_label"].unique())]
+    df = df[df["filename"].isin(set(df_cache["audio_file"]))]
+    df = df.reset_index(drop=True)
+
     species_ids = df["primary_label"].unique().tolist()
     cfg.num_classes = len(species_ids)
 
@@ -370,32 +468,28 @@ def run_training(cfg):
             lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
         )
 
-    skf = StratifiedKFold(
-        n_splits=cfg.training.N_FOLD,
-        shuffle=True,
-        random_state=cfg.seed,
-    )
-
+    folds = get_folds(df, cfg)
     best_scores = []
 
     # Initialize gradient scaler for mixed precision training if using GPU
     scaler = torch.amp.GradScaler() if cfg.device == "cuda" else None
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
+    for fold, (train_idx, val_idx) in enumerate(folds):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
 
         logger.info(f"\n{'='*30} Fold {fold} {'='*30}")
 
-        # Log memory usage at start of each fold
-        log_memory_usage()
-
-        # Initialize wandb run for this fold
         wandb_logger = WandbLogger(
             f"fold_{fold}",
             run_dir,
             group=wandb_group,
-            tags=[f"fold_{fold}"],
+            tags=[
+                f"fold_{fold}",
+                f"n_classes_{cfg.num_classes}",
+                f"{'DEBUG' if cfg.training.DEBUG else ''}",
+                f"{cfg.device.upper()}",
+            ],
             config={
                 "batch_size": cfg.training.BATCH_SIZE,
                 "learning_rate": cfg.training.LR,
@@ -409,6 +503,7 @@ def run_training(cfg):
                 "criterion": cfg.training.CRITERION,
                 "early_stopping_metric": cfg.training.EARLY_STOPPING_METRIC,
                 "early_stopping_patience": cfg.training.EARLY_STOPPING_PATIENCE,
+                "samples_per_epoch": cfg.training.SAMPLES_PER_EPOCH,
             },
         )
 
@@ -418,16 +513,14 @@ def run_training(cfg):
         logger.info(f"Training set: {len(train_df)} audio files")
         logger.info(f"Validation set: {len(val_df)} audio files")
 
-        # full_dataset = BirdCLEFDataset(df, cfg, species_ids, mode="full")
         train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
         val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
-        # raise ValueError("Stop here")
 
         # Create DataLoaders with proper worker configuration
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.training.BATCH_SIZE,
-            shuffle=True,
+            shuffle=False,  # We handle shuffling in the dataset
             num_workers=cfg.training.NUM_WORKERS,
             pin_memory=True,
             persistent_workers=False,
@@ -439,10 +532,10 @@ def run_training(cfg):
         val_loader = DataLoader(
             val_dataset,
             batch_size=cfg.training.BATCH_SIZE,
-            shuffle=False,
+            shuffle=False,  # We handle shuffling in the dataset
             num_workers=cfg.training.NUM_WORKERS,
             pin_memory=True,
-            persistent_workers=False,  # Disable persistent workers
+            persistent_workers=False,
             prefetch_factor=cfg.training.PREFETCH_FACTOR,
             collate_fn=collate_fn,
         )
@@ -474,10 +567,14 @@ def run_training(cfg):
         for epoch in range(cfg.training.EPOCHS):
             logger.info(f"Epoch {epoch+1}/{cfg.training.EPOCHS}")
 
+            # Set epoch for dataset to ensure proper shuffling
+            train_dataset.set_epoch(epoch)
+            val_dataset.set_epoch(epoch)
+
             # Log memory usage at start of each epoch
             log_memory_usage()
 
-            train_loss, train_metrics = train_one_epoch(
+            train_loss, train_metrics, train_analysis = train_one_epoch(
                 model,
                 train_loader,
                 optimizer,
@@ -486,10 +583,11 @@ def run_training(cfg):
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None,
                 scaler,
                 cfg,
+                species_ids,
             )
 
-            val_loss, val_metrics = validate(
-                model, val_loader, criterion, cfg.device, cfg
+            val_loss, val_metrics, val_analysis = validate(
+                model, val_loader, criterion, cfg.device, cfg, species_ids
             )
 
             if scheduler is not None and not isinstance(
@@ -500,25 +598,108 @@ def run_training(cfg):
                 else:
                     scheduler.step()
 
+            # Create visualizations
+            train_metrics_plot = plot_class_metrics(train_metrics, species_ids)
+            val_metrics_plot = plot_class_metrics(val_metrics, species_ids)
+            train_cm_img = plot_confusion_matrix(
+                train_metrics["confusion_matrix"], species_ids
+            )
+            val_cm_img = plot_confusion_matrix(
+                val_metrics["confusion_matrix"], species_ids
+            )
+
             # Log metrics to wandb with fold grouping
             wandb_logger.log(
                 {
                     "epoch": epoch + 1,
                     "fold": fold,
+                    # Loss metrics
                     "train_loss": train_loss,
-                    "train_auc": train_metrics["auc"],
-                    "train_f1": train_metrics["f1"],
                     "val_loss": val_loss,
-                    "val_auc": val_metrics["auc"],
-                    "val_f1": val_metrics["f1"],
+                    # Macro metrics
+                    "train_auc": train_metrics["macro_metrics"]["auc"],
+                    "train_f1": train_metrics["macro_metrics"]["f1"],
+                    "train_precision": train_metrics["macro_metrics"]["precision"],
+                    "train_recall": train_metrics["macro_metrics"]["recall"],
+                    "val_auc": val_metrics["macro_metrics"]["auc"],
+                    "val_f1": val_metrics["macro_metrics"]["f1"],
+                    "val_precision": val_metrics["macro_metrics"]["precision"],
+                    "val_recall": val_metrics["macro_metrics"]["recall"],
+                    # Top-k accuracy
+                    "train_top_k_accuracy": train_metrics["top_k_accuracy"],
+                    "val_top_k_accuracy": val_metrics["top_k_accuracy"],
+                    # Class size correlations
+                    "train_class_size_f1_correlation": train_analysis[
+                        "class_size_correlation"
+                    ]["f1"],
+                    "train_class_size_auc_correlation": train_analysis[
+                        "class_size_correlation"
+                    ]["auc"],
+                    "val_class_size_f1_correlation": val_analysis[
+                        "class_size_correlation"
+                    ]["f1"],
+                    "val_class_size_auc_correlation": val_analysis[
+                        "class_size_correlation"
+                    ]["auc"],
+                    # Learning rate
                     "learning_rate": (
                         scheduler.get_last_lr()[0] if scheduler else cfg.training.LR
                     ),
+                    # Visualizations
+                    "train_metrics_plot": train_metrics_plot,
+                    "val_metrics_plot": val_metrics_plot,
+                    "train_confusion_matrix": wandb.Image(train_cm_img),
+                    "val_confusion_matrix": wandb.Image(val_cm_img),
                 }
             )
 
+            # Log class-specific metrics
+            for label in species_ids:
+                wandb_logger.log(
+                    {
+                        f"train_{label}_precision": train_metrics["per_class"][label][
+                            "precision"
+                        ],
+                        f"train_{label}_recall": train_metrics["per_class"][label][
+                            "recall"
+                        ],
+                        f"train_{label}_f1": train_metrics["per_class"][label]["f1"],
+                        f"train_{label}_auc": train_metrics["per_class"][label]["auc"],
+                        f"train_{label}_support": train_metrics["per_class"][label][
+                            "support"
+                        ],
+                        f"val_{label}_precision": val_metrics["per_class"][label][
+                            "precision"
+                        ],
+                        f"val_{label}_recall": val_metrics["per_class"][label][
+                            "recall"
+                        ],
+                        f"val_{label}_f1": val_metrics["per_class"][label]["f1"],
+                        f"val_{label}_auc": val_metrics["per_class"][label]["auc"],
+                        f"val_{label}_support": val_metrics["per_class"][label][
+                            "support"
+                        ],
+                    }
+                )
+
+            # Log hard and easy classes
+            wandb_logger.log(
+                {
+                    "train_hard_classes": train_analysis["hard_classes"],
+                    "train_easy_classes": train_analysis["easy_classes"],
+                    "val_hard_classes": val_analysis["hard_classes"],
+                    "val_easy_classes": val_analysis["easy_classes"],
+                }
+            )
+
+            # Log dataset usage statistics
+            logger.info(f"\nDataset Usage Statistics for Epoch {epoch + 1}")
+            train_dataset.log_usage_stats(epoch=epoch + 1)
+
             # Check for early stopping
-            current_metric = val_metrics[cfg.training.EARLY_STOPPING_METRIC]
+            current_metric = val_metrics["macro_metrics"][
+                cfg.training.EARLY_STOPPING_METRIC
+            ]
             if current_metric > best_metric + cfg.training.EARLY_STOPPING_MIN_DELTA:
                 best_metric = current_metric
                 no_improvement_epochs = 0
@@ -552,10 +733,10 @@ def run_training(cfg):
                             scheduler.state_dict() if scheduler else None
                         ),
                         "epoch": epoch,
-                        "val_auc": val_metrics["auc"],
-                        "val_f1": val_metrics["f1"],
-                        "train_auc": train_metrics["auc"],
-                        "train_f1": train_metrics["f1"],
+                        "val_auc": val_metrics["macro_metrics"]["auc"],
+                        "val_f1": val_metrics["macro_metrics"]["f1"],
+                        "train_auc": train_metrics["macro_metrics"]["auc"],
+                        "train_f1": train_metrics["macro_metrics"]["f1"],
                         "cfg": cfg,
                     },
                     checkpoint_path,
@@ -578,14 +759,15 @@ def run_training(cfg):
                 break
 
         best_scores.append(
-            {"auc": val_metrics["auc"], "f1": val_metrics["f1"], "epoch": best_epoch}
+            {
+                "auc": val_metrics["macro_metrics"]["auc"],
+                "f1": val_metrics["macro_metrics"]["f1"],
+                "epoch": best_epoch,
+            }
         )
         logger.info(
-            f"Best metrics for fold {fold}: AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f} at epoch {best_epoch}"
+            f"Best metrics for fold {fold}: AUC: {val_metrics['macro_metrics']['auc']:.4f}, F1: {val_metrics['macro_metrics']['f1']:.4f} at epoch {best_epoch}"
         )
-
-        # Log memory usage at end of each fold
-        log_memory_usage()
 
         # Proper cleanup at the end of each fold
         del train_loader
