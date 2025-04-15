@@ -121,7 +121,8 @@ def get_criterion(cfg):
             primary_weight=cfg.training.PRIMARY_WEIGHT,
             secondary_weight=cfg.training.SECONDARY_WEIGHT,
         )
-
+    elif cfg.training.CRITERION == "CELoss":
+        criterion = nn.CrossEntropyLoss()
     else:
         raise NotImplementedError(f"Criterion {cfg.training.CRITERION} not implemented")
 
@@ -232,24 +233,49 @@ def train_one_epoch(
         if device == "cuda" and scaler is not None:
             with torch.cuda.amp.autocast():
                 outputs = model(inputs)
+                # Calculate base loss based on criterion type
+                if isinstance(criterion, HierarchicalBCELoss):
+                    primary_targets = batch["primary_target"].to(
+                        device, non_blocking=True
+                    )
+                    secondary_targets = batch["secondary_target"].to(
+                        device, non_blocking=True
+                    )
+                    base_loss = criterion(outputs, primary_targets, secondary_targets)
+                else:
+                    base_loss = criterion(outputs, targets)
 
-                # Calculate base loss per sample
-                base_loss = criterion(outputs, targets)
                 if len(base_loss.shape) == 2:
                     # If loss is per-class, take mean over classes first
                     base_loss = base_loss.mean(dim=1)
-                # Apply signal power weights to each sample's loss
-                loss = (base_loss * loss_correction).mean()
+                # Apply signal power weights to each sample's loss if enabled
+                loss = (
+                    (base_loss * loss_correction).mean()
+                    if cfg.training.CORRECT_LOSS
+                    else base_loss.mean()
+                )
                 loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
         else:
             outputs = model(inputs)
+            # Calculate base loss based on criterion type
+            if isinstance(criterion, HierarchicalBCELoss):
+                primary_targets = batch["primary_target"].to(device, non_blocking=True)
+                secondary_targets = batch["secondary_target"].to(
+                    device, non_blocking=True
+                )
+                base_loss = criterion(outputs, primary_targets, secondary_targets)
+            else:
+                base_loss = criterion(outputs, targets)
 
-            base_loss = criterion(outputs, targets)
             if len(base_loss.shape) == 2:
                 # If loss is per-class, take mean over classes first
                 base_loss = base_loss.mean(dim=1)
-            # Apply signal power weights to each sample's loss
-            loss = (base_loss * loss_correction).mean()
+            # Apply signal power weights to each sample's loss if enabled
+            loss = (
+                (base_loss * loss_correction).mean()
+                if cfg.training.CORRECT_LOSS
+                else base_loss.mean()
+            )
             loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
 
         # Backward pass with mixed precision if using GPU
@@ -271,7 +297,7 @@ def train_one_epoch(
         batch_times.append(time.time() - batch_start)
 
         outputs = outputs.detach().cpu().numpy()
-        targets = targets.detach().cpu().numpy()
+        targets = targets.detach().cpu().numpy()  # Use primary targets for metrics
 
         if scheduler is not None and isinstance(scheduler, lr_scheduler.OneCycleLR):
             scheduler.step()
@@ -348,11 +374,17 @@ def validate(model, loader, criterion, device, cfg, species_ids=None):
             targets = batch["target"].to(device)
 
             outputs = model(inputs)
-            if isinstance(outputs, tuple):
-                outputs, loss = outputs
+
+            # Calculate loss based on criterion type
+            if isinstance(criterion, HierarchicalBCELoss):
+                primary_targets = batch["primary_target"].to(device)
+                secondary_targets = batch["secondary_target"].to(device)
+                loss = criterion(outputs, primary_targets, secondary_targets)
             else:
-                # Calculate raw loss without weighting
                 loss = criterion(outputs, targets)
+
+            if isinstance(loss, torch.Tensor) and len(loss.shape) > 0:
+                loss = loss.mean()
 
             outputs = outputs.detach().cpu().numpy()
             targets = targets.detach().cpu().numpy()
@@ -495,9 +527,6 @@ def run_training(cfg):
 
         train_df = df.iloc[train_file_idx].reset_index(drop=True)
         val_df = df.iloc[val_file_idx].reset_index(drop=True)
-
-        logger.info(f"Training set: {len(train_df)} audio files")
-        logger.info(f"Validation set: {len(val_df)} audio files")
 
         train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
         val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
@@ -738,7 +767,7 @@ def run_training(cfg):
             else:
                 no_improvement_epochs += 1
                 logger.info(
-                    f"No improvement in {cfg.training.EARLY_STOPPING_METRIC} for {no_improvement_epochs} epochs"
+                    f"No improvement in {cfg.training.EARLY_STOPPING_METRIC} for {no_improvement_epochs} epochs (best value: {best_metric:.3f})"
                 )
 
             # Check for early stopping

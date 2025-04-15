@@ -47,6 +47,7 @@ class CFG:
     training.N_FOLD = 5
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
     training.SAMPLES_PER_EPOCH = 25000
+    training.CORRECT_LOSS = True
     training.SAVE_INTERMEDIATE_MODEL = True
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
@@ -57,9 +58,7 @@ class CFG:
     training.LR = 5e-4
     training.WEIGHT_DECAY = 1e-5
     training.SCHEDULER = "CosineAnnealingLR"
-    training.CRITERION = (
-        "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss
-    )
+    training.CRITERION = "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss HierarchicalBCELoss CELoss
     # label smoothing
     training.USE_LABEL_SMOOTHING = True
     training.PRIMARY_LABEL_SMOOTHING = 0.2  # primary label weight = 1 - smoothing

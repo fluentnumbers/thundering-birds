@@ -61,8 +61,15 @@ class BirdCLEFDataset(Dataset):
         self.class_weights = self.compute_class_weights()
         self.rng = np.random.RandomState(cfg.seed)
 
-        # Initialize sample usage tracking
+        # Initialize sample usage tracking with per-class locks
         self.current_epoch = 0
+        self._class_locks = {
+            class_label: threading.Lock() for class_label in self.class_ids
+        }
+
+        # Pre-generate permutations for each class
+        self._class_permutations = {}
+        self._class_permutation_indices = {}
 
         self.cache_dir = Path(self.cfg.dirs.cache_dir)
 
@@ -97,18 +104,20 @@ class BirdCLEFDataset(Dataset):
                 "cache_paths": file_df["cache_path"].tolist(),
             }
 
-        # Build lookup for classes
+        # Build lookup for classes and initialize permutations
         for c in self.class_ids:
             class_df = self.metadata_df[self.metadata_df["primary_label"] == c]
+            n_segments = len(class_df)
             self.metadata_lookup_classes[c] = {
-                "n_segments": len(class_df),
+                "n_segments": n_segments,
                 "n_files": len(class_df["filename"].unique()),
                 "indices": class_df["index"].tolist(),
                 "files": class_df["filename"].unique().tolist(),
                 "cache_paths": class_df["cache_path"].tolist(),
             }
-
-        # Initialize random state for reproducibility
+            # Initialize permutation for this class
+            self._class_permutation_indices[c] = 0
+            self._class_permutations[c] = self.rng.permutation(n_segments)
 
         # Create signal power lookup using normalized per-file values
         self.signal_power_lookup = dict(
@@ -135,6 +144,23 @@ class BirdCLEFDataset(Dataset):
             raise ValueError("No valid classes found in the dataset")
         return class_weights
 
+    def get_next_segment_idx(self, class_label):
+        """Get next segment index from the pre-generated permutation"""
+        with self._class_locks[class_label]:
+            idx = self._class_permutation_indices[class_label]
+            n_segments = self.metadata_lookup_classes[class_label]["n_segments"]
+
+            # If we've used all segments, generate new permutation
+            if idx >= n_segments:
+                self._class_permutations[class_label] = self.rng.permutation(n_segments)
+                idx = 0
+
+            # Get segment index from permutation
+            segment_idx = self._class_permutations[class_label][idx]
+            self._class_permutation_indices[class_label] = idx + 1
+
+            return segment_idx
+
     def __len__(self):
         return self.samples_per_epoch
 
@@ -151,8 +177,8 @@ class BirdCLEFDataset(Dataset):
             logger.error(f"No segments found for class {class_label}")
             return self._create_empty_sample(class_idx, class_label)
 
-        # Sample a random segment from this class
-        segment_idx = self.rng.randint(0, n_segments)
+        # Get next segment index from permutation
+        segment_idx = self.get_next_segment_idx(class_label)
         cache_path = class_info["cache_paths"][segment_idx]
         spectrogram = torch.load(cache_path)
 
@@ -162,14 +188,16 @@ class BirdCLEFDataset(Dataset):
         ):
             spectrogram = self.apply_spec_augmentations(spectrogram)
 
-        # Create smoothed target vector
-        target = self._create_targets(
+        # Create target vectors
+        primary_target, secondary_target, target = self._create_targets(
             self.metadata_df[self.metadata_df["cache_path"] == cache_path].iloc[0]
         )
 
         return {
             "melspec": spectrogram,
             "target": target,
+            "primary_target": primary_target,
+            "secondary_target": secondary_target,
             "class_label": class_label,
             "segment_idx": segment_idx,
             "signal_power_weight": self.signal_power_lookup.get(str(cache_path), 0.1),
@@ -178,11 +206,14 @@ class BirdCLEFDataset(Dataset):
     def _create_empty_sample(self, class_idx, class_label):
         """Create an empty sample with zeros when loading fails"""
         empty_spectrogram = torch.zeros((1, 224, 224), dtype=torch.float32)
-        target = torch.zeros(self.num_classes, dtype=torch.float32)
-        target[class_idx] = 1.0
+        primary_target = torch.zeros(self.num_classes, dtype=torch.float32)
+        primary_target[class_idx] = 1.0
+        secondary_target = torch.zeros(self.num_classes, dtype=torch.float32)
         return {
             "melspec": empty_spectrogram,
             "target": target,
+            "primary_target": primary_target,
+            "secondary_target": secondary_target,
             "class_label": class_label,
             "segment_idx": -1,
             "signal_power_weight": 0.1,  # minimum weight for failed samples
@@ -221,16 +252,13 @@ class BirdCLEFDataset(Dataset):
         segment_metadata,
     ):
         """
-        Create a target vector with label smoothing and secondary label weighting.
+        Create primary and secondary target vectors with label smoothing and weighting.
 
         Args:
-            primary_idx: Index of the primary label
-            secondary_labels: List of secondary labels
-            smoothing: Label smoothing factor (0.0 to disable)
-            secondary_weight: Weight for secondary labels
+            segment_metadata: Metadata for the current segment
 
         Returns:
-            torch.Tensor: Smoothed target vector
+            tuple: (primary_target, secondary_target, target) tensors
         """
         num_classes = self.num_classes
         primary_idx = self.label_to_idx[segment_metadata["primary_label"]]
@@ -243,20 +271,23 @@ class BirdCLEFDataset(Dataset):
             self.cfg.training.SECONDARY_LABEL_WEIGHT if self.mode == "train" else 0.0
         )
 
-        if not USE_SMOOTHING or self.mode != "train" or secondary_labels is None:
-            target = torch.zeros(num_classes, dtype=torch.float32)
-            target[primary_idx] = 1.0
-            return target
+        # Create primary target with label smoothing
+        if not USE_SMOOTHING or self.mode != "train":
+            primary_target = torch.zeros(num_classes, dtype=torch.float32)
+            primary_target[primary_idx] = 1.0
+        else:
+            # Initialize with small uniform distribution for smoothing
+            primary_target = torch.full(
+                (num_classes,),
+                primary_smoothing / (num_classes - 1),
+                dtype=torch.float32,
+            )
+            # Set primary label with smoothing
+            primary_target[primary_idx] = 1.0 - primary_smoothing
+        target = primary_target.clone()
 
-        # Initialize with small uniform distribution
-        target = torch.full(
-            (num_classes,), primary_smoothing / (num_classes - 1), dtype=torch.float32
-        )
-
-        # Set primary label
-        target[primary_idx] = 1.0 - primary_smoothing
-
-        # Add secondary labels if available
+        # Create secondary target
+        secondary_target = torch.zeros(num_classes, dtype=torch.float32)
         if secondary_labels and secondary_weight > 0:
             if isinstance(secondary_labels, str):
                 # Handle string format (e.g., "[label1,label2]")
@@ -269,13 +300,21 @@ class BirdCLEFDataset(Dataset):
             for label in secondary_labels:
                 if label in self.label_to_idx:
                     sec_idx = self.label_to_idx[label]
-                    if sec_idx != primary_idx:  # Don't add weight to primary label
+                    if (
+                        sec_idx != primary_idx
+                    ):  # Don't include primary label in secondary targets
+                        secondary_target[sec_idx] = secondary_weight
                         target[sec_idx] += secondary_weight
 
-        # Normalize to ensure sum is 1
-        target = target / target.sum()
+        # Normalize primary target to ensure sum is 1
+        if primary_target.sum() > 0:
+            primary_target = primary_target / primary_target.sum()
 
-        return target
+        # Normalize target to ensure sum is 1
+        if target.sum() > 0:
+            target = target / target.sum()
+
+        return primary_target, secondary_target, target
 
 
 def process_file_worker(args):
@@ -335,7 +374,9 @@ def collate_fn(batch):
             result[key].append(value)
 
     for key in result:
-        if key == "target" and isinstance(result[key][0], torch.Tensor):
+        if key in ["primary_target", "secondary_target", "target"] and isinstance(
+            result[key][0], torch.Tensor
+        ):
             result[key] = torch.stack(result[key])
         elif key == "melspec" and isinstance(result[key][0], torch.Tensor):
             shapes = [t.shape for t in result[key]]
