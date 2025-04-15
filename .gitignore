@@ -175,7 +175,7 @@ cython_debug/
 .cursor/
 custom_modes/
 memory-bank/
-
+.specstory/
 
 data/*
 data/**/*.ogg
