@@ -417,8 +417,8 @@ def get_folds(df, cfg):
         val_dist = df.iloc[val_idx]["primary_label"].value_counts(normalize=True)
 
         logger.info(f"\nFold {fold}:")
-        logger.info(f"Train: {len(train_idx)} segments from {len(train_files)} files")
-        logger.info(f"Val: {len(val_idx)} segments from {len(val_files)} files")
+        logger.info(f"Train: {len(train_files)} files")
+        logger.info(f"Val: {len(val_files)} files")
 
         folds.append((train_idx, val_idx))
 
@@ -474,6 +474,8 @@ def run_training(cfg):
     # Initialize gradient scaler for mixed precision training if using GPU
     scaler = torch.amp.GradScaler() if cfg.device == "cuda" else None
 
+    torch.backends.cudnn.benchmark = True
+
     for fold, (train_idx, val_idx) in enumerate(folds):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
@@ -487,7 +489,7 @@ def run_training(cfg):
             tags=[
                 f"fold_{fold}",
                 f"n_classes_{cfg.num_classes}",
-                f"{'DEBUG' if cfg.training.DEBUG else ''}",
+                f"{'DEBUG' if cfg.training.DEBUG else 'PROD'}",
                 f"{cfg.device.upper()}",
             ],
             config={
@@ -523,7 +525,9 @@ def run_training(cfg):
             shuffle=False,  # We handle shuffling in the dataset
             num_workers=cfg.training.NUM_WORKERS,
             pin_memory=True,
-            persistent_workers=False,
+            persistent_workers=(
+                True if cfg.training.NUM_WORKERS > 0 else False
+            ),  # Change to True
             prefetch_factor=cfg.training.PREFETCH_FACTOR,
             collate_fn=collate_fn,
             drop_last=True,
@@ -535,7 +539,9 @@ def run_training(cfg):
             shuffle=False,  # We handle shuffling in the dataset
             num_workers=cfg.training.NUM_WORKERS,
             pin_memory=True,
-            persistent_workers=False,
+            persistent_workers=(
+                True if cfg.training.NUM_WORKERS > 0 else False
+            ),  # Change to True
             prefetch_factor=cfg.training.PREFETCH_FACTOR,
             collate_fn=collate_fn,
         )
@@ -567,7 +573,7 @@ def run_training(cfg):
         for epoch in range(cfg.training.EPOCHS):
             logger.info(f"Epoch {epoch+1}/{cfg.training.EPOCHS}")
 
-            # Set epoch for dataset to ensure proper shuffling
+            # Set epoch for both train and validation datasets
             train_dataset.set_epoch(epoch)
             val_dataset.set_epoch(epoch)
 
@@ -599,12 +605,12 @@ def run_training(cfg):
                     scheduler.step()
 
             # Create visualizations
-            train_metrics_plot = plot_class_metrics(train_metrics, species_ids)
-            val_metrics_plot = plot_class_metrics(val_metrics, species_ids)
-            train_cm_img = plot_confusion_matrix(
+            train_metrics_plots = plot_class_metrics(train_metrics, species_ids)
+            val_metrics_plots = plot_class_metrics(val_metrics, species_ids)
+            train_cm_plot = plot_confusion_matrix(
                 train_metrics["confusion_matrix"], species_ids
             )
-            val_cm_img = plot_confusion_matrix(
+            val_cm_plot = plot_confusion_matrix(
                 val_metrics["confusion_matrix"], species_ids
             )
 
@@ -646,10 +652,16 @@ def run_training(cfg):
                         scheduler.get_last_lr()[0] if scheduler else cfg.training.LR
                     ),
                     # Visualizations
-                    "train_metrics_plot": train_metrics_plot,
-                    "val_metrics_plot": val_metrics_plot,
-                    "train_confusion_matrix": wandb.Image(train_cm_img),
-                    "val_confusion_matrix": wandb.Image(val_cm_img),
+                    "train_precision_plot": train_metrics_plots[0],
+                    "train_recall_plot": train_metrics_plots[1],
+                    "train_f1_plot": train_metrics_plots[2],
+                    "train_auc_plot": train_metrics_plots[3],
+                    "val_precision_plot": val_metrics_plots[0],
+                    "val_recall_plot": val_metrics_plots[1],
+                    "val_f1_plot": val_metrics_plots[2],
+                    "val_auc_plot": val_metrics_plots[3],
+                    "train_confusion_matrix": train_cm_plot,
+                    "val_confusion_matrix": val_cm_plot,
                 }
             )
 
@@ -751,11 +763,17 @@ def run_training(cfg):
             # Check for early stopping
             if no_improvement_epochs >= cfg.training.EARLY_STOPPING_PATIENCE:
                 logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-                # Load best model state
-                model.load_state_dict(best_model_state)
-                optimizer.load_state_dict(best_optimizer_state)
-                if scheduler and best_scheduler_state:
-                    scheduler.load_state_dict(best_scheduler_state)
+
+                # Load best model state if it exists
+                if best_model_state is not None:
+                    model.load_state_dict(best_model_state)
+                    if best_optimizer_state is not None:
+                        optimizer.load_state_dict(best_optimizer_state)
+                    if scheduler and best_scheduler_state is not None:
+                        scheduler.load_state_dict(best_scheduler_state)
+                else:
+                    logger.warning("No best model state found to load")
+
                 break
 
         best_scores.append(

@@ -96,8 +96,10 @@ def calculate_class_metrics(
         else:
             aucs.append(-1)
 
-    # Calculate confusion matrix
-    cm = confusion_matrix(truth.argmax(axis=1), binary_preds.argmax(axis=1))
+    # Calculate confusion matrix with proper label mapping
+    true_labels = np.argmax(truth, axis=1)
+    pred_labels = np.argmax(binary_preds, axis=1)
+    cm = confusion_matrix(true_labels, pred_labels, labels=range(len(labels)))
 
     # Calculate top-k accuracy
     k = 3
@@ -127,7 +129,7 @@ def calculate_class_metrics(
     return results
 
 
-def plot_class_metrics(metrics: Dict, labels: List[str]) -> go.Figure:
+def plot_class_metrics(metrics: Dict, labels: List[str]) -> List[go.Figure]:
     """
     Create interactive plots for class-specific metrics.
 
@@ -136,20 +138,8 @@ def plot_class_metrics(metrics: Dict, labels: List[str]) -> go.Figure:
         labels: List of class names
 
     Returns:
-        Plotly figure with multiple subplots
+        List of Plotly figures, one for each metric type
     """
-    # Create subplots
-    fig = make_subplots(
-        rows=2,
-        cols=2,
-        subplot_titles=(
-            "Precision by Class",
-            "Recall by Class",
-            "F1 Score by Class",
-            "AUC by Class",
-        ),
-    )
-
     # Extract metrics
     precisions = [metrics["per_class"][label]["precision"] for label in labels]
     recalls = [metrics["per_class"][label]["recall"] for label in labels]
@@ -157,59 +147,111 @@ def plot_class_metrics(metrics: Dict, labels: List[str]) -> go.Figure:
     aucs = [metrics["per_class"][label]["auc"] for label in labels]
     supports = [metrics["per_class"][label]["support"] for label in labels]
 
-    # Add traces
-    fig.add_trace(go.Bar(x=labels, y=precisions, name="Precision"), row=1, col=1)
-    fig.add_trace(go.Bar(x=labels, y=recalls, name="Recall"), row=1, col=2)
-    fig.add_trace(go.Bar(x=labels, y=f1s, name="F1"), row=2, col=1)
-    fig.add_trace(go.Bar(x=labels, y=aucs, name="AUC"), row=2, col=2)
+    # Create separate figures for each metric
+    figures = []
+    metric_data = [
+        ("Precision", precisions),
+        ("Recall", recalls),
+        ("F1 Score", f1s),
+        ("AUC", aucs),
+    ]
 
-    # Update layout
-    fig.update_layout(
-        height=800,
-        width=1200,
-        title_text="Class-wise Performance Metrics",
-        showlegend=False,
-    )
+    for title, values in metric_data:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=labels, y=values, name=title))
 
-    # Add support as hover text
-    for i in range(len(labels)):
-        fig.update_traces(
-            hovertemplate=f"Class: {labels[i]}<br>Support: {supports[i]}<extra></extra>",
-            selector={"name": "Precision"},
+        # Update layout
+        fig.update_layout(
+            height=400,
+            width=600,
+            title_text=f"{title} by Class",
+            showlegend=False,
+            xaxis_title="Class",
+            yaxis_title=title,
+            yaxis_range=[0, 1],  # Set y-axis range to [0, 1] for all metrics
         )
 
-    return fig
+        # Add support as hover text
+        fig.update_traces(
+            hovertemplate="Class: %{x}<br>"
+            + f"{title}: %{{y:.3f}}<br>Support: %{{customdata}}<extra></extra>",
+            customdata=supports,
+        )
+
+        figures.append(fig)
+
+    return figures
 
 
-def plot_confusion_matrix(cm: np.ndarray, labels: List[str]) -> np.ndarray:
+def plot_confusion_matrix(cm: np.ndarray, labels: List[str]) -> plt.Figure:
     """
-    Create and save confusion matrix plot.
+    Create a confusion matrix plot using matplotlib.
 
     Args:
         cm: Confusion matrix
         labels: List of class names
 
     Returns:
-        Numpy array of the image
+        matplotlib Figure object
     """
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(
-        cm, annot=True, fmt="d", cmap="Blues", xticklabels=labels, yticklabels=labels
-    )
-    plt.title("Confusion Matrix")
-    plt.ylabel("True Label")
-    plt.xlabel("Predicted Label")
+    # Create figure and axes with larger size for high resolution
+    plt.close("all")  # Close any existing figures
 
-    # Save to buffer
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    plt.close()
-    buf.seek(0)
+    # Calculate figure size based on number of classes
+    n_classes = len(labels)
+    fig_size = min(
+        20, max(8, n_classes * 0.5)
+    )  # Scale figure size with number of classes
+    fig = plt.figure(figsize=(fig_size, fig_size), dpi=200)
+    ax = fig.add_subplot(111)
 
-    # Convert to numpy array
-    img = PIL.Image.open(buf)
-    img_array = np.array(img)
-    return img_array
+    # Normalize confusion matrix
+    cm_norm = cm.astype("float") / (cm.sum(axis=1)[:, np.newaxis] + 1e-6)
+
+    # Create heatmap
+    im = ax.imshow(cm_norm, interpolation="nearest", cmap="Blues")
+
+    # Add colorbar
+    cbar = ax.figure.colorbar(im, ax=ax)
+    cbar.ax.set_ylabel("Ratio", rotation=-90, va="bottom", fontsize=10)
+
+    # Set up axes
+    ax.set_xlabel("Predicted Label", fontsize=12)
+    ax.set_ylabel("True Label", fontsize=12)
+    ax.set_title("Confusion Matrix", fontsize=14, pad=20)
+
+    # Add ticks
+    tick_marks = np.arange(len(labels))
+    ax.set_xticks(tick_marks)
+    ax.set_yticks(tick_marks)
+
+    # Determine fontsize based on number of classes
+    fontsize = min(10, max(6, int(200 / n_classes)))
+
+    # Add tick labels
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=fontsize)
+    ax.set_yticklabels(labels, fontsize=fontsize)
+
+    # Add text annotations
+    thresh = cm_norm.max() / 2.0
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            if cm[i, j] > 0:  # Only show non-zero values
+                text = f"{cm[i, j]}\n{cm_norm[i, j]:.1%}"
+                ax.text(
+                    j,
+                    i,
+                    text,
+                    ha="center",
+                    va="center",
+                    color="white" if cm_norm[i, j] > thresh else "black",
+                    fontsize=max(6, int(fontsize * 0.8)),
+                )
+
+    # Adjust layout
+    plt.subplots_adjust(bottom=0.2)
+
+    return fig
 
 
 def analyze_class_performance(

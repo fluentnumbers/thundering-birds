@@ -39,19 +39,19 @@ class CFG:
 
     training = EasyDict()
     training.DEBUG = True if device == "cpu" else False
-    training.EPOCHS = 20
-    training.PREFETCH_FACTOR = None
+    training.EPOCHS = 50
+    training.NUM_WORKERS = 10 if device == "cuda" else 0
+    training.PREFETCH_FACTOR = 2 if training.NUM_WORKERS > 0 else None
     training.AUGMENTATION_PROB = 0
     training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = None
     training.N_FOLD = 5
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
-    training.NUM_WORKERS = 0
-    training.SAMPLES_PER_EPOCH = 10000
+    training.SAMPLES_PER_EPOCH = 25000
     training.SAVE_INTERMEDIATE_MODEL = True
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
-    training.EARLY_STOPPING_PATIENCE = 7
-    training.BATCH_SIZE = 128 if device == "cuda" else 16
+    training.EARLY_STOPPING_PATIENCE = 20
+    training.BATCH_SIZE = 256 if device == "cuda" else 16
     training.GRAD_ACCUM_STEPS = 4
     training.OPTIMIZER = "AdamW"
     training.LR = 5e-4
@@ -65,8 +65,8 @@ class CFG:
 
     def update_debug_settings(self):
         if self.training.DEBUG:
-            self.training.DEBUG_N_CLASSES = 4
-            self.training.EPOCHS = 20
+            self.training.DEBUG_N_CLASSES = 5
+            self.training.EPOCHS = 10
             self.training.SAMPLES_PER_EPOCH = 500
             # self.training.SELECTED_FOLDS = [4]
 

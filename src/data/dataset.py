@@ -81,8 +81,12 @@ class BirdCLEFDataset(Dataset):
         self.metadata_df = self.metadata_df.reset_index(drop=True)
         self.metadata_df["index"] = range(len(self.metadata_df))
 
-        self.metadata_df["cache_path"] = self.metadata_df["segment_file"].map(
-            lambda x: Path(self.cache_dir / x)
+        # Fix path handling - ensure paths are relative to cache_dir
+        self.metadata_df["cache_path"] = self.metadata_df.apply(
+            lambda row: self.cache_dir
+            / row["primary_label"]
+            / f"{row['primary_label']}_{Path(row['audio_file']).stem}_segment_{row['segment_idx']}.pt",
+            axis=1,
         )
 
         self.metadata_lookup_files = {}
@@ -142,6 +146,10 @@ class BirdCLEFDataset(Dataset):
         class_info = self.metadata_lookup_classes[class_label]
         n_segments = class_info["n_segments"]
 
+        if n_segments == 0:
+            logger.warning(f"No segments found for class {class_label}")
+            return self._create_empty_sample(class_idx, class_label)
+
         # Sample a random segment from this class
         segment_idx = self.rng.randint(0, n_segments)
         cache_path = class_info["cache_paths"][segment_idx]
@@ -160,12 +168,20 @@ class BirdCLEFDataset(Dataset):
                 f"Sample {sample_key} used {self.sample_usage[self.current_epoch][sample_key]} times in epoch {self.current_epoch}"
             )
 
-        # Load the segment
+        # Load the segment with error handling
         try:
+            if not cache_path.exists():
+                logger.error(f"Segment file not found: {cache_path}")
+                return self._create_empty_sample(class_idx, class_label)
+
             spectrogram = torch.load(cache_path)
+            if spectrogram is None or torch.isnan(spectrogram).any():
+                logger.error(f"Invalid spectrogram loaded from {cache_path}")
+                return self._create_empty_sample(class_idx, class_label)
+
         except Exception as e:
-            logger.warning(f"Failed to load segment from {cache_path}: {e}")
-            spectrogram = torch.zeros((1, 224, 224), dtype=torch.float32)
+            logger.error(f"Failed to load segment from {cache_path}: {e}")
+            return self._create_empty_sample(class_idx, class_label)
 
         if (
             self.mode == "train"
@@ -182,6 +198,18 @@ class BirdCLEFDataset(Dataset):
             "target": target,
             "class_label": class_label,
             "segment_idx": segment_idx,
+        }
+
+    def _create_empty_sample(self, class_idx, class_label):
+        """Create an empty sample with zeros when loading fails"""
+        empty_spectrogram = torch.zeros((1, 224, 224), dtype=torch.float32)
+        target = torch.zeros(self.num_classes, dtype=torch.float32)
+        target[class_idx] = 1.0
+        return {
+            "melspec": empty_spectrogram,
+            "target": target,
+            "class_label": class_label,
+            "segment_idx": -1,
         }
 
     def apply_spec_augmentations(self, spec):
@@ -216,13 +244,21 @@ class BirdCLEFDataset(Dataset):
         """Set random seed for this epoch and reset usage tracking"""
         self.current_epoch = epoch
         self.rng = np.random.RandomState(self.cfg.seed + epoch)
-        self.sample_usage[epoch] = {}  # Reset usage tracking for new epoch
+        if epoch not in self.sample_usage:
+            self.sample_usage[epoch] = {}  # Initialize usage tracking for new epoch
 
     def get_usage_stats(self, epoch=None):
         """Get statistics about sample usage for a specific epoch or all epochs"""
         if epoch is not None:
+            if epoch not in self.sample_usage:
+                logger.warning(
+                    f"Epoch {epoch} has not been initialized yet. Call set_epoch({epoch}) first."
+                )
+                return None
+
             usage = dict(self.sample_usage.get(epoch, {}))  # Convert to regular dict
             if not usage:
+                logger.warning(f"No samples have been processed for epoch {epoch} yet")
                 return None
 
             # Initialize per-class statistics
@@ -253,9 +289,9 @@ class BirdCLEFDataset(Dataset):
             overall_stats = {
                 "total_samples": len(usage),
                 "unique_samples": len(set(usage.keys())),
-                "max_usage": max(usage.values()),
-                "min_usage": min(usage.values()),
-                "avg_usage": sum(usage.values()) / len(usage),
+                "max_usage": max(usage.values()) if usage else 0,
+                "min_usage": min(usage.values()) if usage else 0,
+                "avg_usage": sum(usage.values()) / len(usage) if usage else 0,
                 "samples_used_once": sum(1 for v in usage.values() if v == 1),
                 "samples_used_multiple": sum(1 for v in usage.values() if v > 1),
                 "class_stats": class_stats,

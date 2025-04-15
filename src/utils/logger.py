@@ -69,7 +69,23 @@ class WandbLogger:
             import wandb
 
             self.wandb = wandb
-            self.run_dir = run_dir  # Use the provided run_dir directly
+
+            # Validate and clean tags
+            if tags is not None:
+                # Remove empty strings and ensure tags are between 1-64 chars
+                tags = [tag for tag in tags if tag and 1 <= len(str(tag)) <= 64]
+                if not tags:  # If all tags were invalid, set to None
+                    tags = None
+
+            # Validate group name
+            if group is not None and (not group or len(str(group)) > 64):
+                group = None
+
+            # Validate run name
+            if not run_name or len(str(run_name)) > 64:
+                run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            self.run_dir = run_dir
             self.run = self.wandb.init(
                 project="bird-sound-classification",
                 name=run_name,
@@ -98,15 +114,15 @@ class WandbLogger:
         if self.enabled:
             try:
                 self.wandb.log(
-                    {"images": self.wandb.Image(image, caption=caption), **kwargs}
+                    {caption: self.wandb.Image(image, caption=caption, **kwargs)}
                 )
             except Exception as e:
                 logging.warning(f"Failed to log image to wandb: {e}")
 
     def finish(self) -> None:
-        """Finish wandb run if available."""
+        """Finish the wandb run if available."""
         if self.enabled:
             try:
                 self.wandb.finish()
             except Exception as e:
-                logging.warning(f"Failed to finish wandb: {e}")
+                logging.warning(f"Failed to finish wandb run: {e}")
