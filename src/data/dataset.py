@@ -10,15 +10,17 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 from tqdm.auto import tqdm
 
 from src.data.preprocessing import process_audio_file
+from src.data.processing import align_df_and_metadata, normalize_values_by_group
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 
-def load_segments_info(cfg):
+def load_cache_metadata(cfg):
     """Load and filter metadata for audio segments.
 
     Args:
@@ -41,11 +43,6 @@ def load_segments_info(cfg):
     if unique_classes != 206:
         raise ValueError(f"Expected 206 unique classes, but found {unique_classes}")
 
-    # Log statistics about the filtered dataset
-    # logger.info(
-    # f"After filtering segments metadata: {len(df_cache)} segments from {df_cache['audio_file'].nunique()} files and {df_cache['primary_label'].nunique()} classes"
-    # )
-
     return df_cache
 
 
@@ -59,33 +56,31 @@ class BirdCLEFDataset(Dataset):
         self.label_to_idx = {label: idx for idx, label in enumerate(self.class_ids)}
         self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
         self.classes_present_in_df = self.df["primary_label"].unique().tolist()
-        self.sample_weights_by_rating = (df["rating"].values + 1) / 6
+        self.segments_weights_by_rating = (df["rating"].values + 1) / 6
+
+        self.class_weights = self.compute_class_weights()
+        self.rng = np.random.RandomState(cfg.seed)
 
         # Initialize sample usage tracking
-        self.sample_usage = {}  # Regular dictionary
         self.current_epoch = 0
-        self.sample_usage[0] = {}  # Initialize dictionary for epoch 0
 
         self.cache_dir = Path(self.cfg.dirs.cache_dir)
-        # loading prefiltered metadata about cached segments
-        self.metadata_df = load_segments_info(self.cfg)
 
-        # df maybe train or test set,  so, first keep only files that are present in the metadata (not completely filtered out due to low SNR, etc.)
-        self.df = self.df[self.df["filename"].isin(self.metadata_df["audio_file"])]
-        self.df = self.df.reset_index(drop=True)
-
-        # now remove metadata rows, which represent files which are not in the df
-        self.metadata_df = self.metadata_df[
-            self.metadata_df["audio_file"].isin(self.df["filename"].unique())
-        ]
-        self.metadata_df = self.metadata_df.reset_index(drop=True)
+        self.df, self.metadata_df = align_df_and_metadata(
+            self.df, load_cache_metadata(cfg)
+        )
+        self.samples_per_epoch = (
+            cfg.training.SAMPLES_PER_EPOCH
+            if cfg.training.SAMPLES_PER_EPOCH < len(self.metadata_df)
+            else len(self.metadata_df)
+        )
         self.metadata_df["index"] = range(len(self.metadata_df))
 
         # Fix path handling - ensure paths are relative to cache_dir
         self.metadata_df["cache_path"] = self.metadata_df.apply(
             lambda row: self.cache_dir
             / row["primary_label"]
-            / f"{row['primary_label']}_{Path(row['audio_file']).stem}_segment_{row['segment_idx']}.pt",
+            / f"{row['primary_label']}_{Path(row['filename']).stem}_segment_{row['segment_idx']}.pt",
             axis=1,
         )
 
@@ -93,9 +88,9 @@ class BirdCLEFDataset(Dataset):
         self.metadata_lookup_classes = {}
 
         # Build lookup for files
-        unique_files = self.metadata_df["audio_file"].unique()
+        unique_files = self.metadata_df["filename"].unique()
         for f in unique_files:
-            file_df = self.metadata_df[self.metadata_df["audio_file"] == f]
+            file_df = self.metadata_df[self.metadata_df["filename"] == f]
             self.metadata_lookup_files[f] = {
                 "n_segments": len(file_df),
                 "indices": file_df["index"].tolist(),
@@ -107,32 +102,38 @@ class BirdCLEFDataset(Dataset):
             class_df = self.metadata_df[self.metadata_df["primary_label"] == c]
             self.metadata_lookup_classes[c] = {
                 "n_segments": len(class_df),
-                "n_files": len(class_df["audio_file"].unique()),
+                "n_files": len(class_df["filename"].unique()),
                 "indices": class_df["index"].tolist(),
-                "files": class_df["audio_file"].unique().tolist(),
+                "files": class_df["filename"].unique().tolist(),
                 "cache_paths": class_df["cache_path"].tolist(),
             }
 
-        # Set fixed number of samples per epoch
-        self.samples_per_epoch = cfg.training.SAMPLES_PER_EPOCH
-        if self.samples_per_epoch is None or self.samples_per_epoch > len(
-            self.metadata_df
-        ):
-            self.samples_per_epoch = len(self.metadata_df)
-
         # Initialize random state for reproducibility
-        self.rng = np.random.RandomState(cfg.seed)
 
-        # Pre-compute class weights for sampling
-        self.class_weights = np.ones(len(self.class_ids)) / len(self.class_ids)
-        # Create a mask for classes not present in the current dataset
+        # Create signal power lookup using normalized per-file values
+        self.signal_power_lookup = dict(
+            zip(
+                self.metadata_df["cache_path"].astype(str),
+                normalize_values_by_group(
+                    self.metadata_df["signal_power"],
+                    self.metadata_df["filename"],
+                ),
+            )
+        )
+
+        logger.info(
+            f"{self.mode} dataset loaded with {len(self.metadata_lookup_files)} files, {len(self.metadata_df)} samples and {len(self.metadata_lookup_classes)} classes; {self.samples_per_epoch} samples per epoch"
+        )
+
+    def compute_class_weights(self):
+        class_weights = np.ones(len(self.class_ids)) / len(self.class_ids)
         mask = ~np.isin(self.class_ids, self.classes_present_in_df)
-        self.class_weights[mask] = 0
-        # Normalize weights to sum to 1
-        if self.class_weights.sum() > 0:
-            self.class_weights = self.class_weights / self.class_weights.sum()
+        class_weights[mask] = 0
+        if class_weights.sum() > 0:
+            class_weights = class_weights / class_weights.sum()
         else:
             raise ValueError("No valid classes found in the dataset")
+        return class_weights
 
     def __len__(self):
         return self.samples_per_epoch
@@ -147,41 +148,13 @@ class BirdCLEFDataset(Dataset):
         n_segments = class_info["n_segments"]
 
         if n_segments == 0:
-            logger.warning(f"No segments found for class {class_label}")
+            logger.error(f"No segments found for class {class_label}")
             return self._create_empty_sample(class_idx, class_label)
 
         # Sample a random segment from this class
         segment_idx = self.rng.randint(0, n_segments)
         cache_path = class_info["cache_paths"][segment_idx]
-
-        # Track sample usage
-        sample_key = f"{class_label}_{segment_idx}"
-        if self.current_epoch not in self.sample_usage:
-            self.sample_usage[self.current_epoch] = {}
-        if sample_key not in self.sample_usage[self.current_epoch]:
-            self.sample_usage[self.current_epoch][sample_key] = 0
-        self.sample_usage[self.current_epoch][sample_key] += 1
-
-        # Log if sample is used more than once
-        if self.sample_usage[self.current_epoch][sample_key] > 1:
-            logger.debug(
-                f"Sample {sample_key} used {self.sample_usage[self.current_epoch][sample_key]} times in epoch {self.current_epoch}"
-            )
-
-        # Load the segment with error handling
-        try:
-            if not cache_path.exists():
-                logger.error(f"Segment file not found: {cache_path}")
-                return self._create_empty_sample(class_idx, class_label)
-
-            spectrogram = torch.load(cache_path)
-            if spectrogram is None or torch.isnan(spectrogram).any():
-                logger.error(f"Invalid spectrogram loaded from {cache_path}")
-                return self._create_empty_sample(class_idx, class_label)
-
-        except Exception as e:
-            logger.error(f"Failed to load segment from {cache_path}: {e}")
-            return self._create_empty_sample(class_idx, class_label)
+        spectrogram = torch.load(cache_path)
 
         if (
             self.mode == "train"
@@ -189,15 +162,17 @@ class BirdCLEFDataset(Dataset):
         ):
             spectrogram = self.apply_spec_augmentations(spectrogram)
 
-        # Create target vector
-        target = torch.zeros(self.num_classes, dtype=torch.float32)
-        target[class_idx] = 1.0
+        # Create smoothed target vector
+        target = self._create_targets(
+            self.metadata_df[self.metadata_df["cache_path"] == cache_path].iloc[0]
+        )
 
         return {
             "melspec": spectrogram,
             "target": target,
             "class_label": class_label,
             "segment_idx": segment_idx,
+            "signal_power_weight": self.signal_power_lookup.get(str(cache_path), 0.1),
         }
 
     def _create_empty_sample(self, class_idx, class_label):
@@ -210,6 +185,7 @@ class BirdCLEFDataset(Dataset):
             "target": target,
             "class_label": class_label,
             "segment_idx": -1,
+            "signal_power_weight": 0.1,  # minimum weight for failed samples
         }
 
     def apply_spec_augmentations(self, spec):
@@ -240,109 +216,66 @@ class BirdCLEFDataset(Dataset):
 
         return spec
 
-    def set_epoch(self, epoch):
-        """Set random seed for this epoch and reset usage tracking"""
-        self.current_epoch = epoch
-        self.rng = np.random.RandomState(self.cfg.seed + epoch)
-        if epoch not in self.sample_usage:
-            self.sample_usage[epoch] = {}  # Initialize usage tracking for new epoch
+    def _create_targets(
+        self,
+        segment_metadata,
+    ):
+        """
+        Create a target vector with label smoothing and secondary label weighting.
 
-    def get_usage_stats(self, epoch=None):
-        """Get statistics about sample usage for a specific epoch or all epochs"""
-        if epoch is not None:
-            if epoch not in self.sample_usage:
-                logger.warning(
-                    f"Epoch {epoch} has not been initialized yet. Call set_epoch({epoch}) first."
-                )
-                return None
+        Args:
+            primary_idx: Index of the primary label
+            secondary_labels: List of secondary labels
+            smoothing: Label smoothing factor (0.0 to disable)
+            secondary_weight: Weight for secondary labels
 
-            usage = dict(self.sample_usage.get(epoch, {}))  # Convert to regular dict
-            if not usage:
-                logger.warning(f"No samples have been processed for epoch {epoch} yet")
-                return None
-
-            # Initialize per-class statistics
-            class_stats = {}
-            for class_label in self.class_ids:
-                class_samples = {
-                    k: v for k, v in usage.items() if k.startswith(f"{class_label}_")
-                }
-                class_stats[class_label] = {
-                    "total_samples": len(class_samples),
-                    "unique_samples": len(set(class_samples.keys())),
-                    "max_usage": max(class_samples.values()) if class_samples else 0,
-                    "min_usage": min(class_samples.values()) if class_samples else 0,
-                    "avg_usage": (
-                        sum(class_samples.values()) / len(class_samples)
-                        if class_samples
-                        else 0
-                    ),
-                    "samples_used_once": sum(
-                        1 for v in class_samples.values() if v == 1
-                    ),
-                    "samples_used_multiple": sum(
-                        1 for v in class_samples.values() if v > 1
-                    ),
-                }
-
-            # Overall statistics
-            overall_stats = {
-                "total_samples": len(usage),
-                "unique_samples": len(set(usage.keys())),
-                "max_usage": max(usage.values()) if usage else 0,
-                "min_usage": min(usage.values()) if usage else 0,
-                "avg_usage": sum(usage.values()) / len(usage) if usage else 0,
-                "samples_used_once": sum(1 for v in usage.values() if v == 1),
-                "samples_used_multiple": sum(1 for v in usage.values() if v > 1),
-                "class_stats": class_stats,
-            }
-
-            return overall_stats
-        else:
-            return {e: self.get_usage_stats(e) for e in self.sample_usage.keys()}
-
-    def log_usage_stats(self, epoch=None):
-        """Log detailed usage statistics for an epoch"""
-        if epoch is not None and epoch not in self.sample_usage:
-            logger.warning(
-                f"Epoch {epoch} has not been initialized yet. Call set_epoch({epoch}) first."
-            )
-            return
-
-        stats = self.get_usage_stats(epoch)
-        if stats is None:
-            logger.warning(f"No samples have been processed for epoch {epoch} yet")
-            return
-
-        logger.info(f"\n{'='*50}")
-        logger.info(
-            f"Usage Statistics for Epoch {epoch if epoch is not None else 'All'}"
+        Returns:
+            torch.Tensor: Smoothed target vector
+        """
+        num_classes = self.num_classes
+        primary_idx = self.label_to_idx[segment_metadata["primary_label"]]
+        secondary_labels = segment_metadata["secondary_labels"]
+        USE_SMOOTHING = self.cfg.training.USE_LABEL_SMOOTHING
+        primary_smoothing = (
+            self.cfg.training.PRIMARY_LABEL_SMOOTHING if self.mode == "train" else 0.0
         )
-        logger.info(f"{'='*50}")
+        secondary_weight = (
+            self.cfg.training.SECONDARY_LABEL_WEIGHT if self.mode == "train" else 0.0
+        )
 
-        # Log overall statistics
-        logger.info("\nOverall Statistics:")
-        logger.info(f"Total samples used: {stats['total_samples']}")
-        logger.info(f"Unique samples: {stats['unique_samples']}")
-        logger.info(f"Max usage per sample: {stats['max_usage']}")
-        logger.info(f"Min usage per sample: {stats['min_usage']}")
-        logger.info(f"Avg usage per sample: {stats['avg_usage']:.2f}")
-        logger.info(f"Samples used once: {stats['samples_used_once']}")
-        logger.info(f"Samples used multiple times: {stats['samples_used_multiple']}")
+        if not USE_SMOOTHING or self.mode != "train" or secondary_labels is None:
+            target = torch.zeros(num_classes, dtype=torch.float32)
+            target[primary_idx] = 1.0
+            return target
 
-        # Log per-class statistics
-        logger.info("\nPer-Class Statistics:")
-        for class_label, class_stat in stats["class_stats"].items():
-            logger.info(f"\nClass: {class_label}")
-            logger.info(f"  Total samples: {class_stat['total_samples']}")
-            logger.info(f"  Unique samples: {class_stat['unique_samples']}")
-            logger.info(f"  Max usage: {class_stat['max_usage']}")
-            logger.info(f"  Min usage: {class_stat['min_usage']}")
-            logger.info(f"  Avg usage: {class_stat['avg_usage']:.2f}")
-            logger.info(f"  Used once: {class_stat['samples_used_once']}")
-            logger.info(f"  Used multiple: {class_stat['samples_used_multiple']}")
+        # Initialize with small uniform distribution
+        target = torch.full(
+            (num_classes,), primary_smoothing / (num_classes - 1), dtype=torch.float32
+        )
 
-        logger.info(f"{'='*50}\n")
+        # Set primary label
+        target[primary_idx] = 1.0 - primary_smoothing
+
+        # Add secondary labels if available
+        if secondary_labels and secondary_weight > 0:
+            if isinstance(secondary_labels, str):
+                # Handle string format (e.g., "[label1,label2]")
+                secondary_labels = (
+                    eval(secondary_labels)
+                    if secondary_labels.startswith("[")
+                    else [secondary_labels]
+                )
+
+            for label in secondary_labels:
+                if label in self.label_to_idx:
+                    sec_idx = self.label_to_idx[label]
+                    if sec_idx != primary_idx:  # Don't add weight to primary label
+                        target[sec_idx] += secondary_weight
+
+        # Normalize to ensure sum is 1
+        target = target / target.sum()
+
+        return target
 
 
 def process_file_worker(args):
@@ -410,5 +343,7 @@ def collate_fn(batch):
                 result[key] = torch.stack(result[key])
         elif key == "segment_idx":
             result[key] = torch.tensor(result[key])
+        elif key == "signal_power_weight":
+            result[key] = torch.tensor(result[key], dtype=torch.float32)
 
     return result

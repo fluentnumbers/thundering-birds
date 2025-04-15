@@ -26,9 +26,10 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.config import CFG, set_seed
-from src.data.dataset import BirdCLEFDataset, collate_fn, load_segments_info
+from src.data.dataset import BirdCLEFDataset, collate_fn, load_cache_metadata
+from src.data.processing import align_df_and_metadata
 from src.models.birdclef_model import BirdCLEFModel
-from src.training.losses import AsymmetricLossMultiLabel
+from src.training.losses import AsymmetricLossMultiLabel, HierarchicalBCELoss
 from src.training.metrics import (
     analyze_class_performance,
     calculate_class_metrics,
@@ -115,6 +116,12 @@ def get_criterion(cfg):
             disable_torch_grad_focal_loss=False,
             reduction="mean",
         )
+    elif cfg.training.CRITERION == "HierarchicalBCELoss":
+        criterion = HierarchicalBCELoss(
+            primary_weight=cfg.training.PRIMARY_WEIGHT,
+            secondary_weight=cfg.training.SECONDARY_WEIGHT,
+        )
+
     else:
         raise NotImplementedError(f"Criterion {cfg.training.CRITERION} not implemented")
 
@@ -179,40 +186,6 @@ def log_memory_usage():
         )
 
 
-def verify_class_distribution(df, skf, logger):
-    """
-    Verify that all classes are present in both train and validation sets for each fold.
-
-    Args:
-        df: DataFrame containing the dataset
-        skf: StratifiedKFold object with the split configuration
-        logger: Logger object for output
-
-    Returns:
-        bool: True if all folds have the same classes in train and validation sets
-    """
-    all_folds_balanced = True
-    logger.info(
-        f"Total number of classes in dataset: {len(df['primary_label'].unique())}"
-    )
-
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
-        train_classes = set(df.iloc[train_idx]["primary_label"].unique())
-        val_classes = set(df.iloc[val_idx]["primary_label"].unique())
-
-        if train_classes != val_classes:
-            all_folds_balanced = False
-            missing_in_train = val_classes - train_classes
-            missing_in_val = train_classes - val_classes
-
-            logger.warning(f"Fold {fold_idx} has class distribution mismatch!")
-            if missing_in_train:
-                logger.warning(f"Classes missing in training set: {missing_in_train}")
-            if missing_in_val:
-                logger.warning(f"Classes missing in validation set: {missing_in_val}")
-    return all_folds_balanced
-
-
 def train_one_epoch(
     model,
     loader,
@@ -228,6 +201,7 @@ def train_one_epoch(
     losses = []
     all_targets = []
     all_outputs = []
+    train_weighted_losses = []  # Track weighted losses separately
 
     # Initialize timing variables
     data_loading_time = 0
@@ -248,6 +222,7 @@ def train_one_epoch(
         # Data loading
         inputs = batch["melspec"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
+        loss_correction = batch["signal_power_weight"].to(device, non_blocking=True)
         data_loading_time += time.time() - batch_start
 
         # Training step
@@ -257,17 +232,24 @@ def train_one_epoch(
         if device == "cuda" and scaler is not None:
             with torch.cuda.amp.autocast():
                 outputs = model(inputs)
-                if isinstance(outputs, tuple):
-                    outputs, loss = outputs
-                else:
-                    loss = criterion(outputs, targets)
+
+                # Calculate base loss per sample
+                base_loss = criterion(outputs, targets)
+                if len(base_loss.shape) == 2:
+                    # If loss is per-class, take mean over classes first
+                    base_loss = base_loss.mean(dim=1)
+                # Apply signal power weights to each sample's loss
+                loss = (base_loss * loss_correction).mean()
                 loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
         else:
             outputs = model(inputs)
-            if isinstance(outputs, tuple):
-                outputs, loss = outputs
-            else:
-                loss = criterion(outputs, targets)
+
+            base_loss = criterion(outputs, targets)
+            if len(base_loss.shape) == 2:
+                # If loss is per-class, take mean over classes first
+                base_loss = base_loss.mean(dim=1)
+            # Apply signal power weights to each sample's loss
+            loss = (base_loss * loss_correction).mean()
             loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
 
         # Backward pass with mixed precision if using GPU
@@ -297,15 +279,21 @@ def train_one_epoch(
         all_outputs.append(outputs)
         all_targets.append(targets)
         losses.append(loss.item() * grad_accum_steps)  # Scale back the loss for logging
+        train_weighted_losses.append(
+            loss.item() * grad_accum_steps
+        )  # Track weighted losses
 
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        # Update progress bar with timing info
+        # Update progress bar with timing info and both losses
         pbar.set_postfix(
             {
                 "train_loss": np.mean(losses[-10:]) if losses else 0,
+                "train_weighted_loss": (
+                    np.mean(train_weighted_losses[-10:]) if train_weighted_losses else 0
+                ),
                 "lr": optimizer.param_groups[0]["lr"],
                 "grad_accum": f"{step % grad_accum_steps + 1}/{grad_accum_steps}",
                 "data_time": f"{data_loading_time/(step+1):.3f}s",
@@ -338,6 +326,10 @@ def train_one_epoch(
     analysis = analyze_class_performance(metrics, species_ids, class_distribution)
 
     avg_loss = np.mean(losses)
+    avg_train_weighted_loss = np.mean(train_weighted_losses)
+
+    # Add weighted loss to metrics
+    metrics["train_weighted_loss"] = avg_train_weighted_loss
 
     return avg_loss, metrics, analysis
 
@@ -356,14 +348,18 @@ def validate(model, loader, criterion, device, cfg, species_ids=None):
             targets = batch["target"].to(device)
 
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            if isinstance(outputs, tuple):
+                outputs, loss = outputs
+            else:
+                # Calculate raw loss without weighting
+                loss = criterion(outputs, targets)
 
             outputs = outputs.detach().cpu().numpy()
             targets = targets.detach().cpu().numpy()
 
             all_outputs.append(outputs)
             all_targets.append(targets)
-            losses.append(loss if isinstance(loss, float) else loss.item())
+            losses.append(loss.item())
 
             # Update progress bar with current batch loss
             pbar.set_postfix(
@@ -438,35 +434,23 @@ def run_training(cfg):
 
     # Load training data
     logger.info("Loading training data...")
-    df = pd.read_csv(cfg.dirs.train_csv)
-    df_cache = load_segments_info(cfg)
 
+    df = pd.read_csv(cfg.dirs.train_csv)
     if cfg.training.DEBUG:
         cfg.update_debug_settings()
         # Filter the dataframe to keep only the top 3 classes
         class_counts = df["primary_label"].value_counts().sort_index()
-        top_3_classes = class_counts[class_counts >= 4][
+        top_n_classes = class_counts[class_counts >= 4][
             : cfg.training.DEBUG_N_CLASSES
         ].index.tolist()
 
-        df = df[df["primary_label"].isin(top_3_classes)]
+        df = df[df["primary_label"].isin(top_n_classes)]
         logger.info(
             f"Filtered training data to {len(df)} audio files from {cfg.training.DEBUG_N_CLASSES} classes"
         )
-
-    df_cache = df_cache[df_cache["primary_label"].isin(df["primary_label"].unique())]
-    df = df[df["filename"].isin(set(df_cache["audio_file"]))]
-    df = df.reset_index(drop=True)
-
+    df, df_cache = align_df_and_metadata(df, load_cache_metadata(cfg))
     species_ids = df["primary_label"].unique().tolist()
     cfg.num_classes = len(species_ids)
-
-    if "filepath" not in df.columns:
-        df["filepath"] = cfg.dirs.train_datadir + "/" + df.filename
-    if "samplename" not in df.columns:
-        df["samplename"] = df.filename.map(
-            lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
-        )
 
     folds = get_folds(df, cfg)
     best_scores = []
@@ -476,7 +460,7 @@ def run_training(cfg):
 
     torch.backends.cudnn.benchmark = True
 
-    for fold, (train_idx, val_idx) in enumerate(folds):
+    for fold, (train_file_idx, val_file_idx) in enumerate(folds):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
 
@@ -509,8 +493,8 @@ def run_training(cfg):
             },
         )
 
-        train_df = df.iloc[train_idx].reset_index(drop=True)
-        val_df = df.iloc[val_idx].reset_index(drop=True)
+        train_df = df.iloc[train_file_idx].reset_index(drop=True)
+        val_df = df.iloc[val_file_idx].reset_index(drop=True)
 
         logger.info(f"Training set: {len(train_df)} audio files")
         logger.info(f"Validation set: {len(val_df)} audio files")
@@ -573,10 +557,6 @@ def run_training(cfg):
         for epoch in range(cfg.training.EPOCHS):
             logger.info(f"Epoch {epoch+1}/{cfg.training.EPOCHS}")
 
-            # Set epoch for both train and validation datasets
-            train_dataset.set_epoch(epoch)
-            val_dataset.set_epoch(epoch)
-
             # Log memory usage at start of each epoch
             log_memory_usage()
 
@@ -621,7 +601,8 @@ def run_training(cfg):
                     "fold": fold,
                     # Loss metrics
                     "train_loss": train_loss,
-                    "val_loss": val_loss,
+                    "train_weighted_loss": train_metrics["train_weighted_loss"],
+                    "val_loss": val_loss,  # Raw validation loss
                     # Macro metrics
                     "train_auc": train_metrics["macro_metrics"]["auc"],
                     "train_f1": train_metrics["macro_metrics"]["f1"],
@@ -704,14 +685,14 @@ def run_training(cfg):
                 }
             )
 
-            # Log dataset usage statistics
-            logger.info(f"\nDataset Usage Statistics for Epoch {epoch + 1}")
-            train_dataset.log_usage_stats(epoch=epoch + 1)
+            # Use raw validation loss or other metrics for early stopping
+            if cfg.training.EARLY_STOPPING_METRIC == "loss":
+                current_metric = -val_loss  # Negative because we want to minimize loss
+            else:
+                current_metric = val_metrics["macro_metrics"][
+                    cfg.training.EARLY_STOPPING_METRIC
+                ]
 
-            # Check for early stopping
-            current_metric = val_metrics["macro_metrics"][
-                cfg.training.EARLY_STOPPING_METRIC
-            ]
             if current_metric > best_metric + cfg.training.EARLY_STOPPING_MIN_DELTA:
                 best_metric = current_metric
                 no_improvement_epochs = 0

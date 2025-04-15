@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class AsymmetricLossMultiLabel(nn.Module):
@@ -62,3 +63,17 @@ class AsymmetricLossMultiLabel(nn.Module):
             return -loss.sum()
 
         return -loss
+
+
+class HierarchicalBCELoss(nn.Module):
+    def __init__(self, primary_weight=1.0, secondary_weight=0.5):
+        super().__init__()
+        self.primary_weight = primary_weight
+        self.secondary_weight = secondary_weight
+
+    def forward(self, x, primary_targets, secondary_targets):
+        primary_loss = F.binary_cross_entropy_with_logits(x, primary_targets)
+        secondary_loss = F.binary_cross_entropy_with_logits(x, secondary_targets)
+        return (
+            self.primary_weight * primary_loss + self.secondary_weight * secondary_loss
+        )

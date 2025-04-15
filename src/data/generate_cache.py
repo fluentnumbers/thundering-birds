@@ -77,7 +77,7 @@ def process_single_file(
             # Create metadata entry for failed file
             metadata = [
                 {
-                    "audio_file": str(row["filename"]),
+                    "filename": str(row["filename"]),
                     "segment_file": None,
                     "segment_idx": -1,
                     "primary_label": row.get("primary_label", None),
@@ -122,7 +122,7 @@ def process_single_file(
             # Create metadata entry
             metadata.append(
                 {
-                    "audio_file": str(row["filename"]),
+                    "filename": str(row["filename"]),
                     "segment_file": str(segment_path.relative_to(dst_folder)),
                     "segment_idx": segment["segment_idx"],
                     "primary_label": segment["primary_label"],
@@ -146,7 +146,7 @@ def process_single_file(
         # Create metadata entry for failed file
         metadata = [
             {
-                "audio_file": str(row["filename"]),
+                "filename": str(row["filename"]),
                 "segment_file": None,
                 "segment_idx": -1,
                 "primary_label": row.get("primary_label", None),

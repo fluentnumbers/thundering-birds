@@ -68,7 +68,7 @@ def calculate_class_metrics(
     Calculate comprehensive class-specific metrics.
 
     Args:
-        truth: Ground truth labels (one-hot encoded)
+        truth: Ground truth labels (continuous or binary)
         pred: Predicted probabilities
         labels: List of class names
         thresholds: Optional class-specific thresholds
@@ -82,30 +82,36 @@ def calculate_class_metrics(
     # Convert probabilities to binary predictions
     binary_preds = (pred > thresholds).astype(int)
 
+    # Convert continuous truth values to binary if they're not already
+    binary_truth = (truth > 0.5).astype(int)
+
     # Calculate per-class metrics
     precision, recall, f1, support = precision_recall_fscore_support(
-        truth, binary_preds, average=None, zero_division=0
+        binary_truth, binary_preds, average=None, zero_division=0
     )
 
-    # Calculate AUC per class
+    # Calculate AUC per class - use original continuous values for AUC
     aucs = []
     for i in range(pred.shape[1]):
-        if np.sum(truth[:, i]) > 0:
-            auc = roc_auc_score(truth[:, i], pred[:, i])
+        if np.sum(binary_truth[:, i]) > 0:
+            auc = roc_auc_score(binary_truth[:, i], pred[:, i])
             aucs.append(auc)
         else:
             aucs.append(-1)
 
     # Calculate confusion matrix with proper label mapping
-    true_labels = np.argmax(truth, axis=1)
+    true_labels = np.argmax(binary_truth, axis=1)
     pred_labels = np.argmax(binary_preds, axis=1)
     cm = confusion_matrix(true_labels, pred_labels, labels=range(len(labels)))
 
-    # Calculate top-k accuracy
+    # Calculate top-k accuracy using binary truth values
     k = 3
     top_k_preds = np.argsort(pred, axis=1)[:, -k:]
     top_k_accuracy = np.mean(
-        [1 if truth[i].argmax() in top_k_preds[i] else 0 for i in range(len(truth))]
+        [
+            1 if binary_truth[i].argmax() in top_k_preds[i] else 0
+            for i in range(len(binary_truth))
+        ]
     )
 
     # Compile results

@@ -60,6 +60,19 @@ class CFG:
     training.CRITERION = (
         "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss
     )
+    # label smoothing
+    training.USE_LABEL_SMOOTHING = True
+    training.PRIMARY_LABEL_SMOOTHING = 0.2  # primary label weight = 1 - smoothing
+    training.SECONDARY_LABEL_WEIGHT = (
+        0.3  # Weight for secondary labels in label smoothing
+    )
+    # HierarchicalBCELoss
+    training.PRIMARY_WEIGHT = (
+        1.0 if training.CRITERION == "HierarchicalBCELoss" else None
+    )
+    training.SECONDARY_WEIGHT = (
+        0.5 if training.CRITERION == "HierarchicalBCELoss" else None
+    )
     training.MIN_LR = 1e-6
     training.T_MAX = training.EPOCHS
 
