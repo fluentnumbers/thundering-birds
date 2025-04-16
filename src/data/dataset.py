@@ -1,10 +1,13 @@
+import ctypes
 import gc
 import json
+import multiprocessing as mp
 import os
 import random
 import threading
 import time
 from pathlib import Path
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -35,7 +38,7 @@ def load_cache_metadata(cfg):
 
     df_cache = df_cache[df_cache["silence_pct"] < 100]
     df_cache = df_cache[~df_cache["rating"].isin([0.5, 1.0, 1.5])]
-    df_cache = df_cache[df_cache["signal_power"] > 0.01]
+    df_cache = df_cache[df_cache["signal_power"] > 0.002]
     df_cache = df_cache[df_cache["snr_db"] > 0]
 
     # Assert that we have the expected number of classes (206)
@@ -60,26 +63,9 @@ class BirdCLEFDataset(Dataset):
 
         self.class_weights = self.compute_class_weights()
         self.rng = np.random.RandomState(cfg.seed)
-
-        # Initialize sample usage tracking with per-class locks
-        self.current_epoch = 0
-        self._class_locks = {
-            class_label: threading.Lock() for class_label in self.class_ids
-        }
-
-        # Pre-generate permutations for each class
-        self._class_permutations = {}
-        self._class_permutation_indices = {}
-
         self.cache_dir = Path(self.cfg.dirs.cache_dir)
-
         self.df, self.metadata_df = align_df_and_metadata(
             self.df, load_cache_metadata(cfg)
-        )
-        self.samples_per_epoch = (
-            cfg.training.SAMPLES_PER_EPOCH
-            if cfg.training.SAMPLES_PER_EPOCH < len(self.metadata_df)
-            else len(self.metadata_df)
         )
         self.metadata_df["index"] = range(len(self.metadata_df))
 
@@ -91,35 +77,105 @@ class BirdCLEFDataset(Dataset):
             axis=1,
         )
 
-        self.metadata_lookup_files = {}
-        self.metadata_lookup_classes = {}
+        # Initialize tracking for all segment usage (only for training)
+        if self.mode == "train":
+            self.segment_usage_stats_per_epoch = {}
 
-        # Build lookup for files
-        unique_files = self.metadata_df["filename"].unique()
-        for f in unique_files:
-            file_df = self.metadata_df[self.metadata_df["filename"] == f]
-            self.metadata_lookup_files[f] = {
-                "n_segments": len(file_df),
-                "indices": file_df["index"].tolist(),
-                "cache_paths": file_df["cache_path"].tolist(),
+            # Create shared memory structures for segment usage tracking
+            self._shared_segment_counts = {}
+            self._shared_segment_indices = {}
+            self.segment_usage_stats_per_class = {}
+
+            for class_label in self.class_ids:
+                class_segments = self.metadata_df[
+                    self.metadata_df["primary_label"] == class_label
+                ]["segment_file"].unique()
+
+                # Create shared array for this class's segment counts
+                n_segments = len(class_segments)
+                shared_arr = mp.Array(ctypes.c_uint32, n_segments)
+
+                # Create mapping from segment file to index in shared array
+                segment_to_idx = {seg: idx for idx, seg in enumerate(class_segments)}
+
+                self._shared_segment_counts[class_label] = shared_arr
+                self._shared_segment_indices[class_label] = segment_to_idx
+
+                # Create view dictionary that maps segment files to their usage counts
+                self.segment_usage_stats_per_class[class_label] = {
+                    segment_file: 0 for segment_file in class_segments
+                }
+
+            self.segment_usage_stats_lock = mp.Lock()
+
+            # Initialize sample usage tracking with per-class locks
+            self._class_locks = {
+                class_label: mp.Lock() for class_label in self.class_ids
             }
 
-        # Build lookup for classes and initialize permutations
-        for c in self.class_ids:
-            class_df = self.metadata_df[self.metadata_df["primary_label"] == c]
-            n_segments = len(class_df)
-            self.metadata_lookup_classes[c] = {
-                "n_segments": n_segments,
-                "n_files": len(class_df["filename"].unique()),
-                "indices": class_df["index"].tolist(),
-                "files": class_df["filename"].unique().tolist(),
-                "cache_paths": class_df["cache_path"].tolist(),
-            }
-            # Initialize permutation for this class
-            self._class_permutation_indices[c] = 0
-            self._class_permutations[c] = self.rng.permutation(n_segments)
+            # Generate one permutation per class that we'll use across epochs
+            self._class_permutations = {}
+            self._class_permutation_indices = {}
 
-        # Create signal power lookup using normalized per-file values
+            # Track how many times we've had to regenerate permutations
+            self._permutation_reset_counts = {
+                class_label: 0 for class_label in self.class_ids
+            }
+
+        # For validation, create a deterministic order of all segments
+        if self.mode != "train":
+            self.all_segment_indices = []
+            for class_label in self.class_ids:
+                class_segments = self.metadata_df[
+                    self.metadata_df["primary_label"] == class_label
+                ]
+                for _, row in class_segments.iterrows():
+                    self.all_segment_indices.append(
+                        {
+                            "class_label": class_label,
+                            "segment_file": row["segment_file"],
+                            "cache_path": row["cache_path"],
+                            "segment_idx": row["segment_idx"],
+                        }
+                    )
+        else:
+            # Initialize samples per epoch for training
+            self.samples_per_epoch = (
+                cfg.training.SAMPLES_PER_EPOCH
+                if cfg.training.SAMPLES_PER_EPOCH < len(self.metadata_df)
+                else len(self.metadata_df)
+            )
+
+            self.metadata_lookup_files = {}
+            self.metadata_lookup_classes = {}
+
+            # Build lookup for files
+            unique_files = self.metadata_df["filename"].unique()
+            for f in unique_files:
+                file_df = self.metadata_df[self.metadata_df["filename"] == f]
+                self.metadata_lookup_files[f] = {
+                    "n_segments": len(file_df),
+                    "indices": file_df["index"].tolist(),
+                    "cache_paths": file_df["cache_path"].tolist(),
+                }
+
+            # Build lookup for classes and initialize permutations
+            for c in self.class_ids:
+                class_df = self.metadata_df[self.metadata_df["primary_label"] == c]
+                n_segments = len(class_df)
+                self.metadata_lookup_classes[c] = {
+                    "n_segments": n_segments,
+                    "n_files": len(class_df["filename"].unique()),
+                    "indices": class_df["index"].tolist(),
+                    "files": class_df["filename"].unique().tolist(),
+                    "cache_paths": class_df["cache_path"].tolist(),
+                    "segments": class_df["segment_file"].tolist(),
+                }
+                # Initialize permutation for this class
+                self._class_permutations[c] = self.rng.permutation(n_segments)
+                self._class_permutation_indices[c] = 0
+
+            # Create signal power lookup using normalized per-file values
         self.signal_power_lookup = dict(
             zip(
                 self.metadata_df["cache_path"].astype(str),
@@ -131,8 +187,61 @@ class BirdCLEFDataset(Dataset):
         )
 
         logger.info(
-            f"{self.mode} dataset loaded with {len(self.metadata_lookup_files)} files, {len(self.metadata_df)} samples and {len(self.metadata_lookup_classes)} classes; {self.samples_per_epoch} samples per epoch"
+            f"{self.mode} dataset loaded with {len(self.metadata_df['filename'].unique())} files, {len(self.metadata_df)} samples and {len(self.class_ids)} classes;"
+            + (
+                f" {self.samples_per_epoch} samples per epoch ({self.samples_per_epoch // self.cfg.training.BATCH_SIZE} batches ({self.cfg.training.BATCH_SIZE}) per epoch)"
+                if self.mode == "train"
+                else ""
+            )
         )
+
+    def get_segment_usage_stats(self, epoch) -> Dict:
+        """Get data for plotting sampling histogram."""
+        usage_stats = {}
+        with self.segment_usage_stats_lock:
+            for class_label in self.class_ids:
+                # Update the dictionary view with current shared memory values
+                shared_arr = self._shared_segment_counts[class_label]
+                segment_to_idx = self._shared_segment_indices[class_label]
+
+                for segment_file, idx in segment_to_idx.items():
+                    self.segment_usage_stats_per_class[class_label][segment_file] = (
+                        shared_arr[idx]
+                    )
+
+                class_usage = np.array(
+                    list(self.segment_usage_stats_per_class[class_label].values())
+                )
+                usage_stats[class_label] = {
+                    "mean_usage": np.mean(class_usage),
+                    "max_usage": np.max(class_usage),
+                    "unused_segments": (class_usage == 0).sum(),
+                    "total_segments": self.metadata_lookup_classes[class_label][
+                        "n_segments"
+                    ],
+                    "total_segments_drawn": np.sum(class_usage),
+                }
+            self.segment_usage_stats_per_epoch[epoch] = usage_stats
+
+            histogram_data = {
+                "classes": self.class_ids,
+                "total_segments_drawn": np.array(
+                    [usage_stats[c]["total_segments_drawn"] for c in self.class_ids]
+                ),
+                "total_segments": np.asarray(
+                    [usage_stats[c]["total_segments"] for c in self.class_ids]
+                ),
+                "mean_usage_per_class": np.asarray(
+                    [usage_stats[c]["mean_usage"] for c in self.class_ids]
+                ),
+                "max_usage_per_class": np.asarray(
+                    [usage_stats[c]["max_usage"] for c in self.class_ids]
+                ),
+                "unused_segments_per_class": np.asarray(
+                    [usage_stats[c]["unused_segments"] for c in self.class_ids]
+                ),
+            }
+            return histogram_data
 
     def compute_class_weights(self):
         class_weights = np.ones(len(self.class_ids)) / len(self.class_ids)
@@ -145,41 +254,68 @@ class BirdCLEFDataset(Dataset):
         return class_weights
 
     def get_next_segment_idx(self, class_label):
-        """Get next segment index from the pre-generated permutation"""
+        """Get next unused sample index from the class's permutation"""
         with self._class_locks[class_label]:
             idx = self._class_permutation_indices[class_label]
             n_segments = self.metadata_lookup_classes[class_label]["n_segments"]
 
-            # If we've used all segments, generate new permutation
+            # If we've used all segments, generate new permutation with a different seed
             if idx >= n_segments:
-                self._class_permutations[class_label] = self.rng.permutation(n_segments)
-                idx = 0
+                # Create a new seed combining class label hash, reset count, and base seed
+                combined_seed = (
+                    self.cfg.seed
+                    + (hash(class_label) & 0xFFFFFFFF)
+                    + self._permutation_reset_counts[class_label] * 65537
+                ) & 0xFFFFFFFF
 
-            # Get segment index from permutation
+                # Create a new RNG instance with the combined seed
+                permutation_rng = np.random.RandomState(combined_seed)
+                self._class_permutations[class_label] = permutation_rng.permutation(
+                    n_segments
+                )
+                idx = 0
+                self._permutation_reset_counts[class_label] += 1
+
+            # Get segment index from permutation and increment position
             segment_idx = self._class_permutations[class_label][idx]
             self._class_permutation_indices[class_label] = idx + 1
 
             return segment_idx
 
     def __len__(self):
-        return self.samples_per_epoch
+        """Return dataset length based on mode"""
+        if self.mode == "train":
+            return self.samples_per_epoch
+        else:
+            return len(self.all_segment_indices)
 
     def __getitem__(self, idx):
-        # First sample a class uniformly
-        class_idx = self.rng.choice(len(self.class_ids), p=self.class_weights)
-        class_label = self.class_ids[class_idx]
+        if self.mode == "train":
+            # Existing training logic
+            class_label = self.rng.choice(self.class_ids, p=self.class_weights)
+            segment_idx = self.get_next_segment_idx(class_label)
+            cache_path = self.metadata_lookup_classes[class_label]["cache_paths"][
+                segment_idx
+            ]
+            segment_file = self.metadata_lookup_classes[class_label]["segments"][
+                segment_idx
+            ]
 
-        # Get all segments for this class
-        class_info = self.metadata_lookup_classes[class_label]
-        n_segments = class_info["n_segments"]
+            # Update usage tracking with thread safety using shared memory
+            with self.segment_usage_stats_lock:
+                shared_arr = self._shared_segment_counts[class_label]
+                segment_idx_in_arr = self._shared_segment_indices[class_label][
+                    segment_file
+                ]
+                shared_arr[segment_idx_in_arr] += 1
+        else:
+            # Validation mode: use deterministic ordering
+            segment_info = self.all_segment_indices[idx]
+            class_label = segment_info["class_label"]
+            segment_file = segment_info["segment_file"]
+            cache_path = segment_info["cache_path"]
+            segment_idx = segment_info["segment_idx"]
 
-        if n_segments == 0:
-            logger.error(f"No segments found for class {class_label}")
-            return self._create_empty_sample(class_idx, class_label)
-
-        # Get next segment index from permutation
-        segment_idx = self.get_next_segment_idx(class_label)
-        cache_path = class_info["cache_paths"][segment_idx]
         spectrogram = torch.load(cache_path)
 
         if (
@@ -199,6 +335,7 @@ class BirdCLEFDataset(Dataset):
             "primary_target": primary_target,
             "secondary_target": secondary_target,
             "class_label": class_label,
+            "segment_file": segment_file,
             "segment_idx": segment_idx,
             "signal_power_weight": self.signal_power_lookup.get(str(cache_path), 0.1),
         }
@@ -207,6 +344,7 @@ class BirdCLEFDataset(Dataset):
         """Create an empty sample with zeros when loading fails"""
         empty_spectrogram = torch.zeros((1, 224, 224), dtype=torch.float32)
         primary_target = torch.zeros(self.num_classes, dtype=torch.float32)
+        target = torch.zeros(self.num_classes, dtype=torch.float32)
         primary_target[class_idx] = 1.0
         secondary_target = torch.zeros(self.num_classes, dtype=torch.float32)
         return {

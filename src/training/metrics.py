@@ -304,3 +304,74 @@ def analyze_class_performance(
             for label in labels
         },
     }
+
+
+def create_sampling_plots(segment_usage_stats, epoch):
+    """
+    Create Plotly figures for sampling statistics that can be tracked over epochs.
+
+    Args:
+        segment_usage_stats: Dictionary containing sampling statistics
+        epoch: Current epoch number
+
+    Returns:
+        Dictionary of plot names to plotly figures and summary statistics
+    """
+    plots = {}
+    classes = segment_usage_stats["classes"]
+
+    # Define metrics to plot with their titles and y-axis labels
+    metrics_info = [
+        ("total_segments", "Total Segments per Class", "Count"),
+        ("total_segments_drawn", "Segments Drawn per Class", "Count"),
+        ("mean_usage_per_class", "Mean Usage per Class", "Times Used"),
+        ("max_usage_per_class", "Maximum Usage per Class", "Times Used"),
+        ("unused_segments_per_class", "Unused Segments per Class", "Count"),
+    ]
+
+    for metric_key, title, y_label in metrics_info:
+        values = segment_usage_stats[metric_key]
+        fig = go.Figure()
+        fig.add_trace(
+            go.Bar(
+                x=classes,
+                y=[v for v in values],
+                name=metric_key,
+                hovertemplate="Class: %{x}<br>"
+                + f"{y_label}: %{{y:.2f}}<extra></extra>",
+                orientation="v",
+            )
+        )
+
+        # Update layout
+        fig.update_layout(
+            height=400,
+            width=800,
+            title_text=f"{title} (Epoch {epoch})",
+            showlegend=False,
+            xaxis_title="Class",
+            yaxis_title=y_label,
+            xaxis=dict(tickangle=45, type="category"),  # Force categorical axis
+            margin=dict(b=100),  # Add bottom margin for rotated labels
+        )
+
+        # If all values are zero, add annotation
+        if all(v == 0 for v in values):
+            fig.add_annotation(
+                text="No data recorded yet",
+                xref="paper",
+                yref="paper",
+                x=0.5,
+                y=0.5,
+                showarrow=False,
+                font=dict(size=20),
+            )
+
+        # Store plot and summary statistic
+        plot_key = f"{metric_key}"
+        stat_key = f"{metric_key}_mean"
+
+        plots[plot_key] = fig
+        plots[stat_key] = float(np.mean(values))
+
+    return plots

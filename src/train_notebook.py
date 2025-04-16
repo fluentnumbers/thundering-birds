@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import psutil
 import torch
 import torch.nn as nn
@@ -33,6 +34,7 @@ from src.training.losses import AsymmetricLossMultiLabel, HierarchicalBCELoss
 from src.training.metrics import (
     analyze_class_performance,
     calculate_class_metrics,
+    create_sampling_plots,
     plot_class_metrics,
     plot_confusion_matrix,
 )
@@ -462,7 +464,7 @@ def run_training(cfg):
     logger.info(f"Starting training run in {run_dir}")
 
     # Initialize wandb group for all folds
-    wandb_group = f"train_{'DEBUG' if cfg.training.DEBUG else ''}_{cfg.device.upper()}_{timestamp}"
+    wandb_group = f"train_{'DEBUG' if cfg.training.DEBUG else 'PROD'}_{cfg.device.upper()}_{timestamp}"
 
     # Load training data
     logger.info("Loading training data...")
@@ -472,9 +474,13 @@ def run_training(cfg):
         cfg.update_debug_settings()
         # Filter the dataframe to keep only the top 3 classes
         class_counts = df["primary_label"].value_counts().sort_index()
-        top_n_classes = class_counts[class_counts >= 4][
-            : cfg.training.DEBUG_N_CLASSES
-        ].index.tolist()
+        # Get half of the classes with most files and half with least files
+        half_n = cfg.training.DEBUG_N_CLASSES // 2
+        most_common_classes = class_counts.nlargest(half_n).index.tolist()
+        least_common_classes = (
+            class_counts[class_counts >= 4].nsmallest(half_n).index.tolist()
+        )
+        top_n_classes = most_common_classes + least_common_classes
 
         df = df[df["primary_label"].isin(top_n_classes)]
         logger.info(
@@ -525,8 +531,8 @@ def run_training(cfg):
             },
         )
 
-        train_df = df.iloc[train_file_idx].reset_index(drop=True)
-        val_df = df.iloc[val_file_idx].reset_index(drop=True)
+        train_df = df.iloc[train_file_idx].reset_index(drop=False)
+        val_df = df.iloc[val_file_idx].reset_index(drop=False)
 
         train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
         val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
@@ -623,96 +629,121 @@ def run_training(cfg):
                 val_metrics["confusion_matrix"], species_ids
             )
 
-            # Log metrics to wandb with fold grouping
+            # Get sampling histogram data
+            segment_usage_stats = train_dataset.get_segment_usage_stats(epoch)
+
+            # Create sampling distribution plots
+            sampling_plots = create_sampling_plots(segment_usage_stats, epoch + 1)
+
+            # Log all metrics to wandb with fold grouping
             wandb_logger.log(
                 {
                     "epoch": epoch + 1,
                     "fold": fold,
+                    "TOP/val_loss": val_loss,
+                    "TOP/train_loss": train_loss,
+                    "TOP/val_f1": val_metrics["macro_metrics"]["f1"],
+                    "TOP/val_confusion_matrix": val_cm_plot,
                     # Loss metrics
-                    "train_loss": train_loss,
-                    "train_weighted_loss": train_metrics["train_weighted_loss"],
-                    "val_loss": val_loss,  # Raw validation loss
+                    "train/loss": train_loss,
+                    "train/weighted_loss": train_metrics["train_weighted_loss"],
+                    "val/loss": val_loss,
                     # Macro metrics
-                    "train_auc": train_metrics["macro_metrics"]["auc"],
-                    "train_f1": train_metrics["macro_metrics"]["f1"],
-                    "train_precision": train_metrics["macro_metrics"]["precision"],
-                    "train_recall": train_metrics["macro_metrics"]["recall"],
-                    "val_auc": val_metrics["macro_metrics"]["auc"],
-                    "val_f1": val_metrics["macro_metrics"]["f1"],
-                    "val_precision": val_metrics["macro_metrics"]["precision"],
-                    "val_recall": val_metrics["macro_metrics"]["recall"],
+                    "train/auc": train_metrics["macro_metrics"]["auc"],
+                    "train/f1": train_metrics["macro_metrics"]["f1"],
+                    "train/precision": train_metrics["macro_metrics"]["precision"],
+                    "train/recall": train_metrics["macro_metrics"]["recall"],
+                    "val/auc": val_metrics["macro_metrics"]["auc"],
+                    "val/f1": val_metrics["macro_metrics"]["f1"],
+                    "val/precision": val_metrics["macro_metrics"]["precision"],
+                    "val/recall": val_metrics["macro_metrics"]["recall"],
                     # Top-k accuracy
-                    "train_top_k_accuracy": train_metrics["top_k_accuracy"],
-                    "val_top_k_accuracy": val_metrics["top_k_accuracy"],
+                    "train/top_k_accuracy": train_metrics["top_k_accuracy"],
+                    "val/top_k_accuracy": val_metrics["top_k_accuracy"],
                     # Class size correlations
-                    "train_class_size_f1_correlation": train_analysis[
+                    "train/class_size_f1_correlation": train_analysis[
                         "class_size_correlation"
                     ]["f1"],
-                    "train_class_size_auc_correlation": train_analysis[
+                    "train/class_size_auc_correlation": train_analysis[
                         "class_size_correlation"
                     ]["auc"],
-                    "val_class_size_f1_correlation": val_analysis[
+                    "val/class_size_f1_correlation": val_analysis[
                         "class_size_correlation"
                     ]["f1"],
-                    "val_class_size_auc_correlation": val_analysis[
+                    "val/class_size_auc_correlation": val_analysis[
                         "class_size_correlation"
                     ]["auc"],
                     # Learning rate
                     "learning_rate": (
                         scheduler.get_last_lr()[0] if scheduler else cfg.training.LR
                     ),
+                    "train_hard_classes": train_analysis["hard_classes"],
+                    "train_easy_classes": train_analysis["easy_classes"],
+                    "val_hard_classes": val_analysis["hard_classes"],
+                    "val_easy_classes": val_analysis["easy_classes"],
                     # Visualizations
-                    "train_precision_plot": train_metrics_plots[0],
-                    "train_recall_plot": train_metrics_plots[1],
-                    "train_f1_plot": train_metrics_plots[2],
-                    "train_auc_plot": train_metrics_plots[3],
-                    "val_precision_plot": val_metrics_plots[0],
-                    "val_recall_plot": val_metrics_plots[1],
-                    "val_f1_plot": val_metrics_plots[2],
-                    "val_auc_plot": val_metrics_plots[3],
-                    "train_confusion_matrix": train_cm_plot,
-                    "val_confusion_matrix": val_cm_plot,
-                }
+                    "train/precision_plot": train_metrics_plots[0],
+                    "train/recall_plot": train_metrics_plots[1],
+                    "train/f1_plot": train_metrics_plots[2],
+                    "train/auc_plot": train_metrics_plots[3],
+                    "val/precision_plot": val_metrics_plots[0],
+                    "val/recall_plot": val_metrics_plots[1],
+                    "val/f1_plot": val_metrics_plots[2],
+                    "val/auc_plot": val_metrics_plots[3],
+                    "train/confusion_matrix": train_cm_plot,
+                    "val/confusion_matrix": val_cm_plot,
+                    "sampling/total_segments": sampling_plots["total_segments"],
+                    "sampling/total_segments_drawn": sampling_plots[
+                        "total_segments_drawn"
+                    ],
+                    "sampling/mean_usage_per_class": sampling_plots[
+                        "mean_usage_per_class"
+                    ],
+                    "sampling/max_usage_per_class": sampling_plots[
+                        "max_usage_per_class"
+                    ],
+                    "sampling/unused_segments_per_class": sampling_plots[
+                        "unused_segments_per_class"
+                    ],
+                },
             )
 
             # Log class-specific metrics
             for label in species_ids:
                 wandb_logger.log(
                     {
-                        f"train_{label}_precision": train_metrics["per_class"][label][
-                            "precision"
+                        f"per_class/train_{label}_precision": train_metrics[
+                            "per_class"
+                        ][label]["precision"],
+                        f"per_class/train_{label}_recall": train_metrics["per_class"][
+                            label
+                        ]["recall"],
+                        f"per_class/train_{label}_f1": train_metrics["per_class"][
+                            label
+                        ]["f1"],
+                        f"per_class/train_{label}_auc": train_metrics["per_class"][
+                            label
+                        ]["auc"],
+                        f"per_class/train_{label}_support": train_metrics["per_class"][
+                            label
+                        ]["support"],
+                        f"per_class/val_{label}_precision": val_metrics["per_class"][
+                            label
+                        ]["precision"],
+                        f"per_class/val_{label}_recall": val_metrics["per_class"][
+                            label
+                        ]["recall"],
+                        f"per_class/val_{label}_f1": val_metrics["per_class"][label][
+                            "f1"
                         ],
-                        f"train_{label}_recall": train_metrics["per_class"][label][
-                            "recall"
+                        f"per_class/val_{label}_auc": val_metrics["per_class"][label][
+                            "auc"
                         ],
-                        f"train_{label}_f1": train_metrics["per_class"][label]["f1"],
-                        f"train_{label}_auc": train_metrics["per_class"][label]["auc"],
-                        f"train_{label}_support": train_metrics["per_class"][label][
-                            "support"
-                        ],
-                        f"val_{label}_precision": val_metrics["per_class"][label][
-                            "precision"
-                        ],
-                        f"val_{label}_recall": val_metrics["per_class"][label][
-                            "recall"
-                        ],
-                        f"val_{label}_f1": val_metrics["per_class"][label]["f1"],
-                        f"val_{label}_auc": val_metrics["per_class"][label]["auc"],
-                        f"val_{label}_support": val_metrics["per_class"][label][
-                            "support"
-                        ],
+                        f"per_class/val_{label}_support": val_metrics["per_class"][
+                            label
+                        ]["support"],
                     }
                 )
-
-            # Log hard and easy classes
-            wandb_logger.log(
-                {
-                    "train_hard_classes": train_analysis["hard_classes"],
-                    "train_easy_classes": train_analysis["easy_classes"],
-                    "val_hard_classes": val_analysis["hard_classes"],
-                    "val_easy_classes": val_analysis["easy_classes"],
-                }
-            )
 
             # Use raw validation loss or other metrics for early stopping
             if cfg.training.EARLY_STOPPING_METRIC == "loss":
