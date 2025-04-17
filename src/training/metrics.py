@@ -340,6 +340,13 @@ def create_sampling_plots(segment_usage_stats, epoch):
                 hovertemplate="Class: %{x}<br>"
                 + f"{y_label}: %{{y:.2f}}<extra></extra>",
                 orientation="v",
+                width=0.5,
+                # Add text labels on top of each bar
+                text=[str(int(v)) if v == int(v) else f"{v:.1f}" for v in values],
+                textposition="outside",
+                textfont=dict(
+                    size=10,
+                ),
             )
         )
 

@@ -37,9 +37,68 @@ def load_cache_metadata(cfg):
     df_cache["snr_db"] = pd.to_numeric(df_cache["snr_db"], errors="coerce")
 
     df_cache = df_cache[df_cache["silence_pct"] < 100]
-    df_cache = df_cache[~df_cache["rating"].isin([0.5, 1.0, 1.5])]
-    df_cache = df_cache[df_cache["signal_power"] > 0.002]
-    df_cache = df_cache[df_cache["snr_db"] > 0]
+
+    # Calculate the number of segments per class
+    class_segment_counts = df_cache["primary_label"].value_counts()
+
+    # Find bottom 10% of classes by number of segments
+    bottom_10_percent_classes = class_segment_counts[
+        class_segment_counts <= np.percentile(class_segment_counts.values, 10)
+    ].index.tolist()
+
+    # Find top 10% of classes by number of segments
+    top_10_percent_classes = class_segment_counts[
+        class_segment_counts >= np.percentile(class_segment_counts.values, 90)
+    ].index.tolist()
+
+    logger.info(
+        f"Bottom 10% classes (excluded from filtering): {len(bottom_10_percent_classes)}"
+    )
+    logger.info(f"Top 10% classes (stricter filtering): {len(top_10_percent_classes)}")
+
+    # Create a copy of the dataframe for filtering
+    df_filtered = df_cache.copy()
+
+    # Apply stricter filtering only to top 10% classes
+    stricter_filter_mask = (
+        (df_filtered["primary_label"].isin(top_10_percent_classes))
+        & (df_filtered["signal_power"] > 0.005)  # Stricter signal power threshold
+        & (df_filtered["snr_db"] > 0.1)  # Stricter SNR threshold
+        & ~(df_filtered["rating"].isin([0.5, 1, 1.5]))
+    )
+
+    # Keep all segments from bottom 10% classes
+    keep_mask = df_filtered["primary_label"].isin(bottom_10_percent_classes)
+
+    # Apply normal filtering to the middle 80% classes
+    middle_classes_mask = (
+        ~(
+            df_filtered["primary_label"].isin(bottom_10_percent_classes)
+            | df_filtered["primary_label"].isin(top_10_percent_classes)
+        )
+        & (df_filtered["signal_power"] > 0.002)
+        & (df_filtered["snr_db"] > 0)
+        & ~(df_filtered["rating"].isin([0.5, 1, 1.5]))
+    )
+
+    # Combine the masks to get the final dataframe
+    df_cache = pd.concat(
+        [
+            df_filtered[keep_mask],  # Bottom 10% (no filtering)
+            df_filtered[middle_classes_mask],  # Middle 80% (normal filtering)
+            df_filtered[
+                stricter_filter_mask & ~keep_mask
+            ],  # Top 10% (stricter filtering)
+        ]
+    )
+
+    # Log the filtering results
+    logger.info(f"Original segments count: {len(df_filtered)}")
+    logger.info(f"After class-specific filtering: {len(df_cache)}")
+    logger.info(f"Segments from bottom 10% classes: now {sum(keep_mask)}, before ")
+    logger.info(
+        f"Segments from top 10% classes after filtering: now {sum(stricter_filter_mask & ~keep_mask)}, before "
+    )
 
     # Assert that we have the expected number of classes (206)
     unique_classes = df_cache["primary_label"].nunique()
@@ -308,6 +367,7 @@ class BirdCLEFDataset(Dataset):
                     segment_file
                 ]
                 shared_arr[segment_idx_in_arr] += 1
+                num_times_used = shared_arr[segment_idx_in_arr]
         else:
             # Validation mode: use deterministic ordering
             segment_info = self.all_segment_indices[idx]
@@ -318,11 +378,10 @@ class BirdCLEFDataset(Dataset):
 
         spectrogram = torch.load(cache_path)
 
-        if (
-            self.mode == "train"
-            and random.random() < self.cfg.training.AUGMENTATION_PROB
-        ):
-            spectrogram = self.apply_spec_augmentations(spectrogram)
+        if self.mode == "train" and num_times_used > 1:
+            spectrogram = self.apply_spec_augmentations(
+                spectrogram, num_times_used=num_times_used
+            )
 
         # Create target vectors
         primary_target, secondary_target, target = self._create_targets(
@@ -357,30 +416,67 @@ class BirdCLEFDataset(Dataset):
             "signal_power_weight": 0.1,  # minimum weight for failed samples
         }
 
-    def apply_spec_augmentations(self, spec):
-        """Apply augmentations to spectrogram"""
+    def apply_spec_augmentations(self, spec, num_times_used):
+        """Apply augmentations to spectrogram with usage-based intensity
 
-        # Time masking (horizontal stripes)
+        Args:
+            spec (torch.Tensor): Input spectrogram
+            num_times_used (int): Number of times the segment has been used
+        """
+        # Get usage count for this segment if tracking info is available
+        usage_factor = min(1.0 + (num_times_used * 0.1), 2.0)  # Cap at 2.0
+
+        # Time masking (horizontal stripes) with scaled width
         if random.random() < 0.5:
-            num_masks = random.randint(1, 3)
+            num_masks = random.randint(1, max(2, int(3 * usage_factor)))
             for _ in range(num_masks):
-                width = random.randint(5, 20)
+                width = random.randint(5, int(20 * usage_factor))
                 start = random.randint(0, spec.shape[2] - width)
                 spec[0, :, start : start + width] = 0
 
-        # Frequency masking (vertical stripes)
+        # Frequency masking (vertical stripes) with scaled height
         if random.random() < 0.5:
-            num_masks = random.randint(1, 3)
+            num_masks = random.randint(1, max(2, int(3 * usage_factor)))
             for _ in range(num_masks):
-                height = random.randint(5, 20)
+                height = random.randint(5, int(20 * usage_factor))
                 start = random.randint(0, spec.shape[1] - height)
                 spec[0, start : start + height, :] = 0
 
-        # Random brightness/contrast
+        # Random brightness/contrast with scaled intensity
         if random.random() < 0.5:
-            gain = random.uniform(0.8, 1.2)
-            bias = random.uniform(-0.1, 0.1)
+            gain = random.uniform(1.0 - 0.2 * usage_factor, 1.0 + 0.2 * usage_factor)
+            bias = random.uniform(-0.1 * usage_factor, 0.1 * usage_factor)
             spec = spec * gain + bias
+            spec = torch.clamp(spec, 0, 1)
+
+        # Frequency shift (pitch shift simulation) for heavily used samples
+        if random.random() < 0.3 * usage_factor:
+            shift = random.randint(-2, 2)
+            spec = torch.roll(spec, shifts=shift, dims=1)
+
+        # Time stretching for heavily used samples
+        if random.random() < 0.3 * usage_factor:
+            stretch_factor = random.uniform(0.9, 1.1)
+            orig_size = spec.shape[2]
+            stretched_size = int(orig_size * stretch_factor)
+            if stretched_size != orig_size:
+                spec = torch.nn.functional.interpolate(
+                    spec.unsqueeze(0),
+                    size=(spec.shape[1], stretched_size),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                if stretched_size > orig_size:
+                    spec = spec[:, :, :orig_size]
+                else:
+                    spec = torch.nn.functional.pad(
+                        spec, (0, orig_size - stretched_size)
+                    )
+
+        # Add noise for heavily used samples
+        if random.random() < 0.3 * usage_factor:
+            noise = torch.randn_like(spec) * (0.02 * usage_factor)
+            spec = spec + noise
             spec = torch.clamp(spec, 0, 1)
 
         return spec
