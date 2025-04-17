@@ -677,10 +677,10 @@ def run_training(cfg):
                     "learning_rate": (
                         scheduler.get_last_lr()[0] if scheduler else cfg.training.LR
                     ),
-                    "train_hard_classes": train_analysis["hard_classes"],
-                    "train_easy_classes": train_analysis["easy_classes"],
-                    "val_hard_classes": val_analysis["hard_classes"],
-                    "val_easy_classes": val_analysis["easy_classes"],
+                    "train/hard_classes": train_analysis["hard_classes"],
+                    "train/easy_classes": train_analysis["easy_classes"],
+                    "val/hard_classes": val_analysis["hard_classes"],
+                    "val/easy_classes": val_analysis["easy_classes"],
                     # Visualizations
                     "train/precision_plot": train_metrics_plots[0],
                     "train/recall_plot": train_metrics_plots[1],
@@ -692,19 +692,13 @@ def run_training(cfg):
                     "val/auc_plot": val_metrics_plots[3],
                     "train/confusion_matrix": train_cm_plot,
                     "val/confusion_matrix": val_cm_plot,
-                    "sampling/total_segments": sampling_plots["total_segments"],
-                    "sampling/total_segments_drawn": sampling_plots[
-                        "total_segments_drawn"
+                    "sampling/n_segments_total": sampling_plots["n_segments_total"],
+                    "sampling/n_segments_drawn_with_repetitions": sampling_plots[
+                        "n_segments_drawn_with_repetitions"
                     ],
-                    "sampling/mean_usage_per_class": sampling_plots[
-                        "mean_usage_per_class"
-                    ],
-                    "sampling/max_usage_per_class": sampling_plots[
-                        "max_usage_per_class"
-                    ],
-                    "sampling/unused_segments_per_class": sampling_plots[
-                        "unused_segments_per_class"
-                    ],
+                    "sampling/n_times_drawn_mean": sampling_plots["n_times_drawn_mean"],
+                    "sampling/n_times_drawn_max": sampling_plots["n_times_drawn_max"],
+                    "sampling/n_segments_unused": sampling_plots["n_segments_unused"],
                 },
             )
 

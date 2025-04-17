@@ -231,7 +231,7 @@ class BirdCLEFDataset(Dataset):
                     "segments": class_df["segment_file"].tolist(),
                 }
                 # Initialize permutation for this class
-                self._class_permutations[c] = self.rng.permutation(n_segments)
+                self._class_permutations[c] = list(self.rng.permutation(n_segments))
                 self._class_permutation_indices[c] = 0
 
             # Create signal power lookup using normalized per-file values
@@ -272,32 +272,35 @@ class BirdCLEFDataset(Dataset):
                     list(self.segment_usage_stats_per_class[class_label].values())
                 )
                 usage_stats[class_label] = {
-                    "mean_usage": np.mean(class_usage),
-                    "max_usage": np.max(class_usage),
-                    "unused_segments": (class_usage == 0).sum(),
-                    "total_segments": self.metadata_lookup_classes[class_label][
+                    "n_times_drawn_mean": np.mean(class_usage),
+                    "n_times_drawn_max": np.max(class_usage),
+                    "n_segments_unused": (class_usage == 0).sum(),
+                    "n_segments_total": self.metadata_lookup_classes[class_label][
                         "n_segments"
                     ],
-                    "total_segments_drawn": np.sum(class_usage),
+                    "n_segments_drawn_with_repetitions": np.sum(class_usage),
                 }
             self.segment_usage_stats_per_epoch[epoch] = usage_stats
 
             histogram_data = {
                 "classes": self.class_ids,
-                "total_segments_drawn": np.array(
-                    [usage_stats[c]["total_segments_drawn"] for c in self.class_ids]
+                "n_segments_drawn_with_repetitions": np.array(
+                    [
+                        usage_stats[c]["n_segments_drawn_with_repetitions"]
+                        for c in self.class_ids
+                    ]
                 ),
-                "total_segments": np.asarray(
-                    [usage_stats[c]["total_segments"] for c in self.class_ids]
+                "n_segments_total": np.asarray(
+                    [usage_stats[c]["n_segments_total"] for c in self.class_ids]
                 ),
-                "mean_usage_per_class": np.asarray(
-                    [usage_stats[c]["mean_usage"] for c in self.class_ids]
+                "n_times_drawn_mean": np.asarray(
+                    [usage_stats[c]["n_times_drawn_mean"] for c in self.class_ids]
                 ),
-                "max_usage_per_class": np.asarray(
-                    [usage_stats[c]["max_usage"] for c in self.class_ids]
+                "n_times_drawn_max": np.asarray(
+                    [usage_stats[c]["n_times_drawn_max"] for c in self.class_ids]
                 ),
-                "unused_segments_per_class": np.asarray(
-                    [usage_stats[c]["unused_segments"] for c in self.class_ids]
+                "n_segments_unused": np.asarray(
+                    [usage_stats[c]["n_segments_unused"] for c in self.class_ids]
                 ),
             }
             return histogram_data
@@ -315,12 +318,14 @@ class BirdCLEFDataset(Dataset):
     def get_next_segment_idx(self, class_label):
         """Get next unused sample index from the class's permutation"""
         with self._class_locks[class_label]:
-            idx = self._class_permutation_indices[class_label]
             n_segments = self.metadata_lookup_classes[class_label]["n_segments"]
 
-            # If we've used all segments, generate new permutation with a different seed
-            if idx >= n_segments:
-                # Create a new seed combining class label hash, reset count, and base seed
+            # Check if we need to initialize or reset the permutation
+            if (
+                class_label not in self._class_permutations
+                or len(self._class_permutations[class_label]) == 0
+            ):
+                # Create a new seed combining class label hash and reset count
                 combined_seed = (
                     self.cfg.seed
                     + (hash(class_label) & 0xFFFFFFFF)
@@ -329,15 +334,13 @@ class BirdCLEFDataset(Dataset):
 
                 # Create a new RNG instance with the combined seed
                 permutation_rng = np.random.RandomState(combined_seed)
-                self._class_permutations[class_label] = permutation_rng.permutation(
-                    n_segments
+                self._class_permutations[class_label] = list(
+                    permutation_rng.permutation(n_segments)
                 )
-                idx = 0
                 self._permutation_reset_counts[class_label] += 1
 
-            # Get segment index from permutation and increment position
-            segment_idx = self._class_permutations[class_label][idx]
-            self._class_permutation_indices[class_label] = idx + 1
+            # Get next index from the permutation and remove it
+            segment_idx = self._class_permutations[class_label].pop(0)
 
             return segment_idx
 

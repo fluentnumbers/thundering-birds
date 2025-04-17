@@ -322,11 +322,11 @@ def create_sampling_plots(segment_usage_stats, epoch):
 
     # Define metrics to plot with their titles and y-axis labels
     metrics_info = [
-        ("total_segments", "Total Segments per Class", "Count"),
-        ("total_segments_drawn", "Segments Drawn per Class", "Count"),
-        ("mean_usage_per_class", "Mean Usage per Class", "Times Used"),
-        ("max_usage_per_class", "Maximum Usage per Class", "Times Used"),
-        ("unused_segments_per_class", "Unused Segments per Class", "Count"),
+        ("n_segments_total", "Total Segments per Class", "Count"),
+        ("n_segments_drawn_with_repetitions", "Segments Drawn per Class", "Count"),
+        ("n_times_drawn_mean", "Mean Usage per Class", "Times Used"),
+        ("n_times_drawn_max", "Maximum Usage per Class", "Times Used"),
+        ("n_segments_unused", "Unused Segments per Class", "Count"),
     ]
 
     for metric_key, title, y_label in metrics_info:
