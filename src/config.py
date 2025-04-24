@@ -45,6 +45,7 @@ class CFG:
     training.AUGMENTATION_PROB = 0
     training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = None
     training.N_FOLD = 5
+    training.SAMPLING_CLASSES_WEIGHTS = "segments_inverse"
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
     training.SAMPLES_PER_EPOCH = 25000
     training.CORRECT_LOSS = True

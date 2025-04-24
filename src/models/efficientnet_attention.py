@@ -123,11 +123,11 @@ class EfficientNetWithAttention(nn.Module):
 
         # Add final classification layers with appropriate dropout
         self.classifier = nn.Sequential(
-            nn.Dropout(p=0.5),  # Dropout after feature extraction
+            nn.Dropout(p=0.3),  # Dropout after feature extraction
             nn.Linear(self.efficientnet._fc.in_features, 512),
             nn.ReLU(),
             nn.BatchNorm1d(512),
-            nn.Dropout(p=0.3),  # Dropout before final classification
+            nn.Dropout(p=0.2),  # Dropout before final classification
             nn.Linear(512, num_classes),
         )
 

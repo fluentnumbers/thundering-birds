@@ -70,14 +70,23 @@ def load_cache_metadata(cfg):
     )
 
     # For middle and top classes, rank within each file and keep top 50%
-    def get_top_half_mask(group):
+    def get_top_half_mask(group, pct_to_keep=0.5, not_more_than_n=None):
+        """Keep top half of segments per file"""
         n = len(group)
-        return group["signal_power"].rank(ascending=False) <= n / 2
+        if not_more_than_n is not None:
+            n = min(n * pct_to_keep, not_more_than_n)
+        return group["signal_power"].rank(ascending=False) <= n
+
+    def get_top_n_mask(group, n_segments_to_keep=5):
+        """Keep top n segments per file"""
+        return group["signal_power"].rank(ascending=False) <= n_segments_to_keep
 
     # Process middle classes ranking
     middle_filtered = df_cache[middle_mask].copy()
     if not middle_filtered.empty:
-        middle_ranks = middle_filtered.groupby("filename").apply(get_top_half_mask)
+        middle_ranks = middle_filtered.groupby("filename").apply(
+            get_top_half_mask, pct_to_keep=0.5, not_more_than_n=10
+        )
         middle_ranks = middle_ranks.reset_index(
             level=0, drop=True
         )  # Drop filename from index
@@ -85,22 +94,32 @@ def load_cache_metadata(cfg):
             df_cache.index, fill_value=False
         )
 
+    top_mask = (
+        is_top
+        & (df_cache["signal_power"] > 0.001)
+        & (df_cache["snr_db"] > 0)
+        & ~(df_cache["rating"].isin([0.5, 1, 1.5]))
+    )
+
     # Process top classes ranking
-    top_filtered = df_cache[is_top].copy()
+    top_filtered = df_cache[top_mask].copy()
     if not top_filtered.empty:
-        top_ranks = top_filtered.groupby("filename").apply(get_top_half_mask)
+        top_ranks = top_filtered.groupby("filename").apply(
+            get_top_half_mask, pct_to_keep=0.5, not_more_than_n=10
+        )
         top_ranks = top_ranks.reset_index(
             level=0, drop=True
         )  # Drop filename from index
-        top_mask = is_top & top_ranks.reindex(df_cache.index, fill_value=False)
+        top_mask = top_mask & top_ranks.reindex(df_cache.index, fill_value=False)
     else:
-        top_mask = is_top
+        top_mask = top_mask
 
     # Combine all masks efficiently
     final_mask = bottom_mask | middle_mask | top_mask
     df_cache = df_cache[final_mask]
 
     # Log the filtering results
+    logger.info("*" * 100)
     logger.info(
         f"Quality-based segments filtering: {len(df_cache)} left from {len(df_cache[final_mask])}"
     )
@@ -113,7 +132,7 @@ def load_cache_metadata(cfg):
     logger.info(
         f"Segments from top 10% classes: now {sum(df_cache['primary_label'].isin(top_classes))}, before {sum(is_top)}"
     )
-    logger.info("*" * 100)
+    logger.info("-" * 100)
 
     # Assert that we have the expected number of classes (206)
     unique_classes = df_cache["primary_label"].nunique()
@@ -135,7 +154,6 @@ class BirdCLEFDataset(Dataset):
         self.classes_present_in_df = self.df["primary_label"].unique().tolist()
         self.segments_weights_by_rating = (df["rating"].values + 1) / 6
 
-        self.class_weights = self.compute_class_weights()
         self.rng = np.random.RandomState(cfg.seed)
         self.cache_dir = Path(self.cfg.dirs.cache_dir)
         self.df, self.metadata_df = align_df_and_metadata(
@@ -150,51 +168,6 @@ class BirdCLEFDataset(Dataset):
             / f"{row['primary_label']}_{Path(row['filename']).stem}_segment_{row['segment_idx']}.pt",
             axis=1,
         )
-
-        # Initialize tracking for all segment usage (only for training)
-        if self.mode == "train":
-            self.segment_usage_stats_per_epoch = {}
-
-            # Create shared memory structures for segment usage tracking
-            self._shared_segment_counts = {}
-            self._shared_segment_indices = {}
-            self.segment_usage_stats_per_class = {}
-
-            for class_label in self.class_ids:
-                class_segments = self.metadata_df[
-                    self.metadata_df["primary_label"] == class_label
-                ]["segment_file"].unique()
-
-                # Create shared array for this class's segment counts
-                n_segments = len(class_segments)
-                shared_arr = mp.Array(ctypes.c_uint32, n_segments)
-
-                # Create mapping from segment file to index in shared array
-                segment_to_idx = {seg: idx for idx, seg in enumerate(class_segments)}
-
-                self._shared_segment_counts[class_label] = shared_arr
-                self._shared_segment_indices[class_label] = segment_to_idx
-
-                # Create view dictionary that maps segment files to their usage counts
-                self.segment_usage_stats_per_class[class_label] = {
-                    segment_file: 0 for segment_file in class_segments
-                }
-
-            self.segment_usage_stats_lock = mp.Lock()
-
-            # Initialize sample usage tracking with per-class locks
-            self._class_locks = {
-                class_label: mp.Lock() for class_label in self.class_ids
-            }
-
-            # Generate one permutation per class that we'll use across epochs
-            self._class_permutations = {}
-            self._class_permutation_indices = {}
-
-            # Track how many times we've had to regenerate permutations
-            self._permutation_reset_counts = {
-                class_label: 0 for class_label in self.class_ids
-            }
 
         # For validation, create a deterministic order of all segments
         if self.mode != "train":
@@ -246,6 +219,9 @@ class BirdCLEFDataset(Dataset):
                     "segments": class_df["segment_file"].tolist(),
                 }
 
+            self.class_weights = self.compute_class_weights(
+                weight_type=self.cfg.training.SAMPLING_CLASSES_WEIGHTS
+            )
             # Create signal power lookup using normalized per-file values
         self.signal_power_lookup = dict(
             zip(
@@ -266,15 +242,166 @@ class BirdCLEFDataset(Dataset):
             )
         )
 
-    def compute_class_weights(self):
-        class_weights = np.ones(len(self.class_ids)) / len(self.class_ids)
-        mask = ~np.isin(self.class_ids, self.classes_present_in_df)
-        class_weights[mask] = 0
-        if class_weights.sum() > 0:
+    def compute_class_weights(self, weight_type="uniform"):
+        """Compute class weights based on different strategies.
+
+        Args:
+            weight_type (str): Type of weighting strategy to use
+                - "uniform": Equal weights for all classes (default)
+                - "segments": Weights proportional to number of segments per class
+                - "segments_inverse": Weights inversely proportional to square root of segments per class
+                - "files": Weights proportional to number of files per class
+                - "files_inverse": Weights inversely proportional to square root of files per class
+
+        Returns:
+            np.ndarray: Array of class weights
+        """
+        if weight_type == "uniform":
+            class_weights = np.ones(len(self.class_ids)) / len(self.class_ids)
+            mask = ~np.isin(self.class_ids, self.classes_present_in_df)
+            class_weights[mask] = 0
+            if class_weights.sum() > 0:
+                class_weights = class_weights / class_weights.sum()
+            else:
+                raise ValueError("No valid classes found in the dataset")
+            return class_weights
+
+        elif weight_type == "segments":
+            # Get segment counts from metadata_lookup_classes
+            segment_counts = np.zeros(len(self.class_ids))
+            for i, cls in enumerate(self.class_ids):
+                if cls in self.classes_present_in_df:
+                    segment_counts[i] = self.metadata_lookup_classes[cls]["n_segments"]
+
+            # Compute weights proportional to segment counts
+            total_segments = segment_counts.sum()
+            if total_segments == 0:
+                raise ValueError("No segments found in the dataset")
+
+            # Direct weighting: more segments = higher weight
+            class_weights = segment_counts / total_segments
+
+            # Set weight to 0 for classes not present
+            mask = ~np.isin(self.class_ids, self.classes_present_in_df)
+            class_weights[mask] = 0
+
+            # Log class weights for debugging
+            logger.info("\nClass weights based on segment distribution (direct):")
+            logger.info("Class | Segments | Weight")
+            logger.info("-" * 30)
+            for i, cls in enumerate(self.class_ids):
+                if cls in self.classes_present_in_df:
+                    logger.info(
+                        f"{cls} | {int(segment_counts[i]):^8d} | {class_weights[i]:.4f}"
+                    )
+
+            return class_weights
+
+        elif weight_type == "segments_inverse":
+            # Get segment counts from metadata_lookup_classes
+            segment_counts = np.zeros(len(self.class_ids))
+            for i, cls in enumerate(self.class_ids):
+                if cls in self.classes_present_in_df:
+                    segment_counts[i] = self.metadata_lookup_classes[cls]["n_segments"]
+
+            # Compute weights using square root transformation
+            sqrt_segments = np.sqrt(segment_counts)
+            total_sqrt = sqrt_segments.sum()
+            if total_sqrt == 0:
+                raise ValueError("No segments found in the dataset")
+
+            # Inverse weighting with square root: more segments = lower weight, but less extreme
+            class_weights = total_sqrt / (len(self.class_ids) * sqrt_segments)
+
+            # Normalize weights
             class_weights = class_weights / class_weights.sum()
+
+            # Set weight to 0 for classes not present
+            mask = ~np.isin(self.class_ids, self.classes_present_in_df)
+            class_weights[mask] = 0
+
+            # Log class weights for debugging
+            logger.info("\nClass weights based on segment distribution (inverse):")
+            logger.info("Class | Segments | Weight")
+            logger.info("-" * 30)
+            for i, cls in enumerate(self.class_ids):
+                if cls in self.classes_present_in_df:
+                    logger.info(
+                        f"{cls} | {int(segment_counts[i]):^8d} | {class_weights[i]:.4f}"
+                    )
+
+            return class_weights
+
+        elif weight_type == "files":
+            # Get file counts from metadata_lookup_classes
+            file_counts = np.zeros(len(self.class_ids))
+            for i, cls in enumerate(self.class_ids):
+                if cls in self.classes_present_in_df:
+                    file_counts[i] = self.metadata_lookup_classes[cls]["n_files"]
+
+            # Compute weights proportional to file counts
+            total_files = file_counts.sum()
+            if total_files == 0:
+                raise ValueError("No files found in the dataset")
+
+            # Direct weighting: more files = higher weight
+            class_weights = file_counts / total_files
+
+            # Set weight to 0 for classes not present
+            mask = ~np.isin(self.class_ids, self.classes_present_in_df)
+            class_weights[mask] = 0
+
+            # Log class weights for debugging
+            logger.info("\nClass weights based on file distribution (direct):")
+            logger.info("Class | Files | Weight")
+            logger.info("-" * 30)
+            for i, cls in enumerate(self.class_ids):
+                if cls in self.classes_present_in_df:
+                    logger.info(
+                        f"{cls} | {int(file_counts[i]):^5d} | {class_weights[i]:.4f}"
+                    )
+
+            return class_weights
+
+        elif weight_type == "files_inverse":
+            # Get file counts from metadata_lookup_classes
+            file_counts = np.zeros(len(self.class_ids))
+            for i, cls in enumerate(self.class_ids):
+                if cls in self.classes_present_in_df:
+                    file_counts[i] = self.metadata_lookup_classes[cls]["n_files"]
+
+            # Compute weights using square root transformation
+            sqrt_files = np.sqrt(file_counts)
+            total_sqrt = sqrt_files.sum()
+            if total_sqrt == 0:
+                raise ValueError("No files found in the dataset")
+
+            # Inverse weighting with square root: more files = lower weight, but less extreme
+            class_weights = total_sqrt / (len(self.class_ids) * sqrt_files)
+
+            # Normalize weights
+            class_weights = class_weights / class_weights.sum()
+
+            # Set weight to 0 for classes not present
+            mask = ~np.isin(self.class_ids, self.classes_present_in_df)
+            class_weights[mask] = 0
+
+            # Log class weights for debugging
+            logger.info("\nClass weights based on file distribution (inverse):")
+            logger.info("Class | Files | Weight")
+            logger.info("-" * 30)
+            for i, cls in enumerate(self.class_ids):
+                if cls in self.classes_present_in_df:
+                    logger.info(
+                        f"{cls} | {int(file_counts[i]):^5d} | {class_weights[i]:.4f}"
+                    )
+
+            return class_weights
+
         else:
-            raise ValueError("No valid classes found in the dataset")
-        return class_weights
+            raise ValueError(
+                f"Unknown weight_type: {weight_type}. Use 'uniform', 'segments', 'segments_inverse', 'files', or 'files_inverse'"
+            )
 
     def __len__(self):
         """Return dataset length based on mode"""
@@ -307,7 +434,7 @@ class BirdCLEFDataset(Dataset):
         spectrogram = torch.load(cache_path)
 
         num_times_used = 0
-        if self.mode == "train":
+        if self.mode == "train" and random.random() < 0:
             spectrogram = self.apply_spec_augmentations(
                 spectrogram, num_times_used=num_times_used
             )
