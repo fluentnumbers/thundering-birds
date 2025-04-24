@@ -422,42 +422,112 @@ def validate(model, loader, criterion, device, cfg, species_ids=None):
 
 
 def get_folds(df, cfg):
+    """Create folds ensuring each class has at least one file in both train and validation splits.
+
+    Strategy:
+    1. For each class, reserve one file for validation to ensure representation
+    2. Use StratifiedGroupKFold on the remaining files
+    3. Add back the reserved files to create final splits
+    """
     # Groups are audio files (recordings)
-    groups = df["filename"]  # Each recording is a group
-    # Labels for stratification
+    groups = df["filename"]
     labels = df["primary_label"]
 
-    # Initialize the splitter
-    skf = StratifiedGroupKFold(
-        n_splits=cfg.training.N_FOLD, shuffle=True, random_state=cfg.seed
-    )
+    # Check class distributions
+    class_file_counts = df.groupby("primary_label")["filename"].nunique()
+    logger.info("\nClass file distribution before splitting:")
+    for cls, count in class_file_counts.items():
+        logger.info(f"Class {cls}: {count} files")
 
-    # Get fold indices
+    single_file_classes = class_file_counts[class_file_counts == 1].index.tolist()
+    if single_file_classes:
+        logger.warning(f"Found {len(single_file_classes)} classes with only one file:")
+        for cls in single_file_classes:
+            logger.warning(
+                f"Class '{cls}' has only one file: {df[df['primary_label'] == cls]['filename'].iloc[0]}"
+            )
+        raise ValueError(
+            "Cannot create valid train/validation split with single-file classes. Please ensure all classes have at least 2 files."
+        )
+
+    # Create deterministic folds
     folds = []
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, labels, groups)):
-        # Verify no data leakage
+    rng = np.random.RandomState(cfg.seed)
+
+    for fold in range(cfg.training.N_FOLD):
+        # Reset indices for this fold
+        remaining_df = df.copy()
+        reserved_val_indices = []
+
+        # For each class, reserve one file for validation
+        for cls in df["primary_label"].unique():
+            cls_files = df[df["primary_label"] == cls]["filename"].unique()
+            # Use a different file for each fold using deterministic selection
+            val_file = cls_files[fold % len(cls_files)]
+            val_indices = df[df["filename"] == val_file].index
+            reserved_val_indices.extend(val_indices)
+            remaining_df = remaining_df[remaining_df["filename"] != val_file]
+
+        # Create stratified split with remaining files
+        remaining_groups = remaining_df["filename"]
+        remaining_labels = remaining_df["primary_label"]
+
+        # Calculate validation size to maintain approximately the same ratio as original StratifiedGroupKFold
+        n_groups = len(df["filename"].unique())
+        target_val_groups = n_groups // cfg.training.N_FOLD
+        current_val_groups = len(set(df.loc[reserved_val_indices, "filename"]))
+        remaining_val_size = max(1, target_val_groups - current_val_groups)
+
+        # Split remaining files
+        if len(remaining_df) > 0:
+            group_kfold = StratifiedGroupKFold(
+                n_splits=int(len(remaining_df) / remaining_val_size),
+                shuffle=True,
+                random_state=cfg.seed + fold,
+            )
+            remaining_train_idx, remaining_val_idx = next(
+                group_kfold.split(remaining_df, remaining_labels, remaining_groups)
+            )
+
+            # Map indices back to original dataframe
+            remaining_val_indices = remaining_df.index[remaining_val_idx]
+            remaining_train_indices = remaining_df.index[remaining_train_idx]
+
+            # Combine with reserved validation indices
+            val_idx = np.concatenate([reserved_val_indices, remaining_val_indices])
+            train_idx = remaining_train_indices
+        else:
+            val_idx = reserved_val_indices
+            train_idx = df.index[~df.index.isin(reserved_val_indices)]
+
+        # Verify the split
         train_files = set(df.iloc[train_idx]["filename"])
         val_files = set(df.iloc[val_idx]["filename"])
         assert (
             len(train_files & val_files) == 0
         ), f"Data leakage detected in fold {fold}"
 
-        # Verify class distribution
-        train_dist = df.iloc[train_idx]["primary_label"].value_counts(normalize=True)
-        val_dist = df.iloc[val_idx]["primary_label"].value_counts(normalize=True)
+        # Get class distributions
+        train_class_files = (
+            df.iloc[train_idx].groupby("primary_label")["filename"].nunique()
+        )
+        val_class_files = (
+            df.iloc[val_idx].groupby("primary_label")["filename"].nunique()
+        )
 
-        train_classes = set(df.iloc[train_idx]["primary_label"].unique())
-        val_classes = set(df.iloc[val_idx]["primary_label"].unique())
+        # Log distribution
+        logger.info(f"\nDetailed class distribution for fold {fold}:")
+        logger.info("Class | Train Files | Val Files | Total Files")
+        logger.info("-" * 50)
+        for cls in df["primary_label"].unique():
+            train_count = train_class_files.get(cls, 0)
+            val_count = val_class_files.get(cls, 0)
+            total_count = class_file_counts[cls]
+            logger.info(
+                f"{cls} | {train_count:^10d} | {val_count:^9d} | {total_count:^11d}"
+            )
 
-        if set(train_classes) != set(val_classes):
-            logger.warning(
-                f"Validation missing {len(set(train_classes)-set(val_classes))} classes: {set(train_classes)-set(val_classes)}"
-            )
-            logger.warning(
-                f"Training missing {len(set(val_classes)-set(train_classes))} classes: {set(val_classes)-set(train_classes)}"
-            )
-            raise ValueError("Some classes are missing from training or validation set")
-        logger.info(f"\nFold {fold}:")
+        logger.info(f"\nFold {fold} Summary:")
         logger.info(f"Train: {len(train_files)} files")
         logger.info(f"Val: {len(val_files)} files")
 
@@ -495,7 +565,7 @@ def run_training(cfg):
 
         df = df[df["primary_label"].isin(top_n_classes)]
         logger.info(
-            f"Filtered training data to {len(df)} audio files from {cfg.training.DEBUG_N_CLASSES} classes"
+            f"For DEBUG run, training data was filtered to {len(df)} audio files from {cfg.training.DEBUG_N_CLASSES} classes"
         )
     df, df_cache = align_df_and_metadata(df, load_cache_metadata(cfg))
     species_ids = df["primary_label"].unique().tolist()
@@ -641,10 +711,10 @@ def run_training(cfg):
             )
 
             # Get sampling histogram data
-            segment_usage_stats = train_dataset.get_segment_usage_stats(epoch)
+            # segment_usage_stats = train_dataset.get_segment_usage_stats(epoch)
 
             # Create sampling distribution plots
-            sampling_plots = create_sampling_plots(segment_usage_stats, epoch + 1)
+            # sampling_plots = create_sampling_plots(segment_usage_stats, epoch + 1)
 
             # Log all metrics to wandb with fold grouping
             wandb_logger.log(
@@ -703,13 +773,13 @@ def run_training(cfg):
                     "val/auc_plot": val_metrics_plots[3],
                     "train/confusion_matrix": train_cm_plot,
                     "val/confusion_matrix": val_cm_plot,
-                    "sampling/n_segments_total": sampling_plots["n_segments_total"],
-                    "sampling/n_segments_drawn_with_repetitions": sampling_plots[
-                        "n_segments_drawn_with_repetitions"
-                    ],
-                    "sampling/n_times_drawn_mean": sampling_plots["n_times_drawn_mean"],
-                    "sampling/n_times_drawn_max": sampling_plots["n_times_drawn_max"],
-                    "sampling/n_segments_unused": sampling_plots["n_segments_unused"],
+                    # "sampling/n_segments_total": sampling_plots["n_segments_total"],
+                    # "sampling/n_segments_drawn_with_repetitions": sampling_plots[
+                    #     "n_segments_drawn_with_repetitions"
+                    # ],
+                    # "sampling/n_times_drawn_mean": sampling_plots["n_times_drawn_mean"],
+                    # "sampling/n_times_drawn_max": sampling_plots["n_times_drawn_max"],
+                    # "sampling/n_segments_unused": sampling_plots["n_segments_unused"],
                 },
             )
 

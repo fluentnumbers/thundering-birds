@@ -36,93 +36,85 @@ def load_cache_metadata(cfg):
     # Convert snr_db to numeric, coercing errors to NaN
     df_cache["snr_db"] = pd.to_numeric(df_cache["snr_db"], errors="coerce")
 
+    # Initial filtering of silence segments - do this first to reduce data size
     df_cache = df_cache[df_cache["silence_pct"] < 100]
 
-    # Calculate the number of segments per class
+    # Calculate class distributions once
     class_segment_counts = df_cache["primary_label"].value_counts()
+    bottom_threshold = np.percentile(class_segment_counts.values, 10)
+    top_threshold = np.percentile(class_segment_counts.values, 90)
 
-    # Find bottom 10% of classes by number of segments
-    bottom_classes = class_segment_counts[
-        class_segment_counts <= np.percentile(class_segment_counts.values, 10)
-    ].index.tolist()
-
-    # Find top 10% of classes by number of segments
-    top_classes = class_segment_counts[
-        class_segment_counts >= np.percentile(class_segment_counts.values, 90)
-    ].index.tolist()
-
-    middle_classes = list(
-        set(df_cache["primary_label"].unique()) - set(bottom_classes) - set(top_classes)
+    # Classify classes using boolean masks
+    bottom_classes = set(
+        class_segment_counts[class_segment_counts <= bottom_threshold].index
+    )
+    top_classes = set(class_segment_counts[class_segment_counts >= top_threshold].index)
+    middle_classes = (
+        set(df_cache["primary_label"].unique()) - bottom_classes - top_classes
     )
 
-    # Create a copy of the dataframe for filtering
-    df_filtered = df_cache.copy()
-    ################# TOP CLASSES FILTERING #################
-    # For top 10% classes, keep only 50% of segments with highest signal power from each file
-    top_classes_mask = df_filtered["primary_label"].isin(top_classes)
-    df_top_classes = df_filtered[top_classes_mask].copy()
+    # Create masks for each class category
+    is_bottom = df_cache["primary_label"].isin(bottom_classes)
+    is_middle = df_cache["primary_label"].isin(middle_classes)
+    is_top = df_cache["primary_label"].isin(top_classes)
 
-    # Group by filename and keep top 50% segments by signal power
-    df_top_classes_filtered = pd.DataFrame()
-    for filename, group in df_top_classes.groupby("filename"):
-        # Sort by signal power and keep top 50%
-        top_half = group.nlargest(int(len(group) * 0.5), "signal_power")
-        df_top_classes_filtered = pd.concat([df_top_classes_filtered, top_half])
+    # Process bottom classes - simple filtering
+    bottom_mask = is_bottom & (df_cache["signal_power"] > 0) & (df_cache["snr_db"] > 0)
 
-    # Update the mask for top classes
-    top_classes_mask = df_filtered.index.isin(df_top_classes_filtered.index)
-
-    ################ BOTTOM CLASSES FILTERING #################
-    # Keep all segments from bottom 10% classes
-
-    bottom_classes_mask = (
-        df_filtered["primary_label"].isin(bottom_classes)
-        & (df_filtered["signal_power"] > 0)
-        & (df_filtered["snr_db"] > 0)
-        # & ~(df_filtered["rating"].isin([0.5, 1, 1.5]))
+    # Process middle classes efficiently
+    middle_mask = (
+        is_middle
+        & ~df_cache["rating"].isin([0.5, 1, 1.5])
+        & (df_cache["signal_power"] > 0.001)
+        & (df_cache["snr_db"] > 0)
     )
 
-    ################ MIDDLE CLASSES FILTERING #################
-    df_middle_classes = df_filtered[df_filtered["primary_label"].isin(middle_classes)]
-    df_middle_classes_filtered = pd.DataFrame()
-    for filename, group in df_middle_classes.groupby("filename"):
-        # Sort by signal power and keep top 50%
-        top_half = group.nlargest(int(len(group) * 0.5), "signal_power")
-        df_middle_classes_filtered = pd.concat([df_middle_classes_filtered, top_half])
+    # For middle and top classes, rank within each file and keep top 50%
+    def get_top_half_mask(group):
+        n = len(group)
+        return group["signal_power"].rank(ascending=False) <= n / 2
 
-    middle_classes_mask = df_filtered.index.isin(df_middle_classes_filtered.index)
+    # Process middle classes ranking
+    middle_filtered = df_cache[middle_mask].copy()
+    if not middle_filtered.empty:
+        middle_ranks = middle_filtered.groupby("filename").apply(get_top_half_mask)
+        middle_ranks = middle_ranks.reset_index(
+            level=0, drop=True
+        )  # Drop filename from index
+        middle_mask = middle_mask & middle_ranks.reindex(
+            df_cache.index, fill_value=False
+        )
 
-    # Apply normal filtering to the middle 80% classes
-    # middle_classes_mask = (
-    # df_filtered["primary_label"].isin(middle_classes)
-    # & (df_filtered["signal_power"] > 0.001)
-    # & (df_filtered["snr_db"] > 0)
-    # & ~(df_filtered["rating"].isin([0.5, 1, 1.5]))
-    # )
+    # Process top classes ranking
+    top_filtered = df_cache[is_top].copy()
+    if not top_filtered.empty:
+        top_ranks = top_filtered.groupby("filename").apply(get_top_half_mask)
+        top_ranks = top_ranks.reset_index(
+            level=0, drop=True
+        )  # Drop filename from index
+        top_mask = is_top & top_ranks.reindex(df_cache.index, fill_value=False)
+    else:
+        top_mask = is_top
 
-    # Combine the masks to get the final dataframe
-    df_cache = pd.concat(
-        [
-            df_filtered[bottom_classes_mask],  # Bottom 10% (no filtering)
-            df_filtered[middle_classes_mask],  # Middle 80% (filtered by signal power)
-            df_filtered[top_classes_mask],  # Top 10% (stricter filtering)
-        ]
-    )
+    # Combine all masks efficiently
+    final_mask = bottom_mask | middle_mask | top_mask
+    df_cache = df_cache[final_mask]
 
     # Log the filtering results
     logger.info(
-        f"Quality-based segments filtering: {len(df_cache)} left from {len(df_filtered)}"
+        f"Quality-based segments filtering: {len(df_cache)} left from {len(df_cache[final_mask])}"
     )
     logger.info(
-        f"Segments from bottom 10% classes: now {sum(df_cache['primary_label'].isin(bottom_classes))}, before {sum(df_filtered['primary_label'].isin(bottom_classes))}"
+        f"Segments from bottom 10% classes: now {sum(df_cache['primary_label'].isin(bottom_classes))}, before {sum(is_bottom)}"
     )
     logger.info(
-        f"Segments from middle 80% classes: now {sum(df_cache['primary_label'].isin(middle_classes))}, before {sum(df_filtered['primary_label'].isin(middle_classes))}"
+        f"Segments from middle 80% classes: now {sum(df_cache['primary_label'].isin(middle_classes))}, before {sum(is_middle)}"
     )
     logger.info(
-        f"Segments from top 10% classes: now {sum(df_cache['primary_label'].isin(top_classes))}, before {sum(df_filtered['primary_label'].isin(top_classes))}"
+        f"Segments from top 10% classes: now {sum(df_cache['primary_label'].isin(top_classes))}, before {sum(is_top)}"
     )
     logger.info("*" * 100)
+
     # Assert that we have the expected number of classes (206)
     unique_classes = df_cache["primary_label"].nunique()
     if unique_classes != 206:
@@ -253,9 +245,6 @@ class BirdCLEFDataset(Dataset):
                     "cache_paths": class_df["cache_path"].tolist(),
                     "segments": class_df["segment_file"].tolist(),
                 }
-                # Initialize permutation for this class
-                self._class_permutations[c] = list(self.rng.permutation(n_segments))
-                self._class_permutation_indices[c] = 0
 
             # Create signal power lookup using normalized per-file values
         self.signal_power_lookup = dict(
@@ -277,57 +266,6 @@ class BirdCLEFDataset(Dataset):
             )
         )
 
-    def get_segment_usage_stats(self, epoch) -> Dict:
-        """Get data for plotting sampling histogram."""
-        usage_stats = {}
-        with self.segment_usage_stats_lock:
-            for class_label in self.class_ids:
-                # Update the dictionary view with current shared memory values
-                shared_arr = self._shared_segment_counts[class_label]
-                segment_to_idx = self._shared_segment_indices[class_label]
-
-                for segment_file, idx in segment_to_idx.items():
-                    self.segment_usage_stats_per_class[class_label][segment_file] = (
-                        shared_arr[idx]
-                    )
-
-                class_usage = np.array(
-                    list(self.segment_usage_stats_per_class[class_label].values())
-                )
-                usage_stats[class_label] = {
-                    "n_times_drawn_mean": np.mean(class_usage),
-                    "n_times_drawn_max": np.max(class_usage),
-                    "n_segments_unused": (class_usage == 0).sum(),
-                    "n_segments_total": self.metadata_lookup_classes[class_label][
-                        "n_segments"
-                    ],
-                    "n_segments_drawn_with_repetitions": np.sum(class_usage),
-                }
-            self.segment_usage_stats_per_epoch[epoch] = usage_stats
-
-            histogram_data = {
-                "classes": self.class_ids,
-                "n_segments_drawn_with_repetitions": np.array(
-                    [
-                        usage_stats[c]["n_segments_drawn_with_repetitions"]
-                        for c in self.class_ids
-                    ]
-                ),
-                "n_segments_total": np.asarray(
-                    [usage_stats[c]["n_segments_total"] for c in self.class_ids]
-                ),
-                "n_times_drawn_mean": np.asarray(
-                    [usage_stats[c]["n_times_drawn_mean"] for c in self.class_ids]
-                ),
-                "n_times_drawn_max": np.asarray(
-                    [usage_stats[c]["n_times_drawn_max"] for c in self.class_ids]
-                ),
-                "n_segments_unused": np.asarray(
-                    [usage_stats[c]["n_segments_unused"] for c in self.class_ids]
-                ),
-            }
-            return histogram_data
-
     def compute_class_weights(self):
         class_weights = np.ones(len(self.class_ids)) / len(self.class_ids)
         mask = ~np.isin(self.class_ids, self.classes_present_in_df)
@@ -337,35 +275,6 @@ class BirdCLEFDataset(Dataset):
         else:
             raise ValueError("No valid classes found in the dataset")
         return class_weights
-
-    def get_next_segment_idx(self, class_label):
-        """Get next unused sample index from the class's permutation"""
-        with self._class_locks[class_label]:
-            n_segments = self.metadata_lookup_classes[class_label]["n_segments"]
-
-            # Check if we need to initialize or reset the permutation
-            if (
-                class_label not in self._class_permutations
-                or len(self._class_permutations[class_label]) == 0
-            ):
-                # Create a new seed combining class label hash and reset count
-                combined_seed = (
-                    self.cfg.seed
-                    + (hash(class_label) & 0xFFFFFFFF)
-                    + self._permutation_reset_counts[class_label] * 65537
-                ) & 0xFFFFFFFF
-
-                # Create a new RNG instance with the combined seed
-                permutation_rng = np.random.RandomState(combined_seed)
-                self._class_permutations[class_label] = list(
-                    permutation_rng.permutation(n_segments)
-                )
-                self._permutation_reset_counts[class_label] += 1
-
-            # Get next index from the permutation and remove it
-            segment_idx = self._class_permutations[class_label].pop(0)
-
-            return segment_idx
 
     def __len__(self):
         """Return dataset length based on mode"""
@@ -378,22 +287,15 @@ class BirdCLEFDataset(Dataset):
         if self.mode == "train":
             # Existing training logic
             class_label = self.rng.choice(self.class_ids, p=self.class_weights)
-            segment_idx = self.get_next_segment_idx(class_label)
+            segment_idx = self.rng.randint(
+                0, self.metadata_lookup_classes[class_label]["n_segments"]
+            )
             cache_path = self.metadata_lookup_classes[class_label]["cache_paths"][
                 segment_idx
             ]
             segment_file = self.metadata_lookup_classes[class_label]["segments"][
                 segment_idx
             ]
-
-            # Update usage tracking with thread safety using shared memory
-            with self.segment_usage_stats_lock:
-                shared_arr = self._shared_segment_counts[class_label]
-                segment_idx_in_arr = self._shared_segment_indices[class_label][
-                    segment_file
-                ]
-                shared_arr[segment_idx_in_arr] += 1
-                num_times_used = shared_arr[segment_idx_in_arr]
         else:
             # Validation mode: use deterministic ordering
             segment_info = self.all_segment_indices[idx]
@@ -404,7 +306,8 @@ class BirdCLEFDataset(Dataset):
 
         spectrogram = torch.load(cache_path)
 
-        if self.mode == "train" and num_times_used > 1:
+        num_times_used = 0
+        if self.mode == "train":
             spectrogram = self.apply_spec_augmentations(
                 spectrogram, num_times_used=num_times_used
             )
@@ -513,6 +416,8 @@ class BirdCLEFDataset(Dataset):
     ):
         """
         Create primary and secondary target vectors with label smoothing and weighting.
+        Label smoothing is only applied when secondary labels are present, to avoid
+        unnecessarily reducing confidence in the primary label when we're certain about it.
 
         Args:
             segment_metadata: Metadata for the current segment
@@ -531,23 +436,12 @@ class BirdCLEFDataset(Dataset):
             self.cfg.training.SECONDARY_LABEL_WEIGHT if self.mode == "train" else 0.0
         )
 
-        # Create primary target with label smoothing
-        if not USE_SMOOTHING or self.mode != "train":
-            primary_target = torch.zeros(num_classes, dtype=torch.float32)
-            primary_target[primary_idx] = 1.0
-        else:
-            # Initialize with small uniform distribution for smoothing
-            primary_target = torch.full(
-                (num_classes,),
-                primary_smoothing / (num_classes - 1),
-                dtype=torch.float32,
-            )
-            # Set primary label with smoothing
-            primary_target[primary_idx] = 1.0 - primary_smoothing
-        target = primary_target.clone()
-
-        # Create secondary target
+        # Initialize targets
+        primary_target = torch.zeros(num_classes, dtype=torch.float32)
         secondary_target = torch.zeros(num_classes, dtype=torch.float32)
+
+        # Process secondary labels first to determine if we should apply smoothing
+        has_valid_secondary = False
         if secondary_labels and secondary_weight > 0:
             if isinstance(secondary_labels, str):
                 # Handle string format (e.g., "[label1,label2]")
@@ -557,22 +451,36 @@ class BirdCLEFDataset(Dataset):
                     else [secondary_labels]
                 )
 
+            # Collect valid secondary labels (excluding primary label)
+            valid_secondary_indices = []
             for label in secondary_labels:
                 if label in self.label_to_idx:
                     sec_idx = self.label_to_idx[label]
                     if (
                         sec_idx != primary_idx
                     ):  # Don't include primary label in secondary targets
+                        valid_secondary_indices.append(sec_idx)
                         secondary_target[sec_idx] = secondary_weight
-                        target[sec_idx] += secondary_weight
+                        has_valid_secondary = True
 
-        # Normalize primary target to ensure sum is 1
-        if primary_target.sum() > 0:
-            primary_target = primary_target / primary_target.sum()
+        # Apply label smoothing only if we have valid secondary labels and smoothing is enabled
+        if USE_SMOOTHING and self.mode == "train" and has_valid_secondary:
+            # Apply smoothing only to classes with secondary labels
+            smoothing_weight = primary_smoothing / max(len(valid_secondary_indices), 1)
+            primary_target[primary_idx] = 1.0 - primary_smoothing
+            for sec_idx in valid_secondary_indices:
+                primary_target[sec_idx] = smoothing_weight
+        else:
+            # No smoothing - full confidence in primary label
+            primary_target[primary_idx] = 1.0
 
-        # Normalize target to ensure sum is 1
-        if target.sum() > 0:
-            target = target / target.sum()
+        # Create combined target
+        target = primary_target.clone()
+        if has_valid_secondary:
+            target += secondary_target
+            # Normalize target to ensure sum is 1
+            if target.sum() > 0:
+                target = target / target.sum()
 
         return primary_target, secondary_target, target
 
