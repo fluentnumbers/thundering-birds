@@ -42,64 +42,87 @@ def load_cache_metadata(cfg):
     class_segment_counts = df_cache["primary_label"].value_counts()
 
     # Find bottom 10% of classes by number of segments
-    bottom_10_percent_classes = class_segment_counts[
+    bottom_classes = class_segment_counts[
         class_segment_counts <= np.percentile(class_segment_counts.values, 10)
     ].index.tolist()
 
     # Find top 10% of classes by number of segments
-    top_10_percent_classes = class_segment_counts[
+    top_classes = class_segment_counts[
         class_segment_counts >= np.percentile(class_segment_counts.values, 90)
     ].index.tolist()
 
-    logger.info(
-        f"Bottom 10% classes (excluded from filtering): {len(bottom_10_percent_classes)}"
+    middle_classes = list(
+        set(df_cache["primary_label"].unique()) - set(bottom_classes) - set(top_classes)
     )
-    logger.info(f"Top 10% classes (stricter filtering): {len(top_10_percent_classes)}")
 
     # Create a copy of the dataframe for filtering
     df_filtered = df_cache.copy()
+    ################# TOP CLASSES FILTERING #################
+    # For top 10% classes, keep only 50% of segments with highest signal power from each file
+    top_classes_mask = df_filtered["primary_label"].isin(top_classes)
+    df_top_classes = df_filtered[top_classes_mask].copy()
 
-    # Apply stricter filtering only to top 10% classes
-    stricter_filter_mask = (
-        (df_filtered["primary_label"].isin(top_10_percent_classes))
-        & (df_filtered["signal_power"] > 0.005)  # Stricter signal power threshold
-        & (df_filtered["snr_db"] > 0.1)  # Stricter SNR threshold
-        & ~(df_filtered["rating"].isin([0.5, 1, 1.5]))
+    # Group by filename and keep top 50% segments by signal power
+    df_top_classes_filtered = pd.DataFrame()
+    for filename, group in df_top_classes.groupby("filename"):
+        # Sort by signal power and keep top 50%
+        top_half = group.nlargest(int(len(group) * 0.5), "signal_power")
+        df_top_classes_filtered = pd.concat([df_top_classes_filtered, top_half])
+
+    # Update the mask for top classes
+    top_classes_mask = df_filtered.index.isin(df_top_classes_filtered.index)
+
+    ################ BOTTOM CLASSES FILTERING #################
+    # Keep all segments from bottom 10% classes
+
+    bottom_classes_mask = (
+        df_filtered["primary_label"].isin(bottom_classes)
+        & (df_filtered["signal_power"] > 0)
+        & (df_filtered["snr_db"] > 0)
+        # & ~(df_filtered["rating"].isin([0.5, 1, 1.5]))
     )
 
-    # Keep all segments from bottom 10% classes
-    keep_mask = df_filtered["primary_label"].isin(bottom_10_percent_classes)
+    ################ MIDDLE CLASSES FILTERING #################
+    df_middle_classes = df_filtered[df_filtered["primary_label"].isin(middle_classes)]
+    df_middle_classes_filtered = pd.DataFrame()
+    for filename, group in df_middle_classes.groupby("filename"):
+        # Sort by signal power and keep top 50%
+        top_half = group.nlargest(int(len(group) * 0.5), "signal_power")
+        df_middle_classes_filtered = pd.concat([df_middle_classes_filtered, top_half])
+
+    middle_classes_mask = df_filtered.index.isin(df_middle_classes_filtered.index)
 
     # Apply normal filtering to the middle 80% classes
-    middle_classes_mask = (
-        ~(
-            df_filtered["primary_label"].isin(bottom_10_percent_classes)
-            | df_filtered["primary_label"].isin(top_10_percent_classes)
-        )
-        & (df_filtered["signal_power"] > 0.002)
-        & (df_filtered["snr_db"] > 0)
-        & ~(df_filtered["rating"].isin([0.5, 1, 1.5]))
-    )
+    # middle_classes_mask = (
+    # df_filtered["primary_label"].isin(middle_classes)
+    # & (df_filtered["signal_power"] > 0.001)
+    # & (df_filtered["snr_db"] > 0)
+    # & ~(df_filtered["rating"].isin([0.5, 1, 1.5]))
+    # )
 
     # Combine the masks to get the final dataframe
     df_cache = pd.concat(
         [
-            df_filtered[keep_mask],  # Bottom 10% (no filtering)
-            df_filtered[middle_classes_mask],  # Middle 80% (normal filtering)
-            df_filtered[
-                stricter_filter_mask & ~keep_mask
-            ],  # Top 10% (stricter filtering)
+            df_filtered[bottom_classes_mask],  # Bottom 10% (no filtering)
+            df_filtered[middle_classes_mask],  # Middle 80% (filtered by signal power)
+            df_filtered[top_classes_mask],  # Top 10% (stricter filtering)
         ]
     )
 
     # Log the filtering results
-    logger.info(f"Original segments count: {len(df_filtered)}")
-    logger.info(f"After class-specific filtering: {len(df_cache)}")
-    logger.info(f"Segments from bottom 10% classes: now {sum(keep_mask)}, before ")
     logger.info(
-        f"Segments from top 10% classes after filtering: now {sum(stricter_filter_mask & ~keep_mask)}, before "
+        f"Quality-based segments filtering: {len(df_cache)} left from {len(df_filtered)}"
     )
-
+    logger.info(
+        f"Segments from bottom 10% classes: now {sum(df_cache['primary_label'].isin(bottom_classes))}, before {sum(df_filtered['primary_label'].isin(bottom_classes))}"
+    )
+    logger.info(
+        f"Segments from middle 80% classes: now {sum(df_cache['primary_label'].isin(middle_classes))}, before {sum(df_filtered['primary_label'].isin(middle_classes))}"
+    )
+    logger.info(
+        f"Segments from top 10% classes: now {sum(df_cache['primary_label'].isin(top_classes))}, before {sum(df_filtered['primary_label'].isin(top_classes))}"
+    )
+    logger.info("*" * 100)
     # Assert that we have the expected number of classes (206)
     unique_classes = df_cache["primary_label"].nunique()
     if unique_classes != 206:

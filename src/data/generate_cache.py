@@ -194,6 +194,8 @@ def generate_spectrograms_whole_dataset(
     # Set number of workers
     if n_workers is None:
         n_workers = max(1, mp.cpu_count() - 1)
+    else:
+        n_workers = min(n_workers, mp.cpu_count() - 1)
     logger.info(f"Using {n_workers} worker processes")
 
     # Prepare arguments for each file
@@ -269,6 +271,7 @@ def generate_spectrograms_whole_dataset(
 if __name__ == "__main__":
     cfg = CFG()
     cfg.update_machine_settings(machine="local")
+
     set_seed(cfg.seed)
     train_df = pd.read_csv(cfg.dirs.train_csv)
     # train_df = train_df.head(1000)  # Uncomment for testing with a small subset
@@ -280,7 +283,7 @@ if __name__ == "__main__":
         src_folder,
         dst_folder,
         cfg,
-        n_workers=12,  # Uncomment to use single worker for debugging
+        n_workers=1,  # Uncomment to use single worker for debugging
     )
     logger.info(f"Success: {success}")
     logger.info(f"Metadata shape: {metadata_df.shape}")

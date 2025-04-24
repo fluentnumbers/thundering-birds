@@ -446,6 +446,17 @@ def get_folds(df, cfg):
         train_dist = df.iloc[train_idx]["primary_label"].value_counts(normalize=True)
         val_dist = df.iloc[val_idx]["primary_label"].value_counts(normalize=True)
 
+        train_classes = set(df.iloc[train_idx]["primary_label"].unique())
+        val_classes = set(df.iloc[val_idx]["primary_label"].unique())
+
+        if set(train_classes) != set(val_classes):
+            logger.warning(
+                f"Validation missing {len(set(train_classes)-set(val_classes))} classes: {set(train_classes)-set(val_classes)}"
+            )
+            logger.warning(
+                f"Training missing {len(set(val_classes)-set(train_classes))} classes: {set(val_classes)-set(train_classes)}"
+            )
+            raise ValueError("Some classes are missing from training or validation set")
         logger.info(f"\nFold {fold}:")
         logger.info(f"Train: {len(train_files)} files")
         logger.info(f"Val: {len(val_files)} files")
