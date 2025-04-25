@@ -41,7 +41,7 @@ class CFG:
     training.DEBUG = True if device == "cpu" else False
     training.EPOCHS = 50
     training.NUM_WORKERS = 10 if device == "cuda" else 0
-    training.PREFETCH_FACTOR = 2 if training.NUM_WORKERS > 0 else None
+    training.PREFETCH_FACTOR = 6 if training.NUM_WORKERS > 0 else None
     training.AUGMENTATION_PROB = 0
     training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = None
     training.N_FOLD = 5
