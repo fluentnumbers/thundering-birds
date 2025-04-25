@@ -3,7 +3,6 @@
 
 import gc
 import json
-import multiprocessing as mp
 import os
 import time
 import warnings
@@ -12,15 +11,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import psutil
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import wandb
 from dotenv import load_dotenv
-from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
@@ -30,14 +24,15 @@ from src.config import CFG, set_seed
 from src.data.dataset import BirdCLEFDataset, collate_fn, load_cache_metadata
 from src.data.processing import align_df_and_metadata
 from src.models.birdclef_model import BirdCLEFModel
-from src.training.losses import AsymmetricLossMultiLabel, HierarchicalBCELoss
+from src.training.criterion import get_criterion
+from src.training.losses import HierarchicalBCELoss
 from src.training.metrics import (
     analyze_class_performance,
     calculate_class_metrics,
-    create_sampling_plots,
     plot_class_metrics,
     plot_confusion_matrix,
 )
+from src.training.scheduler import get_scheduler
 from src.utils.logger import WandbLogger, setup_logger
 
 # Add at the beginning of your script, before any PyTorch imports
@@ -49,114 +44,6 @@ LOGS_DIR = Path("logs")
 
 # Create global logger
 logger = setup_logger(__name__)
-
-
-def get_optimizer(model, cfg):
-
-    if cfg.training.OPTIMIZER == "Adam":
-        optimizer = optim.Adam(
-            model.parameters(),
-            lr=cfg.training.LR,
-            weight_decay=cfg.training.WEIGHT_DECAY,
-        )
-    elif cfg.training.OPTIMIZER == "AdamW":
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=cfg.training.LR,
-            weight_decay=cfg.training.WEIGHT_DECAY,
-        )
-    elif cfg.training.OPTIMIZER == "SGD":
-        optimizer = optim.SGD(
-            model.parameters(),
-            lr=cfg.training.LR,
-            momentum=0.9,
-            weight_decay=cfg.training.WEIGHT_DECAY,
-        )
-    else:
-        raise NotImplementedError(f"Optimizer {cfg.training.OPTIMIZER} not implemented")
-
-    return optimizer
-
-
-def get_scheduler(optimizer, cfg):
-
-    if cfg.training.SCHEDULER == "CosineAnnealingLR":
-        scheduler = lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cfg.training.EPOCHS, eta_min=cfg.training.MIN_LR
-        )
-    elif cfg.training.SCHEDULER == "ReduceLROnPlateau":
-        scheduler = lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.5,
-            patience=2,
-            min_lr=cfg.training.MIN_LR,
-            verbose=True,
-        )
-    elif cfg.training.SCHEDULER == "StepLR":
-        scheduler = lr_scheduler.StepLR(
-            optimizer, step_size=cfg.training.EPOCHS // 3, gamma=0.5
-        )
-    elif cfg.training.SCHEDULER == "OneCycleLR":
-        scheduler = None
-    else:
-        scheduler = None
-
-    return scheduler
-
-
-def get_criterion(cfg):
-
-    if cfg.training.CRITERION == "BCEWithLogitsLoss":
-        criterion = nn.BCEWithLogitsLoss()
-    elif cfg.training.CRITERION == "AsymmetricLossMultiLabel":
-        criterion = AsymmetricLossMultiLabel(
-            gamma_neg=4,
-            gamma_pos=1,
-            clip=0.05,
-            eps=1e-8,
-            disable_torch_grad_focal_loss=False,
-            reduction="mean",
-        )
-    elif cfg.training.CRITERION == "HierarchicalBCELoss":
-        criterion = HierarchicalBCELoss(
-            primary_weight=cfg.training.PRIMARY_WEIGHT,
-            secondary_weight=cfg.training.SECONDARY_WEIGHT,
-        )
-    elif cfg.training.CRITERION == "CELoss":
-        criterion = nn.CrossEntropyLoss()
-    else:
-        raise NotImplementedError(f"Criterion {cfg.training.CRITERION} not implemented")
-
-    return criterion
-
-
-def calculate_metrics(targets, outputs, thresholds=None):
-    """Calculate AUC and F1 scores for all classes"""
-    num_classes = targets.shape[1]
-    aucs = []
-    f1s = []
-
-    probs = 1 / (1 + np.exp(-outputs))
-    if thresholds is None:
-        thresholds = np.array([0.5] * num_classes)
-
-    # Use class-specific thresholds
-    preds = (probs > thresholds[:, None].T).astype(int)
-
-    for i in range(num_classes):
-        if np.sum(targets[:, i]) > 0:
-            class_auc = roc_auc_score(targets[:, i], probs[:, i])
-            class_f1 = f1_score(targets[:, i], preds[:, i], zero_division=0)
-            aucs.append(class_auc)
-            f1s.append(class_f1)
-
-    return {
-        "auc": np.mean(aucs) if aucs else 0.0,
-        "f1": np.mean(f1s) if f1s else 0.0,
-        "aucs": aucs,
-        "f1s": f1s,
-    }
 
 
 def log_memory_usage():
@@ -283,17 +170,38 @@ def train_one_epoch(
         # Backward pass with mixed precision if using GPU
         if device == "cuda" and scaler is not None:
             scaler.scale(loss).backward()
+
+            # Unscale before gradient clipping
+            if (
+                cfg.training.MAX_GRAD_NORM is not None
+                and (step + 1) % grad_accum_steps == 0
+            ):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.training.MAX_GRAD_NORM
+                )
+
+            # Step optimizer only after accumulating gradients
+            if (step + 1) % grad_accum_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
 
-        # Step optimizer only after accumulating gradients
-        if (step + 1) % grad_accum_steps == 0:
-            if device == "cuda" and scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
+            # Apply gradient clipping
+            if (
+                cfg.training.MAX_GRAD_NORM is not None
+                and (step + 1) % grad_accum_steps == 0
+            ):
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.training.MAX_GRAD_NORM
+                )
+
+            # Step optimizer only after accumulating gradients
+            if (step + 1) % grad_accum_steps == 0:
                 optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
 
         training_time += time.time() - train_start
         batch_times.append(time.time() - batch_start)
@@ -548,9 +456,9 @@ def run_training(cfg):
         half_n = cfg.training.DEBUG_N_CLASSES // 2
         most_common_classes = class_counts.nlargest(half_n).index.tolist()
         least_common_classes = (
-            class_counts[class_counts >= 4].nsmallest(half_n * 2).index.tolist()
+            class_counts[class_counts >= 4].nsmallest(half_n).index.tolist()
         )
-        top_n_classes = least_common_classes
+        top_n_classes = least_common_classes + most_common_classes
 
         df = df[df["primary_label"].isin(top_n_classes)]
         logger.info(
@@ -571,6 +479,11 @@ def run_training(cfg):
     for fold, (train_file_idx, val_file_idx) in enumerate(folds):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
+        train_df = df.iloc[train_file_idx].reset_index(drop=False)
+        val_df = df.iloc[val_file_idx].reset_index(drop=False)
+
+        train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
+        val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
 
         logger.info(f"\n{'='*30} Fold {fold} {'='*30}")
 
@@ -586,7 +499,7 @@ def run_training(cfg):
             ],
             config={
                 "batch_size": cfg.training.BATCH_SIZE,
-                "learning_rate": cfg.training.LR,
+                "learning_rate": cfg.training.BASE_LR,
                 "epochs": cfg.training.EPOCHS,
                 "model": cfg.model.model_name,
                 "device": cfg.device,
@@ -597,15 +510,23 @@ def run_training(cfg):
                 "criterion": cfg.training.CRITERION,
                 "early_stopping_metric": cfg.training.EARLY_STOPPING_METRIC,
                 "early_stopping_patience": cfg.training.EARLY_STOPPING_PATIENCE,
+                "progressive_unfreezing": cfg.training.PROGRESSIVE_UNFREEZING,
+                "sampling_classes_weights": cfg.training.SAMPLING_CLASSES_WEIGHTS,
                 "samples_per_epoch": cfg.training.SAMPLES_PER_EPOCH,
+                "lr_scaling": cfg.training.LR_SCALING,
+                "lr_scale_factor": cfg.training.LR_SCALE_FACTOR,
+                "warmup_epochs": cfg.training.WARMUP_EPOCHS,
+                "warmup_factor": cfg.training.WARMUP_FACTOR,
+                "max_grad_norm": cfg.training.MAX_GRAD_NORM,
+                "lr_layer_decay": cfg.training.LR_LAYER_DECAY,
+                "train_files": len(train_dataset.metadata_df["filename"].unique()),
+                "train_segments": len(train_dataset.metadata_df),
+                "train_classes": len(train_dataset.class_ids),
+                "val_files": len(val_dataset.metadata_df["filename"].unique()),
+                "val_segments": len(val_dataset.metadata_df),
+                "val_classes": len(val_dataset.class_ids),
             },
         )
-
-        train_df = df.iloc[train_file_idx].reset_index(drop=False)
-        val_df = df.iloc[val_file_idx].reset_index(drop=False)
-
-        train_dataset = BirdCLEFDataset(train_df, cfg, species_ids, mode="train")
-        val_dataset = BirdCLEFDataset(val_df, cfg, species_ids, mode="valid")
 
         # Create DataLoaders with proper worker configuration
         train_loader = DataLoader(
@@ -636,6 +557,15 @@ def run_training(cfg):
         )
 
         model = BirdCLEFModel(cfg).to(cfg.device)
+
+        # Initially freeze the backbone
+        if cfg.training.PROGRESSIVE_UNFREEZING:
+            model.model.freeze_backbone(num_layers=-1)
+            logger.info("Initial trainable parameters:")
+            param_counts = model.model.get_trainable_params()
+            for component, count in param_counts.items():
+                logger.info(f"{component}: {count:,} parameters")
+
         optimizer = get_optimizer(model, cfg)
         criterion = get_criterion(cfg)
 
@@ -661,6 +591,17 @@ def run_training(cfg):
 
         for epoch in range(cfg.training.EPOCHS):
             logger.info(f"Epoch {epoch+1}/{cfg.training.EPOCHS}")
+
+            # Progressive unfreezing
+            if cfg.training.PROGRESSIVE_UNFREEZING:
+                model.model.progressive_unfreeze(epoch, cfg.training.EPOCHS)
+
+                # Log current trainable parameters
+                if epoch % 5 == 0:  # Log every 5 epochs
+                    param_counts = model.model.get_trainable_params()
+                    logger.info(f"\nTrainable parameters at epoch {epoch+1}:")
+                    for component, count in param_counts.items():
+                        logger.info(f"{component}: {count:,} parameters")
 
             # Log memory usage at start of each epoch
             log_memory_usage()
@@ -698,12 +639,6 @@ def run_training(cfg):
             val_cm_plot = plot_confusion_matrix(
                 val_metrics["confusion_matrix"], species_ids
             )
-
-            # Get sampling histogram data
-            # segment_usage_stats = train_dataset.get_segment_usage_stats(epoch)
-
-            # Create sampling distribution plots
-            # sampling_plots = create_sampling_plots(segment_usage_stats, epoch + 1)
 
             # Log all metrics to wandb with fold grouping
             wandb_logger.log(
@@ -762,13 +697,6 @@ def run_training(cfg):
                     "val/auc_plot": val_metrics_plots[3],
                     "train/confusion_matrix": train_cm_plot,
                     "val/confusion_matrix": val_cm_plot,
-                    # "sampling/n_segments_total": sampling_plots["n_segments_total"],
-                    # "sampling/n_segments_drawn_with_repetitions": sampling_plots[
-                    #     "n_segments_drawn_with_repetitions"
-                    # ],
-                    # "sampling/n_times_drawn_mean": sampling_plots["n_times_drawn_mean"],
-                    # "sampling/n_times_drawn_max": sampling_plots["n_times_drawn_max"],
-                    # "sampling/n_segments_unused": sampling_plots["n_segments_unused"],
                 },
             )
 

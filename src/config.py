@@ -57,7 +57,16 @@ class CFG:
     training.BATCH_SIZE = 256 if device == "cuda" else 32
     training.GRAD_ACCUM_STEPS = 4
     training.OPTIMIZER = "AdamW"
-    training.LR = 5e-4
+
+    # Learning rate configuration
+    training.BASE_LR = 5e-4  # Base learning rate before scaling
+    training.LR_SCALING = True  # Whether to use dynamic LR scaling
+    training.LR_SCALE_FACTOR = 0.1  # Factor to scale LR for classifier head
+    training.WARMUP_EPOCHS = 5  # Number of epochs for warmup
+    training.WARMUP_FACTOR = 0.1  # Starting warmup factor
+    training.MAX_GRAD_NORM = 5.0  # Maximum gradient norm for clipping, None to disable
+    training.LR_LAYER_DECAY = 0.9  # Layer-wise learning rate decay factor
+
     training.WEIGHT_DECAY = 1e-5
     training.SCHEDULER = "CosineAnnealingLR"
     training.CRITERION = "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss HierarchicalBCELoss CELoss

@@ -11,9 +11,38 @@ import seaborn as sns
 from plotly.subplots import make_subplots
 from sklearn.metrics import (
     confusion_matrix,
+    f1_score,
     precision_recall_fscore_support,
     roc_auc_score,
 )
+
+
+def calculate_metrics(targets, outputs, thresholds=None):
+    """Calculate AUC and F1 scores for all classes"""
+    num_classes = targets.shape[1]
+    aucs = []
+    f1s = []
+
+    probs = 1 / (1 + np.exp(-outputs))
+    if thresholds is None:
+        thresholds = np.array([0.5] * num_classes)
+
+    # Use class-specific thresholds
+    preds = (probs > thresholds[:, None].T).astype(int)
+
+    for i in range(num_classes):
+        if np.sum(targets[:, i]) > 0:
+            class_auc = roc_auc_score(targets[:, i], probs[:, i])
+            class_f1 = f1_score(targets[:, i], preds[:, i], zero_division=0)
+            aucs.append(class_auc)
+            f1s.append(class_f1)
+
+    return {
+        "auc": np.mean(aucs) if aucs else 0.0,
+        "f1": np.mean(f1s) if f1s else 0.0,
+        "aucs": aucs,
+        "f1s": f1s,
+    }
 
 
 def macro_auc(truth, pred, labels, return_per_class=False):

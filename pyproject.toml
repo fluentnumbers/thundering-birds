@@ -3,6 +3,7 @@ name = "thundering-birds"
 version = "0.1.0"
 description = "BirdCLEF 2025 Competition"
 authors = ["Your Name <your.email@example.com>"]
+packages = [{include = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.10.11"
