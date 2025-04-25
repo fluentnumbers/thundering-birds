@@ -45,7 +45,8 @@ class CFG:
     training.AUGMENTATION_PROB = 0
     training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = None
     training.N_FOLD = 5
-    training.SAMPLING_CLASSES_WEIGHTS = "segments_inverse"
+    training.PROGRESSIVE_UNFREEZING = False
+    training.SAMPLING_CLASSES_WEIGHTS = "uniform"
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
     training.SAMPLES_PER_EPOCH = 25000
     training.CORRECT_LOSS = True
@@ -53,7 +54,7 @@ class CFG:
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.01
     training.EARLY_STOPPING_PATIENCE = 20
-    training.BATCH_SIZE = 256 if device == "cuda" else 16
+    training.BATCH_SIZE = 256 if device == "cuda" else 32
     training.GRAD_ACCUM_STEPS = 4
     training.OPTIMIZER = "AdamW"
     training.LR = 5e-4
@@ -62,9 +63,9 @@ class CFG:
     training.CRITERION = "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss HierarchicalBCELoss CELoss
     # label smoothing
     training.USE_LABEL_SMOOTHING = True
-    training.PRIMARY_LABEL_SMOOTHING = 0.2  # primary label weight = 1 - smoothing
+    training.PRIMARY_LABEL_SMOOTHING = 0.1  # primary label weight = 1 - smoothing
     training.SECONDARY_LABEL_WEIGHT = (
-        0.3  # Weight for secondary labels in label smoothing
+        0.2  # Weight for secondary labels in label smoothing
     )
     # HierarchicalBCELoss
     training.PRIMARY_WEIGHT = (
@@ -78,10 +79,10 @@ class CFG:
 
     def update_debug_settings(self):
         if self.training.DEBUG:
-            self.training.DEBUG_N_CLASSES = 5
-            self.training.EPOCHS = 10
-            self.training.SAMPLES_PER_EPOCH = 500
-            # self.training.SELECTED_FOLDS = [4]
+            self.training.DEBUG_N_CLASSES = 10
+            self.training.EPOCHS = 50
+            self.training.SAMPLES_PER_EPOCH = 10000
+            # self.training.SELECTED_FOLDS = [0]
 
     model = EasyDict()
     model.model_name = "efficientnet-b0"
@@ -102,9 +103,6 @@ class CFG:
     preprocessing.NSAMPLES = preprocessing.SEGMENT_DURATION * preprocessing.SAMPLE_RATE
     preprocessing.UFOLD_OVERLAP = preprocessing.NSAMPLES // 2  # 2.5 seconds overlap
     preprocessing.MAKE_RGB = False
-    preprocessing.SILENCE_THRESHOLD = (
-        0.8  # if more than 50% of the segment is silence, skip it
-    )
 
     def update_machine_settings(self, machine="local", inference_debug=False):
         self.machine = machine

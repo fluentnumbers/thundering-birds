@@ -137,6 +137,108 @@ class EfficientNetWithAttention(nn.Module):
         # Register attention outputs as a buffer to avoid gradient computation
         self.register_buffer("attention_outputs", None)
 
+    def freeze_backbone(self, num_layers: int = -1):
+        """
+        Freeze layers of the EfficientNet backbone.
+
+        Args:
+            num_layers: Number of layers to freeze from the start.
+                      -1 means freeze all backbone layers
+                      0 means freeze none (all trainable)
+        """
+        if num_layers == 0:
+            # Unfreeze all layers
+            for param in self.efficientnet.parameters():
+                param.requires_grad = True
+            return
+
+        # Get list of all blocks in the backbone
+        blocks = list(self.efficientnet._blocks)
+        total_blocks = len(blocks)
+
+        if num_layers == -1:
+            num_layers = total_blocks
+
+        # Freeze initial layers
+        for param in self.efficientnet._conv_stem.parameters():
+            param.requires_grad = False
+        for param in self.efficientnet._bn0.parameters():
+            param.requires_grad = False
+
+        # Freeze specified number of blocks
+        for i, block in enumerate(blocks):
+            for param in block.parameters():
+                param.requires_grad = i >= num_layers
+
+        # Always keep classifier trainable
+        for param in self.classifier.parameters():
+            param.requires_grad = True
+
+    def progressive_unfreeze(
+        self,
+        current_epoch: int,
+        total_epochs: int,
+    ):
+        """
+        Progressively unfreeze layers as training progresses.
+        Unfreezing schedule:
+        - First 5% epochs: Keep most layers frozen, only last 25% trainable
+        - 5-10% epochs: Last 50% trainable
+        - 10-15% epochs: Last 75% trainable
+        - After 15% epochs: All layers trainable
+
+        Args:
+            current_epoch: Current training epoch (0-based)
+            total_epochs: Total number of training epochs
+        """
+        # Initially freeze all backbone layers
+        if current_epoch == 0:
+            self.freeze_backbone(-1)
+            return
+
+        blocks = list(self.efficientnet._blocks)
+        total_blocks = len(blocks)
+
+        # Calculate progress percentage (0 to 100)
+        progress = (current_epoch / total_epochs) * 100
+
+        # Define unfreezing stages
+        if progress < 5:
+            # First 5%: Only last 25% of blocks trainable
+            blocks_to_freeze = int(total_blocks * 0.75)
+        elif progress < 10:
+            # 5-10%: Last 50% of blocks trainable
+            blocks_to_freeze = int(total_blocks * 0.50)
+        elif progress < 15:
+            # 10-15%: Last 75% of blocks trainable
+            blocks_to_freeze = int(total_blocks * 0.25)
+        else:
+            # After 15%: All blocks trainable
+            blocks_to_freeze = 0
+
+        self.freeze_backbone(blocks_to_freeze)
+
+    def get_trainable_params(self):
+        """
+        Get number of trainable parameters in each component.
+
+        Returns:
+            dict: Dictionary containing trainable parameter counts
+        """
+        counts = {
+            "attention": sum(
+                p.numel() for p in self.attention.parameters() if p.requires_grad
+            ),
+            "backbone": sum(
+                p.numel() for p in self.efficientnet.parameters() if p.requires_grad
+            ),
+            "classifier": sum(
+                p.numel() for p in self.classifier.parameters() if p.requires_grad
+            ),
+        }
+        counts["total"] = sum(counts.values())
+        return counts
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Store attention outputs as a buffer to avoid gradient computation
         self.attention_outputs = self.attention(x)
@@ -145,16 +247,12 @@ class EfficientNetWithAttention(nn.Module):
     def get_attention_outputs(self) -> Optional[torch.Tensor]:
         """
         Returns the stored attention outputs if available.
-
-        Returns:
-            Optional[torch.Tensor]: The 3-channel attention outputs (original + 2 attention channels)
         """
         return self.attention_outputs
 
     def clear_attention_outputs(self) -> None:
         """
         Clears the stored attention outputs to free up memory.
-        Should be called after saving or using the attention outputs.
         """
         self.attention_outputs = None
 

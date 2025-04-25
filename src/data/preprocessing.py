@@ -1,10 +1,5 @@
-import logging
-import multiprocessing as mp
-import os
 import time
-from functools import partial
-from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict
 
 import cv2
 import librosa
@@ -12,9 +7,10 @@ import numpy as np
 import pandas as pd
 import torch
 import torchaudio
-from tqdm import tqdm
 
-logger = logging.getLogger(__name__)
+from src.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class MelSpectrogramTransform:

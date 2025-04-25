@@ -311,11 +311,17 @@ def create_sampling_plots(segment_usage_stats, epoch):
     Create Plotly figures for sampling statistics that can be tracked over epochs.
 
     Args:
-        segment_usage_stats: Dictionary containing sampling statistics
+        segment_usage_stats: Dictionary containing sampling statistics with keys:
+            - classes: List of class names
+            - n_segments_total: List of total segments per class
+            - n_segments_drawn_with_repetitions: List of segments drawn per class
+            - n_times_drawn_mean: List of mean usage per class
+            - n_times_drawn_max: List of max usage per class
+            - n_segments_unused: List of unused segments per class
         epoch: Current epoch number
 
     Returns:
-        Dictionary of plot names to plotly figures and summary statistics
+        Dictionary of plot names to plotly figures
     """
     plots = {}
     classes = segment_usage_stats["classes"]
@@ -335,7 +341,7 @@ def create_sampling_plots(segment_usage_stats, epoch):
         fig.add_trace(
             go.Bar(
                 x=classes,
-                y=[v for v in values],
+                y=values,
                 name=metric_key,
                 hovertemplate="Class: %{x}<br>"
                 + f"{y_label}: %{{y:.2f}}<extra></extra>",
@@ -374,11 +380,6 @@ def create_sampling_plots(segment_usage_stats, epoch):
                 font=dict(size=20),
             )
 
-        # Store plot and summary statistic
-        plot_key = f"{metric_key}"
-        stat_key = f"{metric_key}_mean"
-
-        plots[plot_key] = fig
-        plots[stat_key] = float(np.mean(values))
+        plots[metric_key] = fig
 
     return plots
