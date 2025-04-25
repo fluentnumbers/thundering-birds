@@ -312,8 +312,7 @@ def run_training(cfg):
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Starting training run in {run_dir}")
 
-    # Initialize wandb group for all folds
-    wandb_group = f"train_{'DEBUG' if cfg.training.DEBUG else 'PROD'}_{cfg.device.upper()}_{timestamp}"
+
 
     # Load training data
     logger.info("Loading training data...")
@@ -347,6 +346,9 @@ def run_training(cfg):
 
     torch.backends.cudnn.benchmark = True
 
+    # Initialize wandb group for all folds
+    wandb_group = f"train_{'DEBUG' if cfg.training.DEBUG else 'PROD'}_{cfg.num_classes}classes_{cfg.device.upper()}_{timestamp}"
+
     for fold, (train_file_idx, val_file_idx) in enumerate(folds):
         if fold not in cfg.training.SELECTED_FOLDS:
             continue
@@ -359,7 +361,7 @@ def run_training(cfg):
         logger.info(f"\n{'='*30} Fold {fold} {'='*30}")
 
         wandb_logger = WandbLogger(
-            f"fold_{fold}",
+            f"fold{fold}_{cfg.num_classes}classes",
             run_dir,
             group=wandb_group,
             tags=[
@@ -398,6 +400,9 @@ def run_training(cfg):
                 "val_classes": len(val_dataset.class_ids),
             },
         )
+        # After initializing wandb_logger
+        config_dict = cfg.to_dict()
+        wandb_logger.store_config_artifact(config_dict, artifact_name="training_config")
 
         # Create DataLoaders with proper worker configuration
         train_loader = DataLoader(
@@ -705,6 +710,8 @@ def run_training(cfg):
 
         # Finish wandb run for this fold
         wandb_logger.finish()
+
+
 
     logger.info("Cross-Validation Results:")
     for fold, scores in enumerate(best_scores):

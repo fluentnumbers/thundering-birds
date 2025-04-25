@@ -126,3 +126,37 @@ class WandbLogger:
                 self.wandb.finish()
             except Exception as e:
                 logging.warning(f"Failed to finish wandb run: {e}")
+
+    def store_config_artifact(self, config: dict, artifact_name: str = "config") -> None:
+        """Store configuration as a wandb artifact.
+
+        Args:
+            config: Configuration dictionary to store
+            artifact_name: Name for the artifact (default: "config")
+        """
+        if self.enabled:
+            try:
+                # Create a new artifact
+                artifact = self.wandb.Artifact(
+                    name=artifact_name,
+                    type="config",
+                    description="Training configuration"
+                )
+
+                # Add the config as a JSON file
+                import json
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                    json.dump(config, f, indent=4)
+                    artifact.add_file(f.name, name="config.json")
+
+                # Log the artifact
+                self.run.log_artifact(artifact)
+
+                # Clean up temporary file
+                import os
+                os.unlink(f.name)
+
+                logging.info(f"Stored configuration in wandb artifact: {artifact_name}")
+            except Exception as e:
+                logging.warning(f"Failed to store configuration in wandb artifact: {e}")

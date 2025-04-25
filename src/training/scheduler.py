@@ -60,6 +60,12 @@ def get_scheduler(optimizer, cfg):
     """
     if cfg.training.SCHEDULER == "CosineAnnealingLR":
         # Create scheduler with warmup
+        scheduler = lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.training.T_MAX,
+            eta_min=cfg.training.MIN_LR,
+        )
+    elif cfg.training.SCHEDULER == "WarmupCosineScheduler":
         scheduler = WarmupCosineScheduler(
             optimizer,
             warmup_epochs=cfg.training.WARMUP_EPOCHS,

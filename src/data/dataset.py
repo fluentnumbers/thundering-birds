@@ -424,7 +424,7 @@ class BirdCLEFDataset(Dataset):
         spectrogram = torch.load(cache_path)
 
         num_times_used = 0
-        if self.mode == "train" and random.random() < 0:
+        if self.mode == "train" and random.random() < self.cfg.training.AUGMENTATION_PROB:
             spectrogram = self.apply_spec_augmentations(
                 spectrogram, num_times_used=num_times_used
             )

@@ -42,24 +42,27 @@ class CFG:
     training.EPOCHS = 50
     training.NUM_WORKERS = 10 if device == "cuda" else 0
     training.PREFETCH_FACTOR = 6 if training.NUM_WORKERS > 0 else None
-    training.AUGMENTATION_PROB = 0
-    training.LOG_MEMORY_USAGE_EVERY_N_BATCHES = None
+    training.AUGMENTATION_PROB = 0.5
     training.N_FOLD = 5
     training.PROGRESSIVE_UNFREEZING = False
     training.SAMPLING_CLASSES_WEIGHTS = "uniform"
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
-    training.SAMPLES_PER_EPOCH = 25000
+    training.SAMPLES_PER_EPOCH = 15000
     training.CORRECT_LOSS = True
     training.SAVE_INTERMEDIATE_MODEL = True
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
-    training.EARLY_STOPPING_MIN_DELTA = 0.01
-    training.EARLY_STOPPING_PATIENCE = 20
+    training.EARLY_STOPPING_MIN_DELTA = 0.005
+    training.EARLY_STOPPING_PATIENCE = 100
     training.BATCH_SIZE = 256 if device == "cuda" else 32
     training.GRAD_ACCUM_STEPS = 4
     training.OPTIMIZER = "AdamW"
+    training.WEIGHT_DECAY = 1e-5
 
     # Learning rate configuration
-    training.BASE_LR = 5e-4  # Base learning rate before scaling
+    training.SCHEDULER = "CosineAnnealingLR" # WarmupCosineScheduler CosineAnnealingLR
+    training.BASE_LR = 3e-3  # Base learning rate before scaling
+    training.MIN_LR = 1e-6
+    training.T_MAX = training.EPOCHS
     training.LR_SCALING = True  # Whether to use dynamic LR scaling
     training.LR_SCALE_FACTOR = 0.1  # Factor to scale LR for classifier head
     training.WARMUP_EPOCHS = 5  # Number of epochs for warmup
@@ -67,8 +70,7 @@ class CFG:
     training.MAX_GRAD_NORM = 5.0  # Maximum gradient norm for clipping, None to disable
     training.LR_LAYER_DECAY = 0.9  # Layer-wise learning rate decay factor
 
-    training.WEIGHT_DECAY = 1e-5
-    training.SCHEDULER = "CosineAnnealingLR"
+
     training.CRITERION = "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss HierarchicalBCELoss CELoss
     # label smoothing
     training.USE_LABEL_SMOOTHING = True
@@ -83,15 +85,15 @@ class CFG:
     training.SECONDARY_WEIGHT = (
         0.5 if training.CRITERION == "HierarchicalBCELoss" else None
     )
-    training.MIN_LR = 1e-6
-    training.T_MAX = training.EPOCHS
+
 
     def update_debug_settings(self):
         if self.training.DEBUG:
             self.training.DEBUG_N_CLASSES = 10
             self.training.EPOCHS = 50
             self.training.SAMPLES_PER_EPOCH = 10000
-            # self.training.SELECTED_FOLDS = [0]
+            self.training.SELECTED_FOLDS = [0]
+            self.training.T_MAX = self.training.EPOCHS
 
     model = EasyDict()
     model.model_name = "efficientnet-b0"
@@ -151,6 +153,30 @@ class CFG:
             self.inference.DEBUG_COUNT = 10
         if self.inference.USE_SPECIFIC_FOLDS:
             self.inference.SELECTED_FOLDS = [0, 1, 2, 3, 4]
+
+    def to_dict(self) -> dict:
+        """Convert CFG object to a dictionary.
+
+        Returns:
+            dict: Dictionary representation of the configuration
+        """
+        import json
+        from pathlib import Path
+
+        def convert_paths(obj):
+            if isinstance(obj, Path):
+                return str(obj)
+            elif isinstance(obj, dict):
+                return {k: convert_paths(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_paths(item) for item in obj]
+            return obj
+
+        # Convert to dict and handle Path objects
+        config_dict = {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+        config_dict = convert_paths(config_dict)
+
+        return config_dict
 
 
 # This file can be copied AS IS into kaggle notebook

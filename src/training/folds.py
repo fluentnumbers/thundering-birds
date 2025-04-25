@@ -17,9 +17,9 @@ def get_folds(df, cfg):
 
     # Check class distributions
     class_file_counts = df.groupby("primary_label")["filename"].nunique()
-    logger.info("\nClass file distribution before splitting:")
-    for cls, count in class_file_counts.items():
-        logger.info(f"Class {cls}: {count} files")
+    # logger.info("\nClass file distribution before splitting:")
+    # for cls, count in class_file_counts.items():
+    #     logger.info(f"Class {cls}: {count} files")
 
     # Verify all classes have at least 2 files
     single_file_classes = class_file_counts[class_file_counts == 1].index.tolist()
@@ -40,6 +40,8 @@ def get_folds(df, cfg):
     )
 
     for fold, (train_idx, val_idx) in enumerate(group_kfold.split(df, labels, groups)):
+        if fold not in cfg.training.SELECTED_FOLDS:
+            continue
         # Get class distributions
         train_class_files = (
             df.iloc[train_idx].groupby("primary_label")["filename"].nunique()
