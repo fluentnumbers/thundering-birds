@@ -1,12 +1,20 @@
 import torch.nn as nn
 
-from src.training.losses import AsymmetricLossMultiLabel, HierarchicalBCELoss
+from src.training.losses import AsymmetricLossMultiLabel, HierarchicalBCELoss, DynamicWeightedBCELoss
 
 
 def get_criterion(cfg):
 
     if cfg.training.CRITERION == "BCEWithLogitsLoss":
-        criterion = nn.BCEWithLogitsLoss()
+        if hasattr(cfg.training, 'LOSS_WEIGHTING') and cfg.training.LOSS_WEIGHTING == "dynamic":
+            criterion = DynamicWeightedBCELoss(
+                num_classes=cfg.num_classes,
+                momentum=cfg.training.LOSS_MOMENTUM,
+                temperature=cfg.training.LOSS_TEMPERATURE,
+                min_weight=cfg.training.LOSS_MIN_WEIGHT
+            )
+        else:
+            criterion = nn.BCEWithLogitsLoss()
     elif cfg.training.CRITERION == "AsymmetricLossMultiLabel":
         criterion = AsymmetricLossMultiLabel(
             gamma_neg=4,

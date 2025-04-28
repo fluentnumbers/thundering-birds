@@ -39,7 +39,7 @@ class CFG:
 
     training = EasyDict()
     training.DEBUG = True if device == "cpu" else False
-    training.EPOCHS = 50
+    training.EPOCHS = 100
     training.NUM_WORKERS = 10 if device == "cuda" else 0
     training.PREFETCH_FACTOR = 6 if training.NUM_WORKERS > 0 else None
     training.AUGMENTATION_PROB = 0.5
@@ -49,35 +49,53 @@ class CFG:
     training.SELECTED_FOLDS = [0, 1, 2, 3, 4]
     training.SAMPLES_PER_EPOCH = 15000
     training.CORRECT_LOSS = True
+    training.LOSS_WEIGHTING = "static"
+    if training.LOSS_WEIGHTING == "dynamic":
+        training.LOSS_MOMENTUM = 0.999
+        training.LOSS_TEMPERATURE = 1.0
+        training.LOSS_MIN_WEIGHT = 0.01
+    else:
+        training.LOSS_MOMENTUM = None
+        training.LOSS_TEMPERATURE = None
+        training.LOSS_MIN_WEIGHT = None
     training.SAVE_INTERMEDIATE_MODEL = True
     training.EARLY_STOPPING_METRIC = "f1"  # f1 auc
     training.EARLY_STOPPING_MIN_DELTA = 0.005
     training.EARLY_STOPPING_PATIENCE = 100
-    training.BATCH_SIZE = 256 if device == "cuda" else 32
-    training.GRAD_ACCUM_STEPS = 4
+    training.BATCH_SIZE = 384 if device == "cuda" else 32
+    training.GRAD_ACCUM_STEPS = 2
     training.OPTIMIZER = "AdamW"
-    training.WEIGHT_DECAY = 1e-5
+    training.WEIGHT_DECAY = 1e-6
 
     # Learning rate configuration
     training.SCHEDULER = "CosineAnnealingLR" # WarmupCosineScheduler CosineAnnealingLR
-    training.BASE_LR = 3e-3  # Base learning rate before scaling
+    training.BASE_LR = 1e-3  # Base learning rate before scaling
     training.MIN_LR = 1e-6
     training.T_MAX = training.EPOCHS
-    training.LR_SCALING = True  # Whether to use dynamic LR scaling
+    training.LR_SCALING = False  # Whether to use dynamic LR scaling
     training.LR_SCALE_FACTOR = 0.1  # Factor to scale LR for classifier head
-    training.WARMUP_EPOCHS = 5  # Number of epochs for warmup
-    training.WARMUP_FACTOR = 0.1  # Starting warmup factor
-    training.MAX_GRAD_NORM = 5.0  # Maximum gradient norm for clipping, None to disable
+    if training.SCHEDULER == "WarmupCosineScheduler":
+        training.WARMUP_EPOCHS = 10  # Number of epochs for warmup
+        training.WARMUP_FACTOR = 0.1  # Starting warmup factor
+    else:
+        training.WARMUP_EPOCHS = None
+        training.WARMUP_FACTOR = None
+    training.MAX_GRAD_NORM = None # Maximum gradient norm for clipping, None to disable
     training.LR_LAYER_DECAY = 0.9  # Layer-wise learning rate decay factor
 
 
     training.CRITERION = "BCEWithLogitsLoss"  # AsymmetricLossMultiLabel BCEWithLogitsLoss HierarchicalBCELoss CELoss
     # label smoothing
     training.USE_LABEL_SMOOTHING = True
-    training.PRIMARY_LABEL_SMOOTHING = 0.1  # primary label weight = 1 - smoothing
-    training.SECONDARY_LABEL_WEIGHT = (
-        0.2  # Weight for secondary labels in label smoothing
-    )
+    if training.USE_LABEL_SMOOTHING:
+        training.PRIMARY_LABEL_SMOOTHING = 0.1  # primary label weight = 1 - smoothing
+        training.SECONDARY_LABEL_WEIGHT = (
+            0.2  # Weight for secondary labels in label smoothing
+        )
+    else:
+        training.PRIMARY_LABEL_SMOOTHING = None
+        training.SECONDARY_LABEL_WEIGHT = None
+
     # HierarchicalBCELoss
     training.PRIMARY_WEIGHT = (
         1.0 if training.CRITERION == "HierarchicalBCELoss" else None
@@ -89,8 +107,8 @@ class CFG:
 
     def update_debug_settings(self):
         if self.training.DEBUG:
-            self.training.DEBUG_N_CLASSES = 10
-            self.training.EPOCHS = 50
+            self.training.DEBUG_N_CLASSES = 30
+            self.training.EPOCHS = 100
             self.training.SAMPLES_PER_EPOCH = 10000
             self.training.SELECTED_FOLDS = [0]
             self.training.T_MAX = self.training.EPOCHS
@@ -99,7 +117,7 @@ class CFG:
     model.model_name = "efficientnet-b0"
     model.kernel_size = (3, 3)
     model.cfar_scaling_factors = (1, 2)
-    model.mixup_alpha = 0
+    model.mixup_alpha = 0.5
 
     preprocessing = EasyDict()
     preprocessing.NUM_WORKERS = 10

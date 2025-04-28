@@ -70,7 +70,7 @@ def get_scheduler(optimizer, cfg):
             optimizer,
             warmup_epochs=cfg.training.WARMUP_EPOCHS,
             warmup_factor=cfg.training.WARMUP_FACTOR,
-            total_epochs=cfg.training.EPOCHS,
+            total_epochs=cfg.training.T_MAX,
             min_lr=cfg.training.MIN_LR,
         )
     elif cfg.training.SCHEDULER == "ReduceLROnPlateau":

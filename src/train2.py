@@ -107,7 +107,7 @@ class CFG:
     LOAD_DATA = False
     FS = 32000
     TARGET_DURATION = 5.0
-    TARGET_SHAPE = (256, 256)
+    TARGET_SHAPE = (224,224)
 
     N_FFT = 1024
     HOP_LENGTH = 512
@@ -870,8 +870,8 @@ def run_training(df, cfg):
             collate_fn=collate_fn
         )
 
-        model = BirdCLEFModel(cfg).to(cfg.device)
-        # model = MyModel(cfg).to(cfg.device)
+        # model = BirdCLEFModel(cfg).to(cfg.device)
+        model = MyModel(cfg).to(cfg.device)
         optimizer = get_optimizer(model, cfg)
         criterion = get_criterion(cfg)
 

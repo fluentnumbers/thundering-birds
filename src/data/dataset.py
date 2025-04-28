@@ -470,60 +470,60 @@ class BirdCLEFDataset(Dataset):
             num_times_used (int): Number of times the segment has been used
         """
         # Get usage count for this segment if tracking info is available
-        usage_factor = min(1.0 + (num_times_used * 0.1), 2.0)  # Cap at 2.0
 
         # Time masking (horizontal stripes) with scaled width
         if random.random() < 0.5:
-            num_masks = random.randint(1, max(2, int(3 * usage_factor)))
+            num_masks = random.randint(1, 2)
             for _ in range(num_masks):
-                width = random.randint(5, int(20 * usage_factor))
+                width = random.randint(8, 16)
                 start = random.randint(0, spec.shape[2] - width)
-                spec[0, :, start : start + width] = 0
+                spec[0, :, start:start+width] = 0
 
         # Frequency masking (vertical stripes) with scaled height
         if random.random() < 0.5:
-            num_masks = random.randint(1, max(2, int(3 * usage_factor)))
+            num_masks = random.randint(1, 2)
             for _ in range(num_masks):
-                height = random.randint(5, int(20 * usage_factor))
+                height = random.randint(8, 16)
                 start = random.randint(0, spec.shape[1] - height)
-                spec[0, start : start + height, :] = 0
+                spec[0, start:start+height, :] = 0
 
         # Random brightness/contrast with scaled intensity
         if random.random() < 0.5:
-            gain = random.uniform(1.0 - 0.2 * usage_factor, 1.0 + 0.2 * usage_factor)
-            bias = random.uniform(-0.1 * usage_factor, 0.1 * usage_factor)
+            gain = random.uniform(0.8, 1.2)
+            bias = random.uniform(-0.1, 0.1)
             spec = spec * gain + bias
             spec = torch.clamp(spec, 0, 1)
 
         # Frequency shift (pitch shift simulation) for heavily used samples
-        if random.random() < 0.3 * usage_factor:
-            shift = random.randint(-2, 2)
+        if random.random() < 0.7:
+            shift = random.randint(-3,3)
             spec = torch.roll(spec, shifts=shift, dims=1)
+            num_masks = random.randint(2,4)
 
         # Time stretching for heavily used samples
-        if random.random() < 0.3 * usage_factor:
-            stretch_factor = random.uniform(0.9, 1.1)
-            orig_size = spec.shape[2]
-            stretched_size = int(orig_size * stretch_factor)
-            if stretched_size != orig_size:
-                spec = torch.nn.functional.interpolate(
-                    spec.unsqueeze(0),
-                    size=(spec.shape[1], stretched_size),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0)
-                if stretched_size > orig_size:
-                    spec = spec[:, :, :orig_size]
-                else:
-                    spec = torch.nn.functional.pad(
-                        spec, (0, orig_size - stretched_size)
-                    )
+        # if random.random() < 0.3:
+        #     stretch_factor = random.uniform(0.9, 1.1)
+        #     orig_size = spec.shape[2]
+        #     stretched_size = int(orig_size * stretch_factor)
+        #     if stretched_size != orig_size:
+        #         spec = torch.nn.functional.interpolate(
+        #             spec.unsqueeze(0),
+        #             size=(spec.shape[1], stretched_size),
+        #             mode="bilinear",
+        #             align_corners=False,
+        #         ).squeeze(0)
+        #         if stretched_size > orig_size:
+        #             spec = spec[:, :, :orig_size]
+        #         else:
+        #             spec = torch.nn.functional.pad(
+        #                 spec, (0, orig_size - stretched_size)
+        #             )
 
-        # Add noise for heavily used samples
-        if random.random() < 0.3 * usage_factor:
-            noise = torch.randn_like(spec) * (0.02 * usage_factor)
-            spec = spec + noise
-            spec = torch.clamp(spec, 0, 1)
+        # # Add noise for heavily used samples
+        # if random.random() < 0.3:
+        #     noise = torch.randn_like(spec) * (0.02)
+        #     spec = spec + noise
+        #     spec = torch.clamp(spec, 0, 1)
 
         return spec
 

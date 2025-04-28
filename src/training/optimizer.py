@@ -2,7 +2,41 @@ import numpy as np
 import torch.optim as optim
 
 
+
+
+
+
 def get_optimizer(model, cfg):
+
+    if cfg.training.OPTIMIZER == "Adam":
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=cfg.training.BASE_LR,
+            weight_decay=cfg.training.WEIGHT_DECAY,
+        )
+    elif cfg.training.OPTIMIZER == "AdamW":
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=cfg.training.BASE_LR,
+            weight_decay=cfg.training.WEIGHT_DECAY,
+        )
+    elif cfg.training.OPTIMIZER == "SGD":
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=cfg.training.BASE_LR,
+            momentum=0.9,
+            weight_decay=cfg.training.WEIGHT_DECAY,
+        )
+    else:
+        raise NotImplementedError(f"Optimizer {cfg.training.OPTIMIZER} not implemented")
+
+
+
+
+
+    return optimizer
+
+def get_optimizer2(model, cfg):
     """Get optimizer with layer-wise learning rates and dynamic scaling.
 
     The learning rate is scaled based on:

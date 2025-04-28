@@ -134,8 +134,6 @@ class EfficientNetWithAttention(nn.Module):
         # Replace the original classifier
         self.efficientnet._fc = self.classifier
 
-        # Register attention outputs as a buffer to avoid gradient computation
-        self.register_buffer("attention_outputs", None)
 
     def freeze_backbone(self, num_layers: int = -1):
         """

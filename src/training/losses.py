@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+import wandb
 
 
 class AsymmetricLossMultiLabel(nn.Module):
@@ -77,3 +78,52 @@ class HierarchicalBCELoss(nn.Module):
         return (
             self.primary_weight * primary_loss + self.secondary_weight * secondary_loss
         )
+
+
+class DynamicWeightedBCELoss(nn.Module):
+    def __init__(self, num_classes, momentum=0.9, temperature=2.0, min_weight=0.1):
+        super().__init__()
+        self.register_buffer('class_errors', torch.ones(num_classes))
+        self.momentum = momentum
+        self.temperature = temperature
+        self.min_weight = min_weight
+        self.num_classes = num_classes
+
+    def forward(self, logits, targets):
+        device = logits.device
+        with torch.no_grad():
+            # Calculate current errors per class
+            probs = torch.sigmoid(logits)
+            errors = torch.abs(probs - targets).mean(0)  # [num_classes]
+
+            # Ensure class_errors is on the correct device
+            self.class_errors = self.class_errors.to(device)
+
+            # Update running average of errors
+            self.class_errors = (
+                self.momentum * self.class_errors +
+                (1 - self.momentum) * errors
+            )
+
+            # Convert errors to weights using softmax with temperature
+            weights = F.softmax(self.class_errors / self.temperature, dim=0)
+
+            # Ensure minimum weight per class
+            min_weight_tensor = torch.tensor(self.min_weight, device=device)
+            weights = torch.maximum(weights, min_weight_tensor)
+            weights = weights / weights.sum()  # Renormalize
+
+            # Log weights and errors if wandb is initialized
+            if wandb.run is not None:
+                for i in range(self.num_classes):
+                    wandb.log({
+                        f'loss/class_{i}_error': self.class_errors[i].item(),
+                        f'loss/class_{i}_weight': weights[i].item()
+                    })
+
+        # Apply dynamic weights to BCE loss
+        bce_loss = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+        weighted_loss = bce_loss * weights[None, :]
+        return weighted_loss.mean()

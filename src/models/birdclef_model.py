@@ -3,7 +3,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from src.models.efficientnet_attention import EfficientNetWithAttention
+from src.models.efficientnet_attention import AttentionChannels, EfficientNetWithAttention
+from efficientnet_pytorch import EfficientNet
 
 
 class BirdCLEFModel(nn.Module):
@@ -12,11 +13,34 @@ class BirdCLEFModel(nn.Module):
         self.cfg = cfg
 
         # Initialize EfficientNetWithAttention model
-        self.model = EfficientNetWithAttention(
-            num_classes=cfg.num_classes,
-            efficientnet_version=cfg.model.model_name,
+        # self.backbone = EfficientNetWithAttention(
+        #     num_classes=cfg.num_classes,
+        #     efficientnet_version=cfg.model.model_name,
+        #     kernel_size=cfg.model.kernel_size,
+        #     cfar_scaling_factors=cfg.model.cfar_scaling_factors,
+        # )
+        self.attention = AttentionChannels(
             kernel_size=cfg.model.kernel_size,
-            cfar_scaling_factors=cfg.model.cfar_scaling_factors,
+            scaling_factors=cfg.model.cfar_scaling_factors,
+        )
+        self.efficientnet = EfficientNet.from_pretrained(
+            cfg.model.model_name, num_classes=cfg.num_classes
+        )
+
+        backbone_out = self.efficientnet._fc.in_features
+        self.efficientnet._fc = nn.Identity()
+
+        self.pooling = nn.AdaptiveAvgPool2d(1)
+
+        self.feat_dim = backbone_out
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=0.3),  # Dropout after feature extraction
+            nn.Linear(backbone_out, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(p=0.2),  # Dropout before final classification
+            nn.Linear(512, cfg.num_classes),
         )
 
         self.mixup_enabled = (
@@ -32,7 +56,14 @@ class BirdCLEFModel(nn.Module):
         else:
             targets_a, targets_b, lam = None, None, None
 
-        logits = self.model(x)
+        self.attention_outputs = self.attention(x)
+        # x = torch.cat((x, x,x ), dim=1)
+        features = self.efficientnet(self.attention_outputs)
+
+        if isinstance(features, dict):
+            features = features['features']
+
+        logits = self.classifier(features)
 
         if self.training and self.mixup_enabled and targets is not None:
             loss = self.mixup_criterion(
