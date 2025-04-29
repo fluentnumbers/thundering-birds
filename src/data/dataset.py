@@ -5,10 +5,12 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-
+import src.train2 as train2
+from easydict import EasyDict
 from src.data.preprocessing import process_audio_file
 from src.data.processing import align_df_and_metadata, normalize_values_by_group
 from src.utils.logger import setup_logger
+import src.data.preprocessing as preprocessing
 
 logger = setup_logger(__name__)
 
@@ -395,24 +397,85 @@ class BirdCLEFDataset(Dataset):
 
     def __len__(self):
         """Return dataset length based on mode"""
-        if self.mode == "train":
-            return self.samples_per_epoch
-        else:
-            return len(self.all_segment_indices)
+        # if self.mode == "train":
+            # return self.samples_per_epoch
+        # else:
+            # return len(self.all_segment_indices)
+        return len(self.df)
+
+
 
     def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        segment_file = row["filename"]
+        filepath = self.cfg.dirs.train_datadir + "/" + segment_file
+        spec = None
+
+        # spec = preprocessing.process_audio_file(row['filepath'], self.cfg.preprocessing)
+        cfg = EasyDict({"FS":self.cfg.preprocessing.SAMPLE_RATE, "TARGET_DURATION":self.cfg.preprocessing.SEGMENT_DURATION, "TARGET_SHAPE":self.cfg.preprocessing.TARGET_SHAPE,"N_FFT":self.cfg.preprocessing.N_FFT,"HOP_LENGTH":self.cfg.preprocessing.HOP_LENGTH,"N_MELS":self.cfg.preprocessing.N_MELS,"FMIN":self.cfg.preprocessing.FMIN,"FMAX":self.cfg.preprocessing.FMAX})
+        spec = train2.process_audio_file(filepath, cfg)
+
+        if spec is None:
+            spec = np.zeros(self.cfg.TARGET_SHAPE, dtype=np.float32)
+            if self.mode == "train":  # Only print warning during training
+                logger.warning(f"Warning: Spectrogram for {segment_file} not found and could not be generated")
+
+        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
+
+        if self.mode == "train" and random.random() < self.cfg.training.AUGMENTATION_PROB:
+            spec = self.apply_spec_augmentations(spec)
+
+        # primary_target = self.encode_label(row['primary_label'])
+        # target = primary_target.clone()
+        primary_target, secondary_target, target = self._create_targets(
+            row['primary_label'],
+            row['secondary_labels']
+        )
+
+        class_label = row['primary_label']
+
+        if 'secondary_labels' in row and row['secondary_labels'] not in [[''], None, np.nan]:
+            if isinstance(row['secondary_labels'], str):
+                secondary_labels = eval(row['secondary_labels'])
+            else:
+                secondary_labels = row['secondary_labels']
+
+            for label in secondary_labels:
+                if label in self.label_to_idx:
+                    target[self.label_to_idx[label]] = 1.0
+
+
+        return {
+            "melspec": spec,
+            "target": torch.tensor(target, dtype=torch.float32),
+            "primary_target": primary_target,
+            "secondary_target": secondary_target,
+            "class_label": class_label,
+            "segment_file": segment_file,
+            # "segment_idx": segment_idx,
+            # "signal_power_weight": self.signal_power_lookup.get(str(cache_path), 0.1),
+        }
+
+    def __getitem__2(self, idx):
         if self.mode == "train":
-            # Existing training logic
-            class_label = self.rng.choice(self.class_ids, p=self.class_weights)
-            segment_idx = self.rng.randint(
-                0, self.metadata_lookup_classes[class_label]["n_segments"]
-            )
-            cache_path = self.metadata_lookup_classes[class_label]["cache_paths"][
-                segment_idx
-            ]
-            segment_file = self.metadata_lookup_classes[class_label]["segments"][
-                segment_idx
-            ]
+            row = self.df.iloc[idx]
+            segment_file = row["filename"]
+            n_segments = self.metadata_lookup_files[row['filename']]['n_segments']
+            segment_idx = self.rng.randint(0, n_segments)
+
+            cache_path = self.metadata_lookup_files[row['filename']]['cache_paths'][segment_idx]
+            class_label = row['primary_label']
+
+            # class_label = self.rng.choice(self.class_ids, p=self.class_weights)
+            # segment_idx = self.rng.randint(
+            #     0, self.metadata_lookup_classes[class_label]["n_segments"]
+            # )
+            # cache_path = self.metadata_lookup_classes[class_label]["cache_paths"][
+                # segment_idx
+            # ]
+            # segment_file = self.metadata_lookup_classes[class_label]["segments"][
+                # segment_idx
+            # ]
         else:
             # Validation mode: use deterministic ordering
             segment_info = self.all_segment_indices[idx]
@@ -423,15 +486,15 @@ class BirdCLEFDataset(Dataset):
 
         spectrogram = torch.load(cache_path)
 
-        num_times_used = 0
         if self.mode == "train" and random.random() < self.cfg.training.AUGMENTATION_PROB:
             spectrogram = self.apply_spec_augmentations(
-                spectrogram, num_times_used=num_times_used
+                spectrogram
             )
 
         # Create target vectors
         primary_target, secondary_target, target = self._create_targets(
-            self.metadata_df[self.metadata_df["cache_path"] == cache_path].iloc[0]
+            row['primary_label'],
+            row['secondary_labels']
         )
 
         return {
@@ -462,12 +525,11 @@ class BirdCLEFDataset(Dataset):
             "signal_power_weight": 0.1,  # minimum weight for failed samples
         }
 
-    def apply_spec_augmentations(self, spec, num_times_used):
+    def apply_spec_augmentations(self, spec, ):
         """Apply augmentations to spectrogram with usage-based intensity
 
         Args:
             spec (torch.Tensor): Input spectrogram
-            num_times_used (int): Number of times the segment has been used
         """
         # Get usage count for this segment if tracking info is available
 
@@ -529,7 +591,8 @@ class BirdCLEFDataset(Dataset):
 
     def _create_targets(
         self,
-        segment_metadata,
+        primary_label,
+        secondary_labels
     ):
         """
         Create primary and secondary target vectors with label smoothing and weighting.
@@ -543,8 +606,8 @@ class BirdCLEFDataset(Dataset):
             tuple: (primary_target, secondary_target, target) tensors
         """
         num_classes = self.num_classes
-        primary_idx = self.label_to_idx[segment_metadata["primary_label"]]
-        secondary_labels = segment_metadata["secondary_labels"]
+        primary_idx = self.label_to_idx[primary_label]
+        secondary_labels = secondary_labels
         USE_SMOOTHING = self.cfg.training.USE_LABEL_SMOOTHING
         primary_smoothing = (
             self.cfg.training.PRIMARY_LABEL_SMOOTHING if self.mode == "train" else 0.0

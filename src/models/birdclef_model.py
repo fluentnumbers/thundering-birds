@@ -34,14 +34,15 @@ class BirdCLEFModel(nn.Module):
 
         self.feat_dim = backbone_out
 
-        self.classifier = nn.Sequential(
-            nn.Dropout(p=0.3),  # Dropout after feature extraction
-            nn.Linear(backbone_out, 512),
-            nn.ReLU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(p=0.2),  # Dropout before final classification
-            nn.Linear(512, cfg.num_classes),
-        )
+        # self.classifier = nn.Sequential(
+        #     nn.Dropout(p=0.3),  # Dropout after feature extraction
+        #     nn.Linear(backbone_out, 512),
+        #     nn.ReLU(),
+        #     nn.BatchNorm1d(512),
+        #     nn.Dropout(p=0.2),  # Dropout before final classification
+        #     nn.Linear(512, cfg.num_classes),
+        # )
+        self.classifier = nn.Linear(backbone_out, cfg.num_classes)
 
         self.mixup_enabled = (
             hasattr(cfg.model, "mixup_alpha") and cfg.model.mixup_alpha > 0

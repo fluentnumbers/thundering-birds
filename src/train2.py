@@ -728,21 +728,6 @@ def validate(model, loader, criterion, device, species_ids=None):
 
     return avg_loss, metrics, analysis
 
-def calculate_auc(targets, outputs):
-
-    num_classes = targets.shape[1]
-    aucs = []
-
-    probs = 1 / (1 + np.exp(-outputs))
-
-    for i in range(num_classes):
-
-        if np.sum(targets[:, i]) > 0:
-            class_auc = roc_auc_score(targets[:, i], probs[:, i])
-            aucs.append(class_auc)
-
-    return np.mean(aucs) if aucs else 0.0
-
 
 def run_training(df, cfg):
     """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
@@ -809,42 +794,8 @@ def run_training(df, cfg):
                 f"{'DEBUG' if cfg.training.DEBUG else 'PROD'}",
                 f"{cfg.device.upper()}",
             ],
-            # config={
-            #     "batch_size": cfg.training.BATCH_SIZE,
-            #     "epochs": cfg.training.EPOCHS,
-            #     "model": cfg.model.model_name,
-            #     "device": cfg.device,
-            #     "seed": cfg.seed,
-            #     "n_classes": cfg.num_classes,
-            #     "optimizer": cfg.training.OPTIMIZER,
-            #     "scheduler": cfg.training.SCHEDULER,
-            #     "criterion": cfg.training.CRITERION,
-            #     "early_stopping_metric": cfg.training.EARLY_STOPPING_METRIC,
-            #     "early_stopping_patience": cfg.training.EARLY_STOPPING_PATIENCE,
-            #     "progressive_unfreezing": cfg.training.PROGRESSIVE_UNFREEZING,
-            #     "loss_weighting": cfg.training.LOSS_WEIGHTING,
-            #     "loss_momentum": cfg.training.LOSS_MOMENTUM,
-            #     "loss_temperature": cfg.training.LOSS_TEMPERATURE,
-            #     "loss_min_weight": cfg.training.LOSS_MIN_WEIGHT,
-            #     "sampling_classes_weights": cfg.training.SAMPLING_CLASSES_WEIGHTS,
-            #     "samples_per_epoch": cfg.training.SAMPLES_PER_EPOCH,
-            #     "lr_scaling": cfg.training.LR_SCALING,
-            #     "lr_scale_factor": cfg.training.LR_SCALE_FACTOR,
-            #     "warmup_epochs": cfg.training.WARMUP_EPOCHS,
-            #     "warmup_factor": cfg.training.WARMUP_FACTOR,
-            #     "max_grad_norm": cfg.training.MAX_GRAD_NORM,
-            #     "lr_layer_decay": cfg.training.LR_LAYER_DECAY,
-            #     "min_lr": cfg.training.MIN_LR,
-            #     "base_lr": cfg.training.BASE_LR,
-            #     "t_max": cfg.training.T_MAX,
-            #     "grad_accum_steps": cfg.training.GRAD_ACCUM_STEPS,
-            #     "train_files": len(train_dataset.metadata_df["filename"].unique()),
-            #     "train_segments": len(train_dataset.metadata_df),
-            #     "train_classes": len(train_dataset.class_ids),
-            #     "val_files": len(val_dataset.metadata_df["filename"].unique()),
-            #     "val_segments": len(val_dataset.metadata_df),
-            #     "val_classes": len(val_dataset.class_ids),
-            # },
+            config={
+            },
         )
         # After initializing wandb_logger
         # config_dict = cfg.to_dict()
@@ -1011,7 +962,7 @@ def run_training(df, cfg):
                         "train_auc": train_metrics["macro_metrics"]["auc"],
                         "train_f1": train_metrics["macro_metrics"]["f1"],
                     'cfg': cfg
-                }, f"model_fold{fold}.pth")
+                }, checkpoint_path)
                 logger.debug(f"Saved best model checkpoint to {checkpoint_path}")
             else:
                 no_improvement_epochs += 1
