@@ -47,8 +47,6 @@ import torch
 
 from src.utils.logger import WandbLogger, setup_logger
 
-LOGS_DIR = Path("logs")
-
 logger = setup_logger(__name__)
 # Clear GPU memory
 if torch.cuda.is_available():
@@ -79,6 +77,7 @@ class CFG:
     num_workers = 2
     DATA_ROOT = Path("./data/birdclef-2025")
     OUTPUT_DIR = "/outputs/"
+    LOGS_DIR = Path("logs")
 
     train_datadir = (DATA_ROOT / "train_audio_no_voice").as_posix()
     train_csv = (DATA_ROOT / "train.csv").as_posix()
@@ -142,9 +141,9 @@ class CFG:
 
     def update_debug_settings(self):
         if self.debug:
-            self.training.DEBUG_N_CLASSES = 10
+            self.training.DEBUG_N_CLASSES = 50
             self.num_classes = self.training.DEBUG_N_CLASSES
-            self.epochs = 10
+            self.epochs = 100
             self.selected_folds = [0]
 
     def to_dict(self) -> dict:
@@ -454,25 +453,35 @@ def collate_fn(batch):
 
 
 class BirdCLEFModel(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg=None, num_classes=None, model_name=None, pretrained=True, in_channels=1):
         super().__init__()
-        self.cfg = cfg
 
-        # taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
-        # cfg.num_classes = len(taxonomy_df)
+        # Allow initialization with either cfg or direct parameters
+        if cfg is not None:
+            self.num_classes = cfg.num_classes
+            self.model_name = cfg.model_name
+            self.pretrained = cfg.pretrained
+            self.in_channels = cfg.in_channels
+            self.mixup_alpha = cfg.mixup_alpha if hasattr(cfg, "mixup_alpha") else 0
+        else:
+            self.num_classes = num_classes
+            self.model_name = model_name or 'efficientnet_b3'
+            self.pretrained = pretrained
+            self.in_channels = in_channels
+            self.mixup_alpha = 0
 
         self.backbone = timm.create_model(
-            cfg.model_name,
-            pretrained=cfg.pretrained,
-            in_chans=cfg.in_channels,
+            self.model_name,
+            pretrained=self.pretrained,
+            in_chans=self.in_channels,
             drop_rate=0.4,
             drop_path_rate=0.4,
         )
 
-        if "efficientnet" in cfg.model_name:
+        if "efficientnet" in self.model_name:
             backbone_out = self.backbone.classifier.in_features
             self.backbone.classifier = nn.Identity()
-        elif "resnet" in cfg.model_name:
+        elif "resnet" in self.model_name:
             backbone_out = self.backbone.fc.in_features
             self.backbone.fc = nn.Identity()
         else:
@@ -480,17 +489,12 @@ class BirdCLEFModel(nn.Module):
             self.backbone.reset_classifier(0, "")
 
         self.pooling = nn.AdaptiveAvgPool2d(1)
-
         self.feat_dim = backbone_out
+        self.classifier = nn.Linear(backbone_out, self.num_classes)
 
-        self.classifier = nn.Linear(backbone_out, cfg.num_classes)
-
-        self.mixup_enabled = hasattr(cfg, "mixup_alpha") and cfg.mixup_alpha > 0
-        if self.mixup_enabled:
-            self.mixup_alpha = cfg.mixup_alpha
+        self.mixup_enabled = self.mixup_alpha > 0
 
     def forward(self, x, targets=None):
-
         if self.training and self.mixup_enabled and targets is not None:
             mixed_x, targets_a, targets_b, lam = self.mixup_data(x, targets)
             x = mixed_x
@@ -519,18 +523,56 @@ class BirdCLEFModel(nn.Module):
     def mixup_data(self, x, targets):
         """Applies mixup to the data batch"""
         batch_size = x.size(0)
-
         lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
-
         indices = torch.randperm(batch_size).to(x.device)
-
         mixed_x = lam * x + (1 - lam) * x[indices]
-
         return mixed_x, targets, targets[indices], lam
 
     def mixup_criterion(self, criterion, pred, y_a, y_b, lam):
         """Applies mixup to the loss function"""
         return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+    def save_checkpoint(self, path):
+        """Save model checkpoint with minimal dependencies"""
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'num_classes': self.num_classes,
+            'model_name': self.model_name,
+            'in_channels': self.in_channels,
+            'pretrained': self.pretrained,
+            'mixup_alpha': self.mixup_alpha,
+            'architecture': 'BirdCLEFModel'
+        }
+        torch.save(checkpoint, path)
+
+    @staticmethod
+    def load_from_checkpoint(checkpoint_path, map_location=None):
+        """Load model from checkpoint without requiring original config"""
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+
+        # Extract model parameters from checkpoint
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            num_classes = checkpoint.get('num_classes', 206)
+            model_name = checkpoint.get('model_name', 'efficientnet_b3')
+            in_channels = checkpoint.get('in_channels', 1)
+            pretrained = checkpoint.get('pretrained', True)
+        else:
+            state_dict = checkpoint
+            num_classes = 206
+            model_name = 'efficientnet_b3'
+            in_channels = 1
+            pretrained = True
+
+        # Create model instance
+        model = BirdCLEFModel(
+            num_classes=num_classes,
+            model_name=model_name,
+            pretrained=pretrained,
+            in_channels=in_channels
+        )
+        model.load_state_dict(state_dict)
+        return model
 
 
 def get_optimizer(model, cfg):
@@ -747,9 +789,9 @@ def validate(model, loader, criterion, device, species_ids=None):
 def run_training(df, cfg):
     """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = LOGS_DIR / f"training_run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Starting training run in {run_dir}")
+    cfg.run_dir = cfg.LOGS_DIR / f"training_run_{timestamp}"
+    cfg.run_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Starting training run in {cfg.run_dir}")
 
     taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
     species_ids = taxonomy_df["primary_label"].tolist()
@@ -763,9 +805,9 @@ def run_training(df, cfg):
         half_n = cfg.training.DEBUG_N_CLASSES // 2
         most_common_classes = class_counts.nlargest(half_n).index.tolist()
         least_common_classes = (
-            class_counts[class_counts >= 4].nsmallest(half_n * 2).index.tolist()
+            class_counts[class_counts >= 4].nsmallest(half_n ).index.tolist()
         )
-        top_n_classes = least_common_classes  # + most_common_classes
+        top_n_classes = least_common_classes  + most_common_classes
 
         df = df[df["primary_label"].isin(top_n_classes)]
         logger.info(
@@ -822,7 +864,7 @@ def run_training(df, cfg):
 
         wandb_logger = WandbLogger(
             f"fold{fold}_{cfg.num_classes}classes",
-            run_dir,
+            cfg.run_dir,
             group=wandb_group,
             tags=[
                 f"fold_{fold}",
@@ -988,30 +1030,7 @@ def run_training(df, cfg):
                     f"New best {cfg.training.EARLY_STOPPING_METRIC}: {best_metric:.3f} at epoch {best_epoch} \n"
                 )
                 # Save model checkpoint when metrics improve
-                checkpoint_path = run_dir / f"model_fold{fold}_epoch{epoch+1}_best.pth"
-
-                # Delete previous checkpoints for this fold
-                for old_checkpoint in run_dir.glob(f"model_fold{fold}_*_best.pth"):
-                    if old_checkpoint != checkpoint_path:
-                        old_checkpoint.unlink()
-                        logger.debug(f"Deleted old checkpoint {old_checkpoint}")
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": (
-                            scheduler.state_dict() if scheduler else None
-                        ),
-                        "epoch": epoch,
-                        "val_auc": val_metrics["macro_metrics"]["auc"],
-                        "val_f1": val_metrics["macro_metrics"]["f1"],
-                        "train_auc": train_metrics["macro_metrics"]["auc"],
-                        "train_f1": train_metrics["macro_metrics"]["f1"],
-                        "cfg": cfg,
-                    },
-                    checkpoint_path,
-                )
-                logger.debug(f"Saved best model checkpoint to {checkpoint_path}")
+                save_checkpoint(model, timestamp, optimizer, epoch, fold, val_metrics, best_metric, cfg, is_best=True)
             else:
                 no_improvement_epochs += 1
                 logger.info(
@@ -1067,9 +1086,39 @@ def run_training(df, cfg):
         "std_f1": float(np.std([s["f1"] for s in best_scores])),
         "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
     }
-    with open(run_dir / "results.json", "w") as f:
+    with open(cfg.run_dir / "results.json", "w") as f:
         json.dump(results, f, indent=4)
-    logger.info(f"Saved results to {run_dir / 'results.json'}")
+    logger.info(f"Saved results to {cfg.run_dir / 'results.json'}")
+
+
+def save_checkpoint(model, timestamp, optimizer, epoch, fold, metrics, best_score, cfg, is_best=False):
+    if is_best:
+        checkpoint_name = f"model_{timestamp}_fold{fold}_epoch{epoch}_best"
+
+        # Create checkpoint directory if it doesn't exist
+        if not hasattr(cfg, 'run_dir'):
+            cfg.run_dir = cfg.LOGS_DIR / f"training_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            cfg.run_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_path = cfg.run_dir / f"{checkpoint_name}.pth"
+
+        # Delete previous best checkpoints for this fold
+        for old_checkpoint in cfg.run_dir.glob(f"model_{timestamp}_fold{fold}_*_best.pth"):
+            if old_checkpoint != checkpoint_path:  # Don't delete the file we're about to create
+                try:
+                    old_checkpoint.unlink()
+                    logger.info(f"Deleted old checkpoint: {old_checkpoint}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete old checkpoint {old_checkpoint}: {e}")
+
+        # Use the new save method
+        model.save_checkpoint(checkpoint_path)
+        logger.info(f"Saved new best checkpoint to {checkpoint_path}")
+
+
+def load_checkpoint(checkpoint_path, device='cuda'):
+    model = BirdCLEFModel.load_from_checkpoint(checkpoint_path, map_location=device)
+    return model
 
 
 if __name__ == "__main__":
