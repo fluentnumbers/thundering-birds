@@ -1,50 +1,52 @@
-from datetime import datetime
-from src.models.birdclef_model import BirdCLEFModel as MyModel
-import src
-from easydict import EasyDict
-import json
-import os
-import logging
-import random
 import gc
-import time
-import cv2
+import json
+import logging
 import math
+import os
+import random
+import time
 import warnings
+from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
+import cv2
+import librosa
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
-import librosa
-
+import seaborn as sns
+import timm
 import torch
+import torch.hub
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torchaudio
+from dotenv import load_dotenv
+from easydict import EasyDict
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 from torch.optim import lr_scheduler
-from torch.utils.data import Dataset, DataLoader
-
-import matplotlib.pyplot as plt
-import seaborn as sns
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
-import timm
-import torchaudio
-import torch.hub
+import src
+from src.models.birdclef_model import BirdCLEFModel as MyModel
 from src.training.metrics import (
     analyze_class_performance,
     calculate_class_metrics,
     plot_class_metrics,
     plot_confusion_matrix,
 )
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
-import torch
 import gc
-from src.utils.logger import setup_logger, WandbLogger
+
+import torch
+
+from src.utils.logger import WandbLogger, setup_logger
+
 LOGS_DIR = Path("logs")
 
 logger = setup_logger(__name__)
@@ -52,6 +54,7 @@ logger = setup_logger(__name__)
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
     gc.collect()
+
 
 def set_seed(seed=42):
     """
@@ -70,27 +73,24 @@ def set_seed(seed=42):
 class CFG:
 
     seed = 42
-    debug = False
+    debug = True
     apex = False
     print_freq = 100
     num_workers = 2
-    DATA_ROOT = Path("/workspace/thundering-birds/data/birdclef-2025")
-    OUTPUT_DIR = '/outputs/'
+    DATA_ROOT = Path("./data/birdclef-2025")
+    OUTPUT_DIR = "/outputs/"
 
-    train_datadir = (
-            DATA_ROOT / "train_audio_no_voice"
-        ).as_posix()
+    train_datadir = (DATA_ROOT / "train_audio_no_voice").as_posix()
     train_csv = (DATA_ROOT / "train.csv").as_posix()
     test_soundscapes = (DATA_ROOT / "test_soundscapes").as_posix()
     submission_csv = (DATA_ROOT / "sample_submission.csv").as_posix()
     taxonomy_csv = (DATA_ROOT / "taxonomy.csv").as_posix()
 
-    spectrogram_npy = '/kaggle/input/birdclef25-mel-spectrograms/birdclef2025_melspec_5sec_256_256.npy'
+    spectrogram_npy = "/kaggle/input/birdclef25-mel-spectrograms/birdclef2025_melspec_5sec_256_256.npy"
 
-    model_name = 'efficientnet_b3'
+    model_name = "efficientnet_b3"
     pretrained = True
     in_channels = 1
-
 
     model = EasyDict()
     model.model_name = "efficientnet-b0"
@@ -99,15 +99,15 @@ class CFG:
     model.mixup_alpha = 0.5
 
     training = EasyDict()
-    training.EARLY_STOPPING_METRIC = 'f1'
+    training.EARLY_STOPPING_METRIC = "f1"
     training.EARLY_STOPPING_MIN_DELTA = 0.005
     training.EARLY_STOPPING_PATIENCE = 20
-    training.DEBUG = False
+    training.DEBUG = debug
 
     LOAD_DATA = False
     FS = 32000
     TARGET_DURATION = 5.0
-    TARGET_SHAPE = (224,224)
+    TARGET_SHAPE = (224, 224)
 
     N_FFT = 1024
     HOP_LENGTH = 512
@@ -115,19 +115,19 @@ class CFG:
     FMIN = 50
     FMAX = 14000
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs = 100
-    batch_size = 96 if device == 'cuda' else 32
-    criterion = 'BCEWithLogitsLoss'
+    batch_size = 96 if device == "cuda" else 32
+    criterion = "BCEWithLogitsLoss"
 
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
 
-    optimizer = 'AdamW'
+    optimizer = "AdamW"
     lr = 1e-3
     weight_decay = 1e-6
 
-    scheduler = 'CosineAnnealingLR'
+    scheduler = "CosineAnnealingLR"
     min_lr = 1e-6
     T_max = epochs
 
@@ -139,10 +139,14 @@ class CFG:
     vad_sampling_rate = 32000
     vad_min_speech_duration_ms = 250
     vad_min_silence_duration_ms = 100
+
     def update_debug_settings(self):
         if self.debug:
+            self.training.DEBUG_N_CLASSES = 10
+            self.num_classes = self.training.DEBUG_N_CLASSES
             self.epochs = 10
             self.selected_folds = [0]
+
     def to_dict(self) -> dict:
         """Convert CFG object to a dictionary.
 
@@ -162,7 +166,7 @@ class CFG:
             return obj
 
         # Convert to dict and handle Path objects
-        config_dict = {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+        config_dict = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
         config_dict = convert_paths(config_dict)
 
         return config_dict
@@ -186,22 +190,23 @@ def audio2melspec(audio_data, cfg):
         n_mels=cfg.N_MELS,
         fmin=cfg.FMIN,
         fmax=cfg.FMAX,
-        power=2.0
+        power=2.0,
     )
 
     mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-    mel_spec_norm = (mel_spec_db - mel_spec_db.min()) / (mel_spec_db.max() - mel_spec_db.min() + 1e-8)
+    mel_spec_norm = (mel_spec_db - mel_spec_db.min()) / (
+        mel_spec_db.max() - mel_spec_db.min() + 1e-8
+    )
 
     return mel_spec_norm
+
 
 def remove_human_voice(audio_data, sr, cfg):
     """人の声の部分を検出して除去"""
     try:
         # Silero VADモデルのロード
         model, utils = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
-            force_reload=True
+            repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=True
         )
 
         (get_speech_timestamps, _, read_audio, *_) = utils
@@ -211,16 +216,13 @@ def remove_human_voice(audio_data, sr, cfg):
 
         # 人の声のタイムスタンプを取得
         speech_timestamps = get_speech_timestamps(
-            wav_tensor,
-            model,
-            threshold=0.5,
-            sampling_rate=sr
+            wav_tensor, model, threshold=0.5, sampling_rate=sr
         )
 
         # 人の声の部分をマスク
         mask = torch.ones_like(wav_tensor)
         for ts in speech_timestamps:
-            mask[ts['start']:ts['end']] = 0
+            mask[ts["start"] : ts["end"]] = 0
 
         # マスクを適用
         clean_audio = wav_tensor * mask
@@ -229,6 +231,7 @@ def remove_human_voice(audio_data, sr, cfg):
     except Exception as e:
         logger.error(f"VAD error: {e}")
         return audio_data
+
 
 def process_audio_file(audio_path, cfg):
     """Process a single audio file to get the mel spectrogram"""
@@ -250,23 +253,19 @@ def process_audio_file(audio_path, cfg):
         if len(audio_data) > target_samples:
             max_start_idx = len(audio_data) - target_samples
             start_idx = random.randint(0, max_start_idx)
-            audio_data = audio_data[start_idx:start_idx + target_samples]
+            audio_data = audio_data[start_idx : start_idx + target_samples]
 
         # 長さが足りない場合はパディング
         if len(audio_data) < target_samples:
             audio_data = np.pad(
-                audio_data,
-                (0, target_samples - len(audio_data)),
-                mode='constant'
+                audio_data, (0, target_samples - len(audio_data)), mode="constant"
             )
 
         mel_spec = audio2melspec(audio_data, cfg)
 
         if mel_spec.shape != cfg.TARGET_SHAPE:
             mel_spec = cv2.resize(
-                mel_spec,
-                cfg.TARGET_SHAPE,
-                interpolation=cv2.INTER_LINEAR
+                mel_spec, cfg.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR
             )
 
         return mel_spec.astype(np.float32)
@@ -274,6 +273,7 @@ def process_audio_file(audio_path, cfg):
     except Exception as e:
         logger.error(f"Error processing {audio_path}: {e}")
         return None
+
 
 def generate_spectrograms(df, cfg):
     """Generate spectrograms from audio files"""
@@ -288,8 +288,8 @@ def generate_spectrograms(df, cfg):
             break
 
         try:
-            samplename = row['samplename']
-            filepath = row['filepath']
+            samplename = row["samplename"]
+            filepath = row["filepath"]
 
             mel_spec = process_audio_file(filepath, cfg)
 
@@ -309,71 +309,84 @@ def generate_spectrograms(df, cfg):
 
 
 class BirdCLEFDatasetFromNPY(Dataset):
-    def __init__(self, df, cfg, spectrograms=None, mode="train"):
+    def __init__(self, df, cfg, species_ids, spectrograms=None, mode="train"):
         self.df = df
         self.cfg = cfg
         self.mode = mode
 
         self.spectrograms = spectrograms
 
-        taxonomy_df = pd.read_csv(self.cfg.taxonomy_csv)
-        self.species_ids = taxonomy_df['primary_label'].tolist()
+        self.species_ids = species_ids
         self.num_classes = len(self.species_ids)
         self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
 
-        if 'filepath' not in self.df.columns:
-            self.df['filepath'] = self.cfg.train_datadir + '/' + self.df.filename
+        if "filepath" not in self.df.columns:
+            self.df["filepath"] = self.cfg.train_datadir + "/" + self.df.filename
 
-        if 'samplename' not in self.df.columns:
-            self.df['samplename'] = self.df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+        if "samplename" not in self.df.columns:
+            self.df["samplename"] = self.df.filename.map(
+                lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
+            )
 
-        sample_names = set(self.df['samplename'])
+        sample_names = set(self.df["samplename"])
         if self.spectrograms:
             found_samples = sum(1 for name in sample_names if name in self.spectrograms)
-            logger.info(f"Found {found_samples} matching spectrograms for {mode} dataset out of {len(self.df)} samples")
+            logger.info(
+                f"Found {found_samples} matching spectrograms for {mode} dataset out of {len(self.df)} samples"
+            )
 
         if cfg.debug:
-            self.df = self.df.sample(min(1000, len(self.df)), random_state=cfg.seed).reset_index(drop=True)
+            self.df = self.df.sample(
+                min(1000, len(self.df)), random_state=cfg.seed
+            ).reset_index(drop=True)
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        samplename = row['samplename']
+        samplename = row["samplename"]
         spec = None
 
         if self.spectrograms and samplename in self.spectrograms:
             spec = self.spectrograms[samplename]
         elif not self.cfg.LOAD_DATA:
-            spec = process_audio_file(row['filepath'], self.cfg)
+            spec = process_audio_file(row["filepath"], self.cfg)
 
         if spec is None:
             spec = np.zeros(self.cfg.TARGET_SHAPE, dtype=np.float32)
             if self.mode == "train":  # Only print warning during training
-                logger.warning(f"Warning: Spectrogram for {samplename} not found and could not be generated")
+                logger.warning(
+                    f"Warning: Spectrogram for {samplename} not found and could not be generated"
+                )
 
-        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
+        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(
+            0
+        )  # Add channel dimension
 
         if self.mode == "train" and random.random() < self.cfg.aug_prob:
             spec = self.apply_spec_augmentations(spec)
 
-        target = self.encode_label(row['primary_label'])
+        target = self.encode_label(row["primary_label"])
 
-        if 'secondary_labels' in row and row['secondary_labels'] not in [[''], None, np.nan]:
-            if isinstance(row['secondary_labels'], str):
-                secondary_labels = eval(row['secondary_labels'])
+        if "secondary_labels" in row and row["secondary_labels"] not in [
+            [""],
+            None,
+            np.nan,
+        ]:
+            if isinstance(row["secondary_labels"], str):
+                secondary_labels = eval(row["secondary_labels"])
             else:
-                secondary_labels = row['secondary_labels']
+                secondary_labels = row["secondary_labels"]
 
             for label in secondary_labels:
                 if label in self.label_to_idx:
                     target[self.label_to_idx[label]] = 1.0
 
         return {
-            'melspec': spec,
-            'target': torch.tensor(target, dtype=torch.float32),
-            'filename': row['filename']
+            "melspec": spec,
+            "target": torch.tensor(target, dtype=torch.float32),
+            "filename": row["filename"],
         }
 
     def apply_spec_augmentations(self, spec):
@@ -385,7 +398,7 @@ class BirdCLEFDatasetFromNPY(Dataset):
             for _ in range(num_masks):
                 width = random.randint(8, 16)
                 start = random.randint(0, spec.shape[2] - width)
-                spec[0, :, start:start+width] = 0
+                spec[0, :, start : start + width] = 0
 
         # Frequency masking (vertical stripes)
         if random.random() < 0.5:
@@ -393,7 +406,7 @@ class BirdCLEFDatasetFromNPY(Dataset):
             for _ in range(num_masks):
                 height = random.randint(8, 16)
                 start = random.randint(0, spec.shape[1] - height)
-                spec[0, start:start+height, :] = 0
+                spec[0, start : start + height, :] = 0
 
         # Random brightness/contrast
         if random.random() < 0.5:
@@ -404,9 +417,9 @@ class BirdCLEFDatasetFromNPY(Dataset):
 
         # Randomly shift the spectrogram along the time axis
         if random.random() < 0.7:
-            shift = random.randint(-3,3)
+            shift = random.randint(-3, 3)
             spec = torch.roll(spec, shifts=shift, dims=1)
-            num_masks = random.randint(2,4)
+            num_masks = random.randint(2, 4)
         return spec
 
     def encode_label(self, label):
@@ -430,9 +443,9 @@ def collate_fn(batch):
             result[key].append(value)
 
     for key in result:
-        if key == 'target' and isinstance(result[key][0], torch.Tensor):
+        if key == "target" and isinstance(result[key][0], torch.Tensor):
             result[key] = torch.stack(result[key])
-        elif key == 'melspec' and isinstance(result[key][0], torch.Tensor):
+        elif key == "melspec" and isinstance(result[key][0], torch.Tensor):
             shapes = [t.shape for t in result[key]]
             if len(set(str(s) for s in shapes)) == 1:
                 result[key] = torch.stack(result[key])
@@ -445,26 +458,26 @@ class BirdCLEFModel(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
-        cfg.num_classes = len(taxonomy_df)
+        # taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
+        # cfg.num_classes = len(taxonomy_df)
 
         self.backbone = timm.create_model(
             cfg.model_name,
             pretrained=cfg.pretrained,
             in_chans=cfg.in_channels,
             drop_rate=0.4,
-            drop_path_rate=0.4
+            drop_path_rate=0.4,
         )
 
-        if 'efficientnet' in cfg.model_name:
+        if "efficientnet" in cfg.model_name:
             backbone_out = self.backbone.classifier.in_features
             self.backbone.classifier = nn.Identity()
-        elif 'resnet' in cfg.model_name:
+        elif "resnet" in cfg.model_name:
             backbone_out = self.backbone.fc.in_features
             self.backbone.fc = nn.Identity()
         else:
             backbone_out = self.backbone.get_classifier().in_features
-            self.backbone.reset_classifier(0, '')
+            self.backbone.reset_classifier(0, "")
 
         self.pooling = nn.AdaptiveAvgPool2d(1)
 
@@ -472,7 +485,7 @@ class BirdCLEFModel(nn.Module):
 
         self.classifier = nn.Linear(backbone_out, cfg.num_classes)
 
-        self.mixup_enabled = hasattr(cfg, 'mixup_alpha') and cfg.mixup_alpha > 0
+        self.mixup_enabled = hasattr(cfg, "mixup_alpha") and cfg.mixup_alpha > 0
         if self.mixup_enabled:
             self.mixup_alpha = cfg.mixup_alpha
 
@@ -487,7 +500,7 @@ class BirdCLEFModel(nn.Module):
         features = self.backbone(x)
 
         if isinstance(features, dict):
-            features = features['features']
+            features = features["features"]
 
         if len(features.shape) == 4:
             features = self.pooling(features)
@@ -496,8 +509,9 @@ class BirdCLEFModel(nn.Module):
         logits = self.classifier(features)
 
         if self.training and self.mixup_enabled and targets is not None:
-            loss = self.mixup_criterion(F.binary_cross_entropy_with_logits,
-                                       logits, targets_a, targets_b, lam)
+            loss = self.mixup_criterion(
+                F.binary_cross_entropy_with_logits, logits, targets_a, targets_b, lam
+            )
             return logits, loss
 
         return logits
@@ -521,63 +535,52 @@ class BirdCLEFModel(nn.Module):
 
 def get_optimizer(model, cfg):
 
-    if cfg.optimizer == 'Adam':
+    if cfg.optimizer == "Adam":
         optimizer = optim.Adam(
-            model.parameters(),
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
         )
-    elif cfg.optimizer == 'AdamW':
+    elif cfg.optimizer == "AdamW":
         optimizer = optim.AdamW(
-            model.parameters(),
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
         )
-    elif cfg.optimizer == 'SGD':
+    elif cfg.optimizer == "SGD":
         optimizer = optim.SGD(
-            model.parameters(),
-            lr=cfg.lr,
-            momentum=0.9,
-            weight_decay=cfg.weight_decay
+            model.parameters(), lr=cfg.lr, momentum=0.9, weight_decay=cfg.weight_decay
         )
     else:
         raise NotImplementedError(f"Optimizer {cfg.optimizer} not implemented")
 
     return optimizer
 
+
 def get_scheduler(optimizer, cfg):
 
-    if cfg.scheduler == 'CosineAnnealingLR':
+    if cfg.scheduler == "CosineAnnealingLR":
         scheduler = lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=cfg.T_max,
-            eta_min=cfg.min_lr
+            optimizer, T_max=cfg.T_max, eta_min=cfg.min_lr
         )
-    elif cfg.scheduler == 'ReduceLROnPlateau':
+    elif cfg.scheduler == "ReduceLROnPlateau":
         scheduler = lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min',
+            mode="min",
             factor=0.5,
             patience=2,
             min_lr=cfg.min_lr,
-            verbose=True
+            verbose=True,
         )
-    elif cfg.scheduler == 'StepLR':
-        scheduler = lr_scheduler.StepLR(
-            optimizer,
-            step_size=cfg.epochs // 3,
-            gamma=0.5
-        )
-    elif cfg.scheduler == 'OneCycleLR':
+    elif cfg.scheduler == "StepLR":
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=cfg.epochs // 3, gamma=0.5)
+    elif cfg.scheduler == "OneCycleLR":
         scheduler = None
     else:
         scheduler = None
 
     return scheduler
 
+
 def get_criterion(cfg):
 
-    if cfg.criterion == 'BCEWithLogitsLoss':
+    if cfg.criterion == "BCEWithLogitsLoss":
         criterion = nn.BCEWithLogitsLoss()
     else:
         raise NotImplementedError(f"Criterion {cfg.criterion} not implemented")
@@ -585,7 +588,16 @@ def get_criterion(cfg):
     return criterion
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None, cfg=None, species_ids=None):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device,
+    scheduler=None,
+    cfg=None,
+    species_ids=None,
+):
 
     model.train()
     losses = []
@@ -596,13 +608,13 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None,
 
     for step, batch in pbar:
 
-        if isinstance(batch['melspec'], list):
+        if isinstance(batch["melspec"], list):
             batch_outputs = []
             batch_losses = []
 
-            for i in range(len(batch['melspec'])):
-                inputs = batch['melspec'][i].unsqueeze(0).to(device)
-                target = batch['target'][i].unsqueeze(0).to(device)
+            for i in range(len(batch["melspec"])):
+                inputs = batch["melspec"][i].unsqueeze(0).to(device)
+                target = batch["target"][i].unsqueeze(0).to(device)
 
                 optimizer.zero_grad()
                 output = model(inputs)
@@ -615,11 +627,11 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None,
             optimizer.step()
             outputs = torch.cat(batch_outputs, dim=0).numpy()
             loss = np.mean(batch_losses)
-            targets = batch['target'].numpy()
+            targets = batch["target"].numpy()
 
         else:
-            inputs = batch['melspec'].to(device)
-            targets = batch['target'].to(device)
+            inputs = batch["melspec"].to(device)
+            targets = batch["target"].to(device)
 
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -642,10 +654,12 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None,
         all_targets.append(targets)
         losses.append(loss if isinstance(loss, float) else loss.item())
 
-        pbar.set_postfix({
-            'train_loss': np.mean(losses[-10:]) if losses else 0,
-            'lr': optimizer.param_groups[0]['lr']
-        })
+        pbar.set_postfix(
+            {
+                "train_loss": np.mean(losses[-10:]) if losses else 0,
+                "lr": optimizer.param_groups[0]["lr"],
+            }
+        )
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
@@ -664,6 +678,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None,
 
     return avg_loss, metrics, analysis
 
+
 def validate(model, loader, criterion, device, species_ids=None):
 
     model.eval()
@@ -674,13 +689,13 @@ def validate(model, loader, criterion, device, species_ids=None):
 
     with torch.no_grad():
         for step, batch in pbar:
-            if isinstance(batch['melspec'], list):
+            if isinstance(batch["melspec"], list):
                 batch_outputs = []
                 batch_losses = []
 
-                for i in range(len(batch['melspec'])):
-                    inputs = batch['melspec'][i].unsqueeze(0).to(device)
-                    target = batch['target'][i].unsqueeze(0).to(device)
+                for i in range(len(batch["melspec"])):
+                    inputs = batch["melspec"][i].unsqueeze(0).to(device)
+                    target = batch["target"][i].unsqueeze(0).to(device)
 
                     output = model(inputs)
                     loss = criterion(output, target)
@@ -690,11 +705,11 @@ def validate(model, loader, criterion, device, species_ids=None):
 
                 outputs = torch.cat(batch_outputs, dim=0).numpy()
                 loss = np.mean(batch_losses)
-                targets = batch['target'].numpy()
+                targets = batch["target"].numpy()
 
             else:
-                inputs = batch['melspec'].to(device)
-                targets = batch['target'].to(device)
+                inputs = batch["melspec"].to(device)
+                targets = batch["target"].to(device)
 
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
@@ -706,10 +721,10 @@ def validate(model, loader, criterion, device, species_ids=None):
             all_targets.append(targets)
             losses.append(loss if isinstance(loss, float) else loss.item())
         pbar.set_postfix(
-                {
-                    "val_loss": f"{np.mean(losses[-10:]):.2f}",
-                }
-            )
+            {
+                "val_loss": f"{np.mean(losses[-10:]):.2f}",
+            }
+        )
 
     all_outputs = np.concatenate(all_outputs)
     all_targets = np.concatenate(all_targets)
@@ -737,11 +752,27 @@ def run_training(df, cfg):
     logger.info(f"Starting training run in {run_dir}")
 
     taxonomy_df = pd.read_csv(cfg.taxonomy_csv)
-    species_ids = taxonomy_df['primary_label'].tolist()
+    species_ids = taxonomy_df["primary_label"].tolist()
     cfg.num_classes = len(species_ids)
 
     if cfg.debug:
         cfg.update_debug_settings()
+        # Filter the dataframe to keep only the top 3 classes
+        class_counts = df["primary_label"].value_counts().sort_index()
+        # Get half of the classes with most files and half with least files
+        half_n = cfg.training.DEBUG_N_CLASSES // 2
+        most_common_classes = class_counts.nlargest(half_n).index.tolist()
+        least_common_classes = (
+            class_counts[class_counts >= 4].nsmallest(half_n * 2).index.tolist()
+        )
+        top_n_classes = least_common_classes  # + most_common_classes
+
+        df = df[df["primary_label"].isin(top_n_classes)]
+        logger.info(
+            f"For DEBUG run, training data was filtered to {len(df)} audio files from {cfg.training.DEBUG_N_CLASSES} classes"
+        )
+        species_ids = df["primary_label"].unique().tolist()
+        cfg.num_classes = len(species_ids)
 
     spectrograms = None
     if cfg.LOAD_DATA:
@@ -756,10 +787,12 @@ def run_training(df, cfg):
 
     if not cfg.LOAD_DATA:
         logger.info("Will generate spectrograms on-the-fly during training.")
-        if 'filepath' not in df.columns:
-            df['filepath'] = cfg.train_datadir + '/' + df.filename
-        if 'samplename' not in df.columns:
-            df['samplename'] = df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+        if "filepath" not in df.columns:
+            df["filepath"] = cfg.train_datadir + "/" + df.filename
+        if "samplename" not in df.columns:
+            df["samplename"] = df.filename.map(
+                lambda x: x.split("/")[0] + "-" + x.split("/")[-1].split(".")[0]
+            )
 
     skf = StratifiedKFold(n_splits=cfg.n_fold, shuffle=True, random_state=cfg.seed)
 
@@ -768,7 +801,7 @@ def run_training(df, cfg):
 
     wandb_group = f"train_{'DEBUG' if cfg.training.DEBUG else 'PROD'}_{cfg.num_classes}classes_{cfg.device.upper()}_{timestamp}"
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['primary_label'])):
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
         if fold not in cfg.selected_folds:
             continue
 
@@ -777,12 +810,15 @@ def run_training(df, cfg):
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df = df.iloc[val_idx].reset_index(drop=True)
 
-        logger.info(f'Training set: {len(train_df)} samples')
-        logger.info(f'Validation set: {len(val_df)} samples')
+        logger.info(f"Training set: {len(train_df)} samples")
+        logger.info(f"Validation set: {len(val_df)} samples")
 
-        train_dataset = BirdCLEFDatasetFromNPY(train_df, cfg, spectrograms=spectrograms, mode='train')
-        val_dataset = BirdCLEFDatasetFromNPY(val_df, cfg, spectrograms=spectrograms, mode='valid')
-
+        train_dataset = BirdCLEFDatasetFromNPY(
+            train_df, cfg, species_ids, spectrograms=spectrograms, mode="train"
+        )
+        val_dataset = BirdCLEFDatasetFromNPY(
+            val_df, cfg, species_ids, spectrograms=spectrograms, mode="valid"
+        )
 
         wandb_logger = WandbLogger(
             f"fold{fold}_{cfg.num_classes}classes",
@@ -795,12 +831,12 @@ def run_training(df, cfg):
                 f"{cfg.device.upper()}",
             ],
             config={
+                "cfg": cfg.to_dict(),
             },
         )
         # After initializing wandb_logger
         # config_dict = cfg.to_dict()
         # wandb_logger.store_config_artifact(config_dict, artifact_name="training_config")
-
 
         train_loader = DataLoader(
             train_dataset,
@@ -809,7 +845,7 @@ def run_training(df, cfg):
             num_workers=cfg.num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
-            drop_last=True
+            drop_last=True,
         )
 
         val_loader = DataLoader(
@@ -818,21 +854,21 @@ def run_training(df, cfg):
             shuffle=False,
             num_workers=cfg.num_workers,
             pin_memory=True,
-            collate_fn=collate_fn
+            collate_fn=collate_fn,
         )
 
-        # model = BirdCLEFModel(cfg).to(cfg.device)
-        model = MyModel(cfg).to(cfg.device)
+        model = BirdCLEFModel(cfg).to(cfg.device)
+        # model = MyModel(cfg).to(cfg.device)
         optimizer = get_optimizer(model, cfg)
         criterion = get_criterion(cfg)
 
-        if cfg.scheduler == 'OneCycleLR':
+        if cfg.scheduler == "OneCycleLR":
             scheduler = lr_scheduler.OneCycleLR(
                 optimizer,
                 max_lr=cfg.lr,
                 steps_per_epoch=len(train_loader),
                 epochs=cfg.epochs,
-                pct_start=0.1
+                pct_start=0.1,
             )
         else:
             scheduler = get_scheduler(optimizer, cfg)
@@ -856,19 +892,27 @@ def run_training(df, cfg):
                 criterion,
                 cfg.device,
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None,
-                species_ids=species_ids
+                species_ids=species_ids,
             )
 
-            val_loss, val_metrics, val_analysis= validate(model, val_loader, criterion, cfg.device, species_ids)
+            val_loss, val_metrics, val_analysis = validate(
+                model, val_loader, criterion, cfg.device, species_ids
+            )
 
-            if scheduler is not None and not isinstance(scheduler, lr_scheduler.OneCycleLR):
+            if scheduler is not None and not isinstance(
+                scheduler, lr_scheduler.OneCycleLR
+            ):
                 if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
                     scheduler.step(val_loss)
                 else:
                     scheduler.step()
 
-            logger.info(f"Train Loss: {train_loss:.4f}, Train AUC: {train_metrics['macro_metrics']['auc']:.4f}")
-            logger.info(f"Val Loss: {val_loss:.4f}, Val AUC: {val_metrics['macro_metrics']['auc']:.4f}")
+            logger.info(
+                f"Train Loss: {train_loss:.4f}, Train AUC: {train_metrics['macro_metrics']['auc']:.4f}"
+            )
+            logger.info(
+                f"Val Loss: {val_loss:.4f}, Val AUC: {val_metrics['macro_metrics']['auc']:.4f}"
+            )
 
             train_metrics_plots = plot_class_metrics(train_metrics, species_ids)
             val_metrics_plots = plot_class_metrics(val_metrics, species_ids)
@@ -879,7 +923,7 @@ def run_training(df, cfg):
                 val_metrics["confusion_matrix"], species_ids
             )
 
- # Log all metrics to wandb with fold grouping
+            # Log all metrics to wandb with fold grouping
             wandb_logger.log(
                 {
                     "epoch": epoch + 1,
@@ -926,7 +970,6 @@ def run_training(df, cfg):
                 },
             )
 
-
             if cfg.training.EARLY_STOPPING_METRIC == "loss":
                 current_metric = -val_loss  # Negative because we want to minimize loss
             else:
@@ -952,17 +995,22 @@ def run_training(df, cfg):
                     if old_checkpoint != checkpoint_path:
                         old_checkpoint.unlink()
                         logger.debug(f"Deleted old checkpoint {old_checkpoint}")
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'epoch': epoch,
-                    "val_auc": val_metrics["macro_metrics"]["auc"],
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": (
+                            scheduler.state_dict() if scheduler else None
+                        ),
+                        "epoch": epoch,
+                        "val_auc": val_metrics["macro_metrics"]["auc"],
                         "val_f1": val_metrics["macro_metrics"]["f1"],
                         "train_auc": train_metrics["macro_metrics"]["auc"],
                         "train_f1": train_metrics["macro_metrics"]["f1"],
-                    'cfg': cfg
-                }, checkpoint_path)
+                        "cfg": cfg,
+                    },
+                    checkpoint_path,
+                )
                 logger.debug(f"Saved best model checkpoint to {checkpoint_path}")
             else:
                 no_improvement_epochs += 1
@@ -1003,13 +1051,13 @@ def run_training(df, cfg):
         torch.cuda.empty_cache()
         gc.collect()
 
-    logger.info("\n" + "="*60)
+    logger.info("\n" + "=" * 60)
     logger.info("Cross-Validation Results:")
     for fold, scores in enumerate(best_scores):
         logger.info(f"Fold {fold}: AUC: {scores['auc']:.4f}, F1: {scores['f1']:.4f}")
     logger.info(f"Mean AUC: {np.mean([s['auc'] for s in best_scores]):.4f}")
     logger.info(f"Mean F1: {np.mean([s['f1'] for s in best_scores]):.4f}")
-    logger.info("="*60)
+    logger.info("=" * 60)
     # Save final results
     results = {
         "best_scores": best_scores,
@@ -1023,8 +1071,10 @@ def run_training(df, cfg):
         json.dump(results, f, indent=4)
     logger.info(f"Saved results to {run_dir / 'results.json'}")
 
+
 if __name__ == "__main__":
     import time
+
     load_dotenv(".env")
 
     logger.info("\nLoading training data...")

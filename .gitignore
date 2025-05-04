@@ -188,3 +188,4 @@ logs/*
 sound.ogg
 sound.pickle
 vastai.txt
+training_run*
